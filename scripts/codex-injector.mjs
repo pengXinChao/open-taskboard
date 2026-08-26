@@ -2,9 +2,11 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { chmod, mkdir, readFile, rename, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { createInterface } from "node:readline";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -1134,7 +1136,21 @@ async function applyTaskboardAutomationPolicy(
   stillCurrent = () => true,
   { explicit = false, previousQuotaState } = {},
 ) {
-  const quota = request.quotaAware
+  const todoResponse = request.enabledByUser
+    ? await fetch(
+      `${taskboardBaseUrl}/api/tasks?projectId=${encodeURIComponent(request.taskboardProjectId)}&status=todo`,
+      { cache: "no-store" },
+    )
+    : null;
+  if (todoResponse && !todoResponse.ok) {
+    throw new Error(`Taskboard todo check returned HTTP ${todoResponse.status}`);
+  }
+  const todoPayload = todoResponse ? await todoResponse.json() : null;
+  if (todoPayload && !Array.isArray(todoPayload.tasks)) {
+    throw new Error("Taskboard todo check returned invalid JSON");
+  }
+  const hasTodo = todoPayload ? todoPayload.tasks.length > 0 : null;
+  const quota = request.quotaAware && hasTodo !== false
     ? await readCodexQuotaStatus(request.model)
     : null;
   if (!stillCurrent()) return { quota, stale: true };
@@ -1151,6 +1167,7 @@ async function applyTaskboardAutomationPolicy(
   }
   const operation = taskboardAutomationPolicyOperation(request, {
     explicit,
+    hasTodo,
     previousQuotaState,
     quotaState: quota?.state,
     currentStatus: currentItem?.status,
@@ -1159,9 +1176,9 @@ async function applyTaskboardAutomationPolicy(
     ? { item: currentItem, items: listed.items }
     : await reconcileTaskboardAutomation({ ...request, operation }, rpc);
   if (result?.error === "not-found") {
-    return { operation, ...(quota ? { quota } : {}) };
+    return { operation, hasTodo, ...(quota ? { quota } : {}) };
   }
-  return { ...result, operation, ...(quota ? { quota } : {}) };
+  return { ...result, operation, hasTodo, ...(quota ? { quota } : {}) };
 }
 
 function storedAutomationPolicy(request) {
@@ -1263,7 +1280,7 @@ function scheduleQuotaPolicyCheck(record, result) {
   const previous = quotaPolicyTimers.get(key);
   if (previous) clearTimeout(previous);
   quotaPolicyTimers.delete(key);
-  if (!request.enabledByUser || !request.quotaAware) return;
+  if (!request.enabledByUser) return;
 
   const nextRunAt = Number(result.item?.nextRunAt);
   const nextRunDelay = Number.isFinite(nextRunAt) && nextRunAt > Date.now()
@@ -1307,7 +1324,10 @@ function enqueueQuotaPolicyMutation(record, rpc, { explicit = false } = {}) {
         },
       );
       if (result.stale) return result;
-      if (!explicit && result.operation === "list" && result.item?.status === "PAUSED") {
+      if (result.hasTodo === false && result.operation === "pause") {
+        current.version += 1;
+        current.request = { ...current.request, enabledByUser: false };
+      } else if (!explicit && result.operation === "list" && result.item?.status === "PAUSED") {
         current.version += 1;
         current.request = { ...current.request, enabledByUser: false };
       }
@@ -1315,7 +1335,7 @@ function enqueueQuotaPolicyMutation(record, rpc, { explicit = false } = {}) {
         current.request = { ...current.request, automationId: result.item.id };
       }
       if (current.request.quotaAware && result.quota) current.quota = result.quota;
-      else delete current.quota;
+      else if (!current.request.quotaAware) delete current.quota;
       await persistQuotaPolicies();
       scheduleQuotaPolicyCheck(current, result);
       return result;
@@ -1409,7 +1429,7 @@ async function restoreQuotaPolicies(cdp) {
   const restoring = (async () => {
     await ensureQuotaPoliciesLoaded();
     for (const [projectId, record] of quotaPolicyRecords) {
-      if (record.request.enabledByUser && record.request.quotaAware) {
+      if (record.request.enabledByUser) {
         await enqueueCurrentQuotaPolicy(projectId);
       }
     }
@@ -2012,10 +2032,32 @@ ${runtimeSource}`,
   };
 }
 
+async function resolveRunnableCodexExecutable(appPath) {
+  const executable = resolveCodexExecutable({ appPath });
+  if (process.platform !== "win32" || !executable.toLowerCase().includes("\\windowsapps\\")) {
+    return executable;
+  }
+
+  const source = await stat(executable);
+  const cacheDirectory = path.join(taskboardDataDirectory, "codex-runtime");
+  const cachedExecutable = path.join(cacheDirectory, "codex.exe");
+  try {
+    const cached = await stat(cachedExecutable);
+    if (cached.size === source.size && cached.mtimeMs === source.mtimeMs) {
+      return cachedExecutable;
+    }
+  } catch {}
+
+  await mkdir(cacheDirectory, { recursive: true });
+  await pipeline(createReadStream(executable), createWriteStream(cachedExecutable));
+  await utimes(cachedExecutable, source.atime, source.mtime);
+  return cachedExecutable;
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   options.startupToken ??= taskboardInstanceToken;
-  process.env.CODEX_EXECUTABLE = resolveCodexExecutable({ appPath: options.appPath });
+  process.env.CODEX_EXECUTABLE = await resolveRunnableCodexExecutable(options.appPath);
   const cdpVersionUrl = `http://127.0.0.1:${options.port}/json/version`;
 
   if (options.daemon) {
