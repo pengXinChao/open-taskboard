@@ -41,3 +41,13 @@ export function labelPresentation(name: string, language: TaskboardLanguage = "z
     color: tone === "bug" ? "#eb5757" : tone === "feature" ? "#bb87fc" : labelColor(name),
   };
 }
+
+export function issueTypePresentation(issueType: string): { name: string; tone: LabelTone } {
+  if (issueType === "故障" || issueType.toLocaleLowerCase() === "bug") {
+    return { name: issueType, tone: "bug" };
+  }
+  if (issueType === "任务" || issueType === "故事" || issueType === "Requirement") {
+    return { name: issueType, tone: "feature" };
+  }
+  return { name: issueType, tone: null };
+}

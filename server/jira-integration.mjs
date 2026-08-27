@@ -9,6 +9,7 @@ const JIRA_FIELDS = [
   "status",
   "priority",
   "labels",
+  "issuetype",
   "duedate",
   "assignee",
   "reporter",
@@ -88,6 +89,12 @@ function legacyJiraOriginId(baseUrl) {
   return createHash("sha256").update(baseUrl).digest("hex").slice(0, 16);
 }
 
+function issueTypeFromJira(fields) {
+  // 存 Jira 类型显示名（故障/任务/故事），打开对话和列表标签都按名称分支，不使用易变的数字 id。
+  const name = typeof fields?.issuetype?.name === "string" ? fields.issuetype.name.trim() : "";
+  return name ? name.slice(0, 64) : null;
+}
+
 function normalizeIssue(issue, config, index = 0) {
   const fields = issue?.fields ?? {};
   const externalId = String(issue.id);
@@ -109,6 +116,7 @@ function normalizeIssue(issue, config, index = 0) {
     description: typeof fields.description === "string" ? fields.description.slice(0, 100_000) : "",
     status: taskStatusFromJira(fields.status),
     priority: taskPriorityFromJira(fields.priority),
+    issueType: issueTypeFromJira(fields),
     labels,
     sortOrder: (index + 1) * 1024,
     creator: reporter,

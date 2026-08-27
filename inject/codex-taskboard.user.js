@@ -1049,7 +1049,7 @@
     const workspacePath = typeof payload?.workspacePath === "string"
       ? payload.workspacePath.trim()
       : "";
-    const projectless = payload?.projectless === true;
+    const projectless = payload?.projectless === true || !workspacePath;
     const codexProjectKind = payload?.codexProjectKind === "remote" ? "remote" : "local";
     const requestedProjectId = typeof payload?.codexProjectId === "string"
       ? payload.codexProjectId.trim()

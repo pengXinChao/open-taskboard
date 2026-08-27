@@ -88,7 +88,7 @@ test("global tasks open a projectless conversation", () => {
   );
   assert.match(
     openTaskSource,
-    /const projectless = task\.projectId === GLOBAL_PROJECT_ID/,
+    /const projectless = !workspacePath/,
   );
   assert.match(openTaskSource, /codexProjectId: codexProject\.id,\s*codexProjectKind: codexProject\.projectKind/);
   assert.match(openTaskSource, /const savedRemoteIdentity = projectCodexIdentities\[task\.projectId\]/);

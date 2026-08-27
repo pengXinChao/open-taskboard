@@ -205,6 +205,13 @@ export async function getTaskboardMetadata(signal?: AbortSignal): Promise<Taskbo
   return request<TaskboardMetadata>("/api/meta", { signal });
 }
 
+export async function openProjectlessCodexThread(instruction: string): Promise<void> {
+  await request("/api/local/open-codex-thread", {
+    method: "POST",
+    body: JSON.stringify({ instruction }),
+  });
+}
+
 export async function getTaskboardRevision(
   since: number,
   signal?: AbortSignal,
