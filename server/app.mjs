@@ -1708,6 +1708,7 @@ export function createTaskboardServer(options = {}) {
   const jira = createJiraIntegration({
     configStore: jiraConfig,
     database,
+    attachmentsDirectory: resolved.attachmentsDirectory,
     fetch: options.jiraFetch ?? globalThis.fetch,
   });
   let hostRuntime = null;
@@ -3081,8 +3082,12 @@ export function createTaskboardServer(options = {}) {
           if ([...url.searchParams.keys()].length > 0) {
             throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/tasks/:id does not accept query parameters");
           }
-          const task = database.getTask(id);
+          let task = database.getTask(id);
           if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          if (task.source === "jira") {
+            await jira.sync();
+            task = database.getTask(task.id) ?? task;
+          }
           return sendJson(response, 200, { task });
         }
         if (!action && request.method === "PATCH") {

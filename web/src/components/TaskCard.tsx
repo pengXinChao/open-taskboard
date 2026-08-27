@@ -448,7 +448,9 @@ export function TaskCard({
     || task.labels.length > 0
     || Boolean(task.issueType)
     || task.dueDate;
+  // 处理中卡片不展示优先级/标签等可编辑属性，但 Jira issueType 仍要留在看板上。
   const showsProperties = Boolean(projectName)
+    || Boolean(task.issueType)
     || (!processingCard && (hasProperties || showsInlineParticipants || showsConversation));
   const propertyDisabled = savingProperty !== null;
 
