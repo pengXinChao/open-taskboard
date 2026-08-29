@@ -3000,7 +3000,10 @@ async function attachmentContent(env, id, request, download = false) {
     /['()*]/g,
     (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
   );
-  const canOpenInline = !download && INLINE_ATTACHMENT_TYPES.has(attachment.contentType);
+  const canOpenInline = !download && (
+    INLINE_ATTACHMENT_TYPES.has(attachment.contentType)
+    || attachment.contentType.startsWith("video/")
+  );
   return new Response(request.method === "HEAD" ? null : object.body, {
     status: 200,
     headers: {

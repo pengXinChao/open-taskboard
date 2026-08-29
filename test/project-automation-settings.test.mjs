@@ -30,7 +30,7 @@ test("project automation state is device-local and scoped by taskboard project",
   assert.match(appSource, /codexHostId: string/);
   assert.match(appSource, /workspacePath: string/);
   assert.match(appSource, /type AutomationIntervalMinutes = 5 \| 10 \| 15 \| 30 \| 60/);
-  assert.match(appSource, /getAiChatCatalog\(selectedProject\.id, controller\.signal\)/);
+  assert.match(appSource, /getAiChatCatalog\(\s*selectedProject\.id,\s*controller\.signal,\s*selectedCodexProjectIdentity,\s*\)/);
   assert.match(appSource, /defaultModel\.slug/);
   assert.match(appSource, /defaultModel\.defaultReasoningEffort/);
   assert.match(appSource, /taskboardStorage\.getItem\(PROJECT_AUTOMATIONS_KEY\)/);

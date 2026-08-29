@@ -896,6 +896,10 @@ export function App() {
   }, []);
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+  const selectedCodexProjectIdentity = useMemo(
+    () => selectedProject ? codexProjectContextForTaskProject(selectedProject.id) : null,
+    [deviceWorkspacePaths, hostContext, projectCodexIdentities, projects, selectedProject?.id],
+  );
   const isAllProjects = selectedProjectId === ALL_PROJECTS_ID;
   const isJiraProject = selectedProject?.source === "jira";
   const boardDisplaySettings = projectBoardDisplaySettings[selectedProjectId]
@@ -912,7 +916,11 @@ export function App() {
     }
     const controller = new AbortController();
     setAutomationCatalogLoading(true);
-    void getAiChatCatalog(selectedProject.id, controller.signal).then(
+    void getAiChatCatalog(
+      selectedProject.id,
+      controller.signal,
+      selectedCodexProjectIdentity,
+    ).then(
       (catalog) => {
         if (controller.signal.aborted) return;
         setAutomationCatalog({ projectId: selectedProject.id, models: catalog.models });
@@ -927,7 +935,15 @@ export function App() {
       },
     );
     return () => controller.abort();
-  }, [localAiChatAvailable, selectedProject?.id, text]);
+  }, [
+    localAiChatAvailable,
+    selectedCodexProjectIdentity?.codexHostId,
+    selectedCodexProjectIdentity?.codexProjectId,
+    selectedCodexProjectIdentity?.codexProjectKind,
+    selectedCodexProjectIdentity?.workspacePath,
+    selectedProject?.id,
+    text,
+  ]);
   const aiImportProjectId = hasLoadedTasks
     && tasks.length === 0
     && selectedProject
@@ -940,13 +956,19 @@ export function App() {
     setAiImportReadyProjectId(null);
     if (!aiImportProjectId) return;
     const controller = new AbortController();
-    void getAiChatCatalog(aiImportProjectId, controller.signal)
+    void getAiChatCatalog(aiImportProjectId, controller.signal, selectedCodexProjectIdentity)
       .then(() => {
         if (!controller.signal.aborted) setAiImportReadyProjectId(aiImportProjectId);
       })
       .catch(() => {});
     return () => controller.abort();
-  }, [aiImportProjectId, selectedProject]);
+  }, [
+    aiImportProjectId,
+    selectedCodexProjectIdentity?.codexHostId,
+    selectedCodexProjectIdentity?.codexProjectId,
+    selectedCodexProjectIdentity?.codexProjectKind,
+    selectedCodexProjectIdentity?.workspacePath,
+  ]);
   useLayoutEffect(() => {
     if (selectedProject) rememberProjectOpen(selectedProject.id);
   }, [rememberProjectOpen, selectedProject]);
@@ -2240,7 +2262,11 @@ export function App() {
     ) as Record<TaskStatus, Task[]>;
   }, [filteredTasks]);
 
-  const mainBoardItems = boardDisplaySettings.mainStatuses;
+  const mainBoardItems = boardDisplaySettings.mainStatuses.filter(
+    (status) => status !== "blocked"
+      || !hasLoadedTasks
+      || tasks.some((task) => task.status === "blocked"),
+  );
   const mainColumnCount = Math.max(mainBoardItems.length, 1);
   const mainBoardMinWidth = (mainColumnCount * 300) + ((mainColumnCount - 1) * 24);
   const mainBoardMaxWidth = (mainColumnCount * 400) + ((mainColumnCount - 1) * 24);
@@ -4143,6 +4169,7 @@ export function App() {
             available
             projectId={selectedProjectId || null}
             issueId={detailTaskId}
+            codexProjectIdentity={selectedCodexProjectIdentity}
             onThreadsChange={setAiThreads}
             openThreadRequest={aiOpenThreadRequest}
           />
