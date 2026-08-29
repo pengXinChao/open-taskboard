@@ -313,19 +313,15 @@ function buildOpenThreadInstruction(
 ) {
   const issueRef = task.externalKey ?? task.identifier;
   const prefix = `[$manage-taskboard](${skillPath}) [${issueRef}] ${task.title}`;
-  const jiraCloseout = text(
-    "书面报告后把结论写入评论。不要把 Jira 议题移到 in_review。能继续则保持 in_progress；需要人介入则移到 blocked。",
-    "After the written report, add a comment with your conclusion. Do not move a Jira issue to in_review. Keep it in_progress if work can continue; move it to blocked if a person must intervene.",
-  );
   if (isJiraDefectType(task.issueType)) {
     return text(
-      `${prefix}\n这是 Jira 故障。先阅读议题和附件，做诊断审查（现象、复现、影响面、可能原因）并书面报告。\n${jiraCloseout}`,
-      `${prefix}\nThis is a Jira defect. First read the issue and attachments, then diagnose (symptoms, reproduction, impact, likely cause) and report in writing.\n${jiraCloseout}`,
+      `${prefix}\n这是 Jira 故障。先阅读议题和附件，做诊断审查（现象、复现、影响面、可能原因）并书面报告。`,
+      `${prefix}\nThis is a Jira defect. First read the issue and attachments, then diagnose (symptoms, reproduction, impact, likely cause) and report in writing.`,
     );
   }
   return text(
-    `${prefix}\n先阅读议题，复述需求、范围、缺口和验收标准并报告你的理解。\n${jiraCloseout}`,
-    `${prefix}\nFirst read the issue, then restate the requirement, scope, gaps, and acceptance criteria, and report your understanding.\n${jiraCloseout}`,
+    `${prefix}\n先阅读议题，复述需求、范围、缺口和验收标准并报告你的理解。`,
+    `${prefix}\nFirst read the issue, then restate the requirement, scope, gaps, and acceptance criteria, and report your understanding.`,
   );
 }
 const RECENT_PROJECT_IDS_KEY = "taskboard.recentProjectIds.v1";
