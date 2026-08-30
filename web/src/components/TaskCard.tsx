@@ -14,6 +14,7 @@ import {
 import { labelPresentation } from "../labels";
 import { taskPriorityLabel, useTaskboardI18n } from "../i18n";
 import { CODEX_AGENT_ACTOR, actorKey, assigneeTargetForActor } from "../actors";
+import { formatTaskDuration, taskTodaySeconds } from "../timeTracking";
 import type {
   TaskCardPresentation,
   TaskConversationItem,
@@ -45,6 +46,7 @@ interface TaskCardProps {
   onCreateLabel: (label: string) => Promise<void>;
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
+  onTimerPausedChange?: (task: Task, paused: boolean) => Promise<Task>;
   onComplete?: (task: Task) => void;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
@@ -212,8 +214,8 @@ function ProcessingStatusRow({
       {running && <img className="task-processing-glyph" src={processingAnimation} alt="" aria-hidden="true" />}
       <span className="task-processing-label">
         {running
-          ? (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
-          : text("暂停处理", "Processing paused")}
+          ? (elapsed ? text(`Agent 已运行 ${elapsed}...`, `Agent running for ${elapsed}...`) : text("Agent 正在运行...", "Agent running..."))
+          : text("Agent 未运行", "Agent not running")}
       </span>
       <span className="task-processing-spacer" aria-hidden="true" />
       {presentation.conversations.length > 0 && (
@@ -221,6 +223,52 @@ function ProcessingStatusRow({
           conversations={presentation.conversations}
           onOpenConversation={onOpenConversation}
         />
+      )}
+    </div>
+  );
+}
+
+function TaskTimingRow({
+  task,
+  now,
+  saving,
+  onToggle,
+}: {
+  task: Task;
+  now: number;
+  saving: boolean;
+  onToggle: () => void;
+}) {
+  const { text } = useTaskboardI18n();
+  const tracking = task.timeTracking;
+  if (!tracking) return null;
+  const seconds = taskTodaySeconds(tracking, now);
+  const processing = task.status === "in_progress";
+  if (!processing && seconds === 0) return null;
+  return (
+    <div className={`task-timing-row${processing && !tracking.paused ? " is-running" : ""}`}>
+      <span>{text(`今日处理 ${formatTaskDuration(seconds)}`, `Today ${formatTaskDuration(seconds)}`)}</span>
+      {processing && (
+        <>
+          <span className="task-timing-state">
+            {tracking.paused ? text("已暂停", "Paused") : text("计时中", "Tracking")}
+          </span>
+          <button
+            type="button"
+            disabled={saving}
+            draggable={false}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggle();
+            }}
+          >
+            {saving
+              ? text("保存中…", "Saving…")
+              : tracking.paused
+                ? text("继续", "Resume")
+                : text("暂停", "Pause")}
+          </button>
+        </>
       )}
     </div>
   );
@@ -401,6 +449,7 @@ export function TaskCard({
   onCreateLabel,
   onEdit,
   onUpdate,
+  onTimerPausedChange,
   onComplete,
   onContextMenu,
   onDragStart,
@@ -409,8 +458,10 @@ export function TaskCard({
 }: TaskCardProps) {
   const { locale, text } = useTaskboardI18n();
   const displayIdentifier = task.externalKey ?? task.identifier;
+  const hasAgentAssociation = Boolean(task.threadId) || presentation.conversations.length > 0;
   const [propertyMenu, setPropertyMenu] = useState<"priority" | "labels" | "assignee" | null>(null);
   const [savingProperty, setSavingProperty] = useState<"priority" | "labels" | "dueDate" | "assignee" | null>(null);
+  const [savingTimer, setSavingTimer] = useState(false);
   const creator: ActorIdentity = {
     type: task.creatorType,
     id: task.creatorId,
@@ -441,6 +492,14 @@ export function TaskCard({
     void onUpdate(task, changes)
       .catch(() => {})
       .finally(() => setSavingProperty((current) => current === property ? null : current));
+  }
+
+  function toggleTimer() {
+    if (!task.timeTracking || !onTimerPausedChange) return;
+    setSavingTimer(true);
+    void onTimerPausedChange(task, !task.timeTracking.paused)
+      .catch(() => {})
+      .finally(() => setSavingTimer(false));
   }
 
   return (
@@ -474,6 +533,14 @@ export function TaskCard({
       <div className="card-topline">
         <span className="card-reference">
           <span className="task-identifier">ID: {displayIdentifier}</span>
+          {task.jiraStatusOverride && (
+            <span
+              className="jira-local-status-badge"
+              aria-label={text("Jira 状态仅在本地修改", "Jira status changed locally only")}
+            >
+              {text("仅本地", "Local only")}
+            </span>
+          )}
         </span>
         {presentation.unread && <span className="task-unread-dot" aria-label={text("有未读更新", "Unread updates")} />}
         {task.status === "in_review" && onComplete && (
@@ -577,14 +644,18 @@ export function TaskCard({
         </div>
       )}
 
+      <TaskTimingRow task={task} now={now} saving={savingTimer} onToggle={toggleTimer} />
+
       {processingCard && (
         <>
           <ProcessingProgress presentation={presentation} />
-          <ProcessingStatusRow
-            presentation={presentation}
-            now={now}
-            onOpenConversation={onOpenConversation}
-          />
+          {hasAgentAssociation && (
+            <ProcessingStatusRow
+              presentation={presentation}
+              now={now}
+              onOpenConversation={onOpenConversation}
+            />
+          )}
         </>
       )}
     </article>

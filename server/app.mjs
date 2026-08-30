@@ -355,6 +355,23 @@ function parseDueDate(value, name = "dueDate") {
   return date;
 }
 
+function parseTimeTrackingDate(value) {
+  const date = stringField(value, "date", { required: true, maxLength: 10 });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new ApiError(400, "INVALID_QUERY_PARAMETER", "'date' must use YYYY-MM-DD");
+  }
+  const [year, month, day] = date.split("-").map(Number);
+  const parsed = new Date(year, month - 1, day);
+  if (
+    parsed.getFullYear() !== year
+    || parsed.getMonth() !== month - 1
+    || parsed.getDate() !== day
+  ) {
+    throw new ApiError(400, "INVALID_QUERY_PARAMETER", "'date' must be a valid local date");
+  }
+  return date;
+}
+
 function parseDevelopmentContext(value) {
   if (value === null) return null;
   assertPlainObject(value);
@@ -686,6 +703,15 @@ function parseMove(body) {
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
   };
+}
+
+function parseTaskTimer(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "paused"]));
+  if (typeof body.paused !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "'paused' must be a boolean");
+  }
+  return { version: parseVersion(body.version), paused: body.paused };
 }
 
 function parseArchive(body) {
@@ -2458,6 +2484,33 @@ export function createTaskboardServer(options = {}) {
         });
       }
 
+      if (pathname === "/api/local/task-time") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertAllowedQuery(
+          url.searchParams,
+          new Set(["date", "projectId"]),
+          "GET /api/local/task-time",
+        );
+        const date = parseTimeTrackingDate(url.searchParams.get("date"));
+        const projectIdValue = url.searchParams.get("projectId");
+        const projectId = projectIdValue === null ? undefined : validateProjectId(projectIdValue);
+        return sendJson(response, 200, database.getDailyTaskTime(date, projectId));
+      }
+
+      const taskTimerRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/timer$/);
+      if (taskTimerRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/timer");
+        const id = decodeRouteSegment(taskTimerRoute[1], "Task id");
+        if (id.length === 0 || id.length > 128) {
+          throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
+        }
+        const input = parseTaskTimer(await readJson(request));
+        const task = database.setTaskTimerPaused(id, input.version, input.paused);
+        events.emit("task.timer.updated", { task });
+        return sendJson(response, 200, { task });
+      }
+
 
       let currentCloudConfig = null;
       if (pathname.startsWith("/api/")) {
@@ -3144,6 +3197,8 @@ export function createTaskboardServer(options = {}) {
           const move = resolveInputThreadBinding(parseMove(await readJson(request)));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          let jiraChanged = false;
+          let jiraStatusOverride = false;
           if (current.source === "jira") {
             if (current.version !== move.version) {
               throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
@@ -3154,17 +3209,39 @@ export function createTaskboardServer(options = {}) {
             if (current.archivedAt !== null) {
               throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
             }
-            await jira.moveTask(current, move.status);
+            if (current.status === move.status) {
+              jiraStatusOverride = current.jiraStatusOverride;
+            } else {
+              jiraChanged = await jira.moveTask(current, move.status);
+              jiraStatusOverride = !jiraChanged;
+            }
           }
-          const task = database.moveTask(
-            id,
-            move.version,
-            move.status,
-            move.sortOrder,
-            move.threadId,
-            move.threadBinding,
-            actorFromRequest(request),
-          );
+          let task;
+          try {
+            task = database.moveTask(
+              id,
+              move.version,
+              move.status,
+              move.sortOrder,
+              move.threadId,
+              move.threadBinding,
+              actorFromRequest(request),
+              jiraStatusOverride,
+            );
+          } catch (error) {
+            if (jiraChanged) {
+              try {
+                await jira.reconcile();
+              } catch {
+                throw new ApiError(
+                  502,
+                  "JIRA_RECONCILE_FAILED",
+                  "Jira 已更新，但 Taskboard 重新同步失败，请手动同步",
+                );
+              }
+            }
+            throw error;
+          }
           events.emit("task.moved", { task });
           return sendJson(response, 200, { task });
         }

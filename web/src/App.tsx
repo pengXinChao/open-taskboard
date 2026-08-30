@@ -40,6 +40,7 @@ import {
   resolveTaskboardUrl,
   resolveTaskboardWebSocketUrl,
   restoreTask as restoreTaskRequest,
+  setTaskTimerPaused as setTaskTimerPausedRequest,
   setApiText,
   setCurrentUserActor,
   syncJiraConnection,
@@ -85,6 +86,7 @@ import {
   type NewTaskEditorDraft,
 } from "./components/TaskEditor";
 import { TaskFilterMenu } from "./components/TaskFilterMenu";
+import { TimeTrackingView } from "./components/TimeTrackingView";
 import { taskboardStorage } from "./storage";
 import {
   installEmbeddedExternalLinkHandler,
@@ -140,7 +142,7 @@ import { createRevisionPoller, createRevisionWebSocketClient, getRevisionPolling
 
 type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
-type BoardView = "readme" | "dashboard" | "issues" | "list" | "gantt";
+type BoardView = "readme" | "dashboard" | "issues" | "list" | "gantt" | "time";
 type DetailSourceScroll =
   | { projectId: string; view: "issues"; status: TaskStatus; scrollTop: number }
   | { projectId: string; view: "list"; scrollTop: number };
@@ -320,7 +322,7 @@ function readIssueActivityKeys(storageKey: string): Record<string, string> {
 
 function readProjectBoardView(projectId: string): BoardView {
   const view = taskboardStorage.getItem(`${PROJECT_VIEW_KEY_PREFIX}${projectId}`);
-  return view === "readme" || view === "dashboard" || view === "list" || view === "gantt" || view === "issues"
+  return view === "readme" || view === "dashboard" || view === "list" || view === "gantt" || view === "issues" || view === "time"
     ? view
     : "issues";
 }
@@ -349,6 +351,7 @@ const EVENT_NAMES = [
   "task.created",
   "task.updated",
   "task.moved",
+  "task.timer.updated",
   "task.archived",
   "task.restored",
   "task.deleted",
@@ -866,6 +869,10 @@ export function App() {
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
   const isAllProjects = selectedProjectId === ALL_PROJECTS_ID;
   const isJiraProject = selectedProject?.source === "jira";
+  const taskTimeTrackingAvailable = taskboardMetadata?.mode !== "cloud";
+  useEffect(() => {
+    if (!taskTimeTrackingAvailable && boardView === "time") setBoardView("issues");
+  }, [boardView, taskTimeTrackingAvailable]);
   const boardDisplaySettings = projectBoardDisplaySettings[selectedProjectId]
     ?? DEFAULT_BOARD_DISPLAY_SETTINGS;
   const automationModels = automationCatalog && automationCatalog.projectId === selectedProject?.id
@@ -2182,7 +2189,14 @@ export function App() {
     let disposed = false;
     const sync = async () => {
       try {
-        const progress = await getCodexThreadProgress(trackedCodexThreadIds);
+        const chunks = Array.from(
+          { length: Math.ceil(trackedCodexThreadIds.length / 64) },
+          (_, index) => trackedCodexThreadIds.slice(index * 64, (index + 1) * 64),
+        );
+        const snapshots = await Promise.all(chunks.map((threadIds) => (
+          getCodexThreadProgress(threadIds)
+        )));
+        const progress = Object.assign({}, ...snapshots);
         if (!disposed) {
           setCodexThreadProgress((current) => (
             JSON.stringify(current) === JSON.stringify(progress) ? current : progress
@@ -2223,6 +2237,18 @@ export function App() {
     setOtherTasksTab(otherTaskTabs[0]);
   }, [otherTaskTabsKey, otherTasksAvailable, otherTasksTab]);
 
+  const aiThreadsByTaskId = useMemo(() => {
+    const grouped = new Map<string, AiChatThread[]>();
+    for (const thread of aiThreads) {
+      const taskId = thread.origin.issueId;
+      if (!taskId) continue;
+      const threads = grouped.get(taskId) ?? [];
+      threads.push(thread);
+      grouped.set(taskId, threads);
+    }
+    return grouped;
+  }, [aiThreads]);
+
   const taskPresentations = useMemo(() => Object.fromEntries(tasks.map((task) => {
     const unread = (task.status === "in_review" || task.status === "blocked")
       && readActivityKeys[task.id] !== task.activityKey;
@@ -2232,14 +2258,14 @@ export function App() {
     const taskThreadId = normalizeCodexThreadId(task.threadId);
     return [task.id, taskCardPresentation(
       task,
-      aiThreads,
+      aiThreadsByTaskId.get(task.id) ?? [],
       unread,
       runningNativeThreadId,
       hostContext?.threadTodoProgress ?? null,
       taskThreadId ? codexThreadProgress[taskThreadId] ?? null : undefined,
     )];
   })) as Record<string, TaskCardPresentation>, [
-    aiThreads,
+    aiThreadsByTaskId,
     codexThreadProgress,
     hostContext?.threadId,
     hostContext?.threadRunning,
@@ -2248,8 +2274,9 @@ export function App() {
     tasks,
   ]);
   const hasRunningTask = useMemo(
-    () => Object.values(taskPresentations).some((presentation) => presentation.processing.running),
-    [taskPresentations],
+    () => Object.values(taskPresentations).some((presentation) => presentation.processing.running)
+      || tasks.some((task) => Boolean(task.timeTracking?.activeStartedAt)),
+    [taskPresentations, tasks],
   );
 
   useEffect(() => {
@@ -2594,6 +2621,26 @@ export function App() {
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === previous.id ? previous : candidate,
       )));
+      setActionError(error instanceof ApiError && error.code === "VERSION_CONFLICT"
+        ? text(
+          "该议题已在其他位置更新，看板已重新同步。",
+          "This issue changed elsewhere. The board has been synced.",
+        )
+        : errorMessage(error));
+      if (taskScopeProjectId) void refreshTasks(taskScopeProjectId, { quiet: true });
+      throw error;
+    }
+  }
+
+  async function updateTaskTimerPaused(task: Task, paused: boolean): Promise<Task> {
+    setActionError(null);
+    try {
+      const updated = await setTaskTimerPausedRequest(task, paused);
+      setTasks((current) => current.map((candidate) => (
+        candidate.id === updated.id ? updated : candidate
+      )));
+      return updated;
+    } catch (error) {
       setActionError(error instanceof ApiError && error.code === "VERSION_CONFLICT"
         ? text(
           "该议题已在其他位置更新，看板已重新同步。",
@@ -3437,6 +3484,16 @@ export function App() {
             >
               {text("甘特图", "Gantt")}
             </button>
+            {taskTimeTrackingAvailable && (
+              <button
+                className={`view-tab${boardView === "time" ? " active" : ""}`}
+                type="button"
+                aria-pressed={boardView === "time"}
+                onClick={() => selectBoardView("time")}
+              >
+                {text("耗时", "Time")}
+              </button>
+            )}
             {!isAllProjects && (
               <button
                 className={`view-tab${boardView === "readme" ? " active" : ""}`}
@@ -3618,6 +3675,13 @@ export function App() {
               </button>
             </div>
           </div>
+        ) : boardView === "time" ? (
+          <TimeTrackingView
+            projectId={isAllProjects ? undefined : selectedProjectId}
+            refreshToken={[...tasks, ...archivedTasks]
+              .map((task) => `${task.id}:${task.version}`)
+              .join("|")}
+          />
         ) : boardView === "readme" && selectedProject ? (
           <ProjectReadmeView
             key={selectedProjectId}
@@ -3728,6 +3792,7 @@ export function App() {
                         onCreate={(initialStatus) => setEditor({ task: null, status: initialStatus })}
                         onEdit={openTaskDetail}
                         onUpdate={updateTaskProperties}
+                        onTimerPausedChange={updateTaskTimerPaused}
                         onComplete={(task) => void moveTask(task, "done")}
                         onContextMenu={openTaskContextMenu}
                         onDragStart={startTaskDrag}
@@ -3771,6 +3836,7 @@ export function App() {
                     onDelete={setPendingArchivedTaskDelete}
                     onEdit={openTaskDetail}
                     onUpdate={updateTaskProperties}
+                    onTimerPausedChange={updateTaskTimerPaused}
                     onContextMenu={openTaskContextMenu}
                     onDragStart={startTaskDrag}
                     onDragEnd={endTaskDrag}

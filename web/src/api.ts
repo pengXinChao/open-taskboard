@@ -15,6 +15,7 @@ import type {
   ComposerTurnInput,
   CodexThreadBinding,
   DevelopmentScan,
+  DailyTaskTimeSummary,
   HostContext,
   IssueRelationOrigin,
   IssueRelationType,
@@ -607,6 +608,27 @@ export async function moveTask(
     },
   );
   return data.task;
+}
+
+export async function setTaskTimerPaused(task: Task, paused: boolean): Promise<Task> {
+  const data = await request<{ task: Task }>(
+    `/api/local/tasks/${encodeURIComponent(task.id)}/timer`,
+    {
+      method: "POST",
+      body: JSON.stringify({ version: task.version, paused }),
+    },
+  );
+  return data.task;
+}
+
+export async function getDailyTaskTime(
+  date: string,
+  projectId?: string,
+  signal?: AbortSignal,
+): Promise<DailyTaskTimeSummary> {
+  const query = new URLSearchParams({ date });
+  if (projectId) query.set("projectId", projectId);
+  return request<DailyTaskTimeSummary>(`/api/local/task-time?${query}`, { signal });
 }
 
 export async function archiveTask(task: Task, threadId?: string): Promise<Task> {

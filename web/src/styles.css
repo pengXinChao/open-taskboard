@@ -2494,6 +2494,17 @@ kbd {
   white-space: nowrap;
 }
 
+.jira-local-status-badge {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  color: var(--warning);
+  font-size: 9px;
+  font-weight: 550;
+  line-height: 15px;
+}
+
 .task-card h3 {
   display: -webkit-box;
   min-width: 0;
@@ -9194,6 +9205,48 @@ kbd {
 
 .task-progress-segments > span.is-complete {
   background: #00a558;
+}
+
+.task-timing-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 22px;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 550;
+}
+
+.task-timing-row.is-running > span:first-child {
+  color: #00a558;
+}
+
+.task-timing-state {
+  color: var(--text-tertiary);
+}
+
+.task-timing-row button {
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.task-timing-row button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.task-timing-row button:disabled {
+  cursor: default;
+  opacity: .55;
 }
 
 .task-processing-row {

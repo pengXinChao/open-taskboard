@@ -118,6 +118,7 @@ function normalizeIssue(issue, config, index = 0) {
     externalId,
     externalKey,
     externalUrl: `${config.baseUrl}/browse/${encodeURIComponent(externalKey)}`,
+    externalStatusId: limitedString(fields.status?.id ?? fields.status?.name, "unknown", 128),
     createdAt: typeof fields.created === "string" ? fields.created : new Date().toISOString(),
     updatedAt: typeof fields.updated === "string" ? fields.updated : new Date().toISOString(),
   };
@@ -283,7 +284,7 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
     return pendingSync;
   }
 
-  async function resolveTransition(config, issueKey, targetStatus) {
+  async function resolveTransition(config, issueKey, targetStatus, { allowUnavailable = false } = {}) {
     const payload = await request(
       config,
       `/rest/api/2/issue/${encodeURIComponent(issueKey)}/transitions?expand=transitions.fields`,
@@ -296,6 +297,7 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       taskboardStatus: taskStatusFromJira(candidate.to),
     }));
     if (matches.length === 0) {
+      if (allowUnavailable) return null;
       throw new ApiError(
         409,
         "JIRA_TRANSITION_UNAVAILABLE",
@@ -447,7 +449,7 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       return false;
     },
     async moveTask(task, status) {
-      if (status === task.status) return;
+      if (status === task.status) return false;
       const config = await configStore.read();
       if (!config) throw new ApiError(409, "JIRA_NOT_CONFIGURED", "Jira 尚未配置");
       if (task.externalOrigin !== config.originId || !task.externalKey) {
@@ -458,8 +460,15 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
         );
       }
       await assertLiveOrigin(config);
-      const transition = await resolveTransition(config, task.externalKey, status);
+      const transition = await resolveTransition(
+        config,
+        task.externalKey,
+        status,
+        { allowUnavailable: true },
+      );
+      if (!transition) return false;
       await applyTransition(config, task.externalKey, transition);
+      return true;
     },
   };
 }

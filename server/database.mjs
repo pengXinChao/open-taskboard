@@ -22,6 +22,26 @@ function now() {
   return new Date().toISOString();
 }
 
+function localDateKey(value = new Date()) {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function localDayBounds(date) {
+  const [year, month, day] = date.split("-").map(Number);
+  const start = new Date(year, month - 1, day);
+  const end = new Date(year, month - 1, day + 1);
+  return { start, end };
+}
+
+function overlapSeconds(startedAt, endedAt, rangeStart, rangeEnd) {
+  const start = Math.max(new Date(startedAt).getTime(), rangeStart.getTime());
+  const end = Math.min(new Date(endedAt).getTime(), rangeEnd.getTime());
+  return Math.max(0, Math.floor((end - start) / 1000));
+}
+
 function commentConversationTitle(body) {
   const firstLine = String(body ?? "")
     .split(/\r?\n/)
@@ -264,6 +284,13 @@ function taskFromRow(row) {
     externalOrigin: row.external_origin ?? null,
     externalKey: row.external_key ?? null,
     externalUrl: row.external_url ?? null,
+    jiraStatusOverride: row.jira_status_override === 1,
+    timeTracking: {
+      paused: row.timer_paused === 1,
+      date: null,
+      closedSeconds: 0,
+      activeStartedAt: null,
+    },
     archivedAt: row.archived_at,
     version: row.version,
     createdAt: row.created_at,
@@ -450,6 +477,7 @@ export class TaskboardDatabase {
     this.database = new DatabaseSync(filename);
     this.database.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.#migrate();
+    this.#initializeTaskTimers();
     this.interruptAbandonedAiChatRuns();
   }
 
@@ -502,6 +530,9 @@ export class TaskboardDatabase {
         external_id TEXT,
         external_key TEXT,
         external_url TEXT,
+        jira_status_override INTEGER NOT NULL DEFAULT 0 CHECK (jira_status_override IN (0, 1)),
+        jira_remote_status_id TEXT,
+        timer_paused INTEGER NOT NULL DEFAULT 0 CHECK (timer_paused IN (0, 1)),
         archived_at TEXT,
         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
         created_at TEXT NOT NULL,
@@ -510,6 +541,24 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS tasks_project_status_sort
         ON tasks(project_id, archived_at, status, sort_order, created_at);
+
+      CREATE TABLE IF NOT EXISTS task_time_entries (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL,
+        project_name TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        start_reason TEXT NOT NULL,
+        end_reason TEXT
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS task_time_entries_one_active
+        ON task_time_entries(task_id)
+        WHERE ended_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS task_time_entries_range
+        ON task_time_entries(started_at, ended_at, task_id);
 
       CREATE TABLE IF NOT EXISTS comments (
         id TEXT PRIMARY KEY,
@@ -702,6 +751,15 @@ export class TaskboardDatabase {
     }
     if (!taskColumns.some((column) => column.name === "recurrence_unit")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN recurrence_unit TEXT");
+    }
+    if (!taskColumns.some((column) => column.name === "timer_paused")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN timer_paused INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!taskColumns.some((column) => column.name === "jira_status_override")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN jira_status_override INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!taskColumns.some((column) => column.name === "jira_remote_status_id")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN jira_remote_status_id TEXT");
     }
     this.#migrateTaskStatuses();
     const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
@@ -986,6 +1044,125 @@ export class TaskboardDatabase {
     `).run(timestamp);
   }
 
+  #initializeTaskTimers() {
+    const timestamp = now();
+    const tasks = this.database.prepare(`
+      SELECT tasks.id, tasks.project_id, projects.name AS project_name
+      FROM tasks
+      JOIN projects ON projects.id = tasks.project_id
+      WHERE tasks.status = 'in_progress'
+        AND tasks.archived_at IS NULL
+        AND tasks.timer_paused = 0
+        AND NOT EXISTS (
+          SELECT 1 FROM task_time_entries
+          WHERE task_time_entries.task_id = tasks.id
+            AND task_time_entries.ended_at IS NULL
+        )
+    `).all();
+    for (const task of tasks) {
+      // 进行中的片段跨 App 生命周期保存；首次升级只从功能初始化时刻开始，不反推历史。
+      this.#openTaskTimer(
+        task.id,
+        task.project_id,
+        task.project_name,
+        timestamp,
+        "feature_initialized",
+      );
+    }
+  }
+
+  #openTaskTimer(taskId, projectId, projectName, timestamp, reason) {
+    const active = this.database.prepare(`
+      SELECT 1 FROM task_time_entries
+      WHERE task_id = ? AND ended_at IS NULL
+    `).get(taskId);
+    if (active) return;
+    this.database.prepare(`
+      INSERT INTO task_time_entries (
+        id, task_id, project_id, project_name, started_at, ended_at, start_reason, end_reason
+      ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)
+    `).run(randomUUID(), taskId, projectId, projectName, timestamp, reason);
+  }
+
+  #closeTaskTimer(taskId, timestamp, reason) {
+    this.database.prepare(`
+      UPDATE task_time_entries
+      SET ended_at = ?, end_reason = ?
+      WHERE task_id = ? AND ended_at IS NULL
+    `).run(timestamp, reason, taskId);
+  }
+
+  #transitionTaskTimer({
+    taskId,
+    beforeStatus,
+    afterStatus,
+    beforeProjectId,
+    afterProjectId,
+    afterProjectName,
+    paused,
+    beforeArchived = false,
+    afterArchived = false,
+    timestamp,
+    reason,
+  }) {
+    const wasRunning = beforeStatus === "in_progress" && !paused && !beforeArchived;
+    const enteredProcessing = beforeStatus !== "in_progress" && afterStatus === "in_progress";
+    const leftProcessing = beforeStatus === "in_progress" && afterStatus !== "in_progress";
+    const nextPaused = enteredProcessing || leftProcessing || afterArchived ? false : paused;
+    const isRunning = afterStatus === "in_progress" && !nextPaused && !afterArchived;
+    const projectChanged = beforeProjectId !== afterProjectId;
+
+    if (wasRunning && (!isRunning || projectChanged)) {
+      this.#closeTaskTimer(taskId, timestamp, projectChanged ? "project_changed" : reason);
+    }
+    if (nextPaused !== paused) {
+      this.database.prepare("UPDATE tasks SET timer_paused = ? WHERE id = ?")
+        .run(nextPaused ? 1 : 0, taskId);
+    }
+    if (isRunning && (!wasRunning || projectChanged)) {
+      // 项目归属快照写在片段上，避免任务后来移动项目时改写历史日报。
+      this.#openTaskTimer(
+        taskId,
+        afterProjectId,
+        afterProjectName,
+        timestamp,
+        projectChanged ? "project_changed" : reason,
+      );
+    }
+  }
+
+  #attachTaskTiming(tasks, reference = new Date()) {
+    if (tasks.length === 0) return tasks;
+    const date = localDateKey(reference);
+    const { start, end } = localDayBounds(date);
+    const placeholders = tasks.map(() => "?").join(", ");
+    const entries = this.database.prepare(`
+      SELECT task_id, started_at, ended_at
+      FROM task_time_entries
+      WHERE task_id IN (${placeholders})
+        AND started_at < ?
+        AND (ended_at IS NULL OR ended_at > ?)
+      ORDER BY started_at, id
+    `).all(...tasks.map((task) => task.id), end.toISOString(), start.toISOString());
+    const timingByTask = new Map(tasks.map((task) => [task.id, {
+      paused: task.timeTracking.paused,
+      date,
+      closedSeconds: 0,
+      activeStartedAt: null,
+    }]));
+    for (const entry of entries) {
+      const timing = timingByTask.get(entry.task_id);
+      if (!timing) continue;
+      if (entry.ended_at === null) {
+        timing.activeStartedAt = entry.started_at;
+      } else {
+        timing.closedSeconds += overlapSeconds(entry.started_at, entry.ended_at, start, end);
+      }
+    }
+    for (const task of tasks) task.timeTracking = timingByTask.get(task.id);
+    return tasks;
+  }
+
   close() {
     this.database.close();
   }
@@ -1029,6 +1206,9 @@ export class TaskboardDatabase {
           due_date TEXT,
           recurrence_interval INTEGER,
           recurrence_unit TEXT,
+          jira_status_override INTEGER NOT NULL DEFAULT 0 CHECK (jira_status_override IN (0, 1)),
+          jira_remote_status_id TEXT,
+          timer_paused INTEGER NOT NULL DEFAULT 0 CHECK (timer_paused IN (0, 1)),
           archived_at TEXT,
           version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
           created_at TEXT NOT NULL,
@@ -1040,6 +1220,7 @@ export class TaskboardDatabase {
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path, git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
+          jira_status_override, jira_remote_status_id, timer_paused,
           archived_at, version, created_at, updated_at
         )
         SELECT
@@ -1047,6 +1228,7 @@ export class TaskboardDatabase {
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path, git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
+          jira_status_override, jira_remote_status_id, timer_paused,
           archived_at, version, created_at, updated_at
         FROM tasks;
 
@@ -1194,6 +1376,7 @@ export class TaskboardDatabase {
           git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
           external_source, external_origin, external_id, external_key, external_url,
+          jira_status_override, jira_remote_status_id,
           archived_at, version, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?,
@@ -1203,6 +1386,7 @@ export class TaskboardDatabase {
           NULL, NULL, NULL,
           NULL, ?, NULL, NULL,
           'jira', ?, ?, ?, ?,
+          0, ?,
           NULL, 1, ?, ?
         )
       `);
@@ -1212,6 +1396,7 @@ export class TaskboardDatabase {
           sort_order = ?, creator_type = ?, creator_id = ?, creator_name = ?, creator_avatar_url = ?,
           assignee_type = ?, assignee_id = ?, assignee_name = ?, assignee_avatar_url = ?,
           due_date = ?, external_origin = ?, external_id = ?, external_key = ?, external_url = ?,
+          jira_status_override = ?, jira_remote_status_id = ?,
           archived_at = NULL,
           version = version + 1, updated_at = ?
         WHERE id = ?
@@ -1245,16 +1430,31 @@ export class TaskboardDatabase {
             issue.externalId,
             issue.externalKey,
             issue.externalUrl,
+            issue.externalStatusId,
             issue.createdAt,
             issue.updatedAt,
           );
+          if (issue.status === "in_progress") {
+            this.#openTaskTimer(
+              issue.id,
+              JIRA_PROJECT_ID,
+              projectName,
+              timestamp,
+              "jira_sync",
+            );
+          }
           continue;
         }
 
+        const remoteStatusChanged = existing.jira_remote_status_id !== issue.externalStatusId;
+        // 本地覆盖只在远端状态未变化时有效；Jira 上的人工流转会恢复远端权威。
+        const preserveStatusOverride = existing.jira_status_override === 1 && !remoteStatusChanged;
+        const nextStatus = preserveStatusOverride ? existing.status : issue.status;
+        const nextStatusOverride = preserveStatusOverride ? 1 : 0;
         const changed = existing.identifier !== issue.identifier
           || existing.title !== issue.title
           || existing.description !== issue.description
-          || existing.status !== issue.status
+          || existing.status !== nextStatus
           || existing.priority !== issue.priority
           || existing.labels !== labels
           || existing.sort_order !== issue.sortOrder
@@ -1271,13 +1471,15 @@ export class TaskboardDatabase {
           || existing.external_id !== issue.externalId
           || existing.external_key !== issue.externalKey
           || existing.external_url !== issue.externalUrl
+          || existing.jira_status_override !== nextStatusOverride
+          || existing.jira_remote_status_id !== issue.externalStatusId
           || existing.archived_at !== null;
         if (!changed) continue;
         updateTask.run(
           issue.identifier,
           issue.title,
           issue.description,
-          issue.status,
+          nextStatus,
           issue.priority,
           labels,
           issue.sortOrder,
@@ -1294,14 +1496,29 @@ export class TaskboardDatabase {
           issue.externalId,
           issue.externalKey,
           issue.externalUrl,
+          nextStatusOverride,
+          issue.externalStatusId,
           issue.updatedAt,
           existing.id,
         );
+        this.#transitionTaskTimer({
+          taskId: existing.id,
+          beforeStatus: existing.status,
+          afterStatus: nextStatus,
+          beforeProjectId: JIRA_PROJECT_ID,
+          afterProjectId: JIRA_PROJECT_ID,
+          afterProjectName: projectName,
+          paused: existing.timer_paused === 1,
+          beforeArchived: existing.archived_at !== null,
+          afterArchived: false,
+          timestamp,
+          reason: "jira_sync",
+        });
       }
 
       if (archiveMissing) {
         const existingTasks = this.database.prepare(`
-          SELECT id FROM tasks
+          SELECT id, status, timer_paused FROM tasks
           WHERE project_id = ? AND external_source = 'jira' AND archived_at IS NULL
         `).all(JIRA_PROJECT_ID);
         const archiveTask = this.database.prepare(`
@@ -1312,6 +1529,19 @@ export class TaskboardDatabase {
         for (const task of existingTasks) {
           if (!seenTaskIds.has(task.id)) {
             archiveTask.run(timestamp, timestamp, task.id);
+            this.#transitionTaskTimer({
+              taskId: task.id,
+              beforeStatus: task.status,
+              afterStatus: task.status,
+              beforeProjectId: JIRA_PROJECT_ID,
+              afterProjectId: JIRA_PROJECT_ID,
+              afterProjectName: projectName,
+              paused: task.timer_paused === 1,
+              beforeArchived: false,
+              afterArchived: true,
+              timestamp,
+              reason: "jira_archived",
+            });
           }
         }
       }
@@ -1872,12 +2102,12 @@ export class TaskboardDatabase {
     const commentsByTask = this.#commentsForTaskActivity(rows.map((row) => row.id));
     const activitiesByTask = this.#activitiesForTasks(rows.map((row) => row.id));
     const previewImagesByTask = this.#taskPreviewImages(rows.map((row) => row.id));
-    return rows.map((row) => attachTaskActivity(
+    return this.#attachTaskTiming(rows.map((row) => attachTaskActivity(
       this.#taskWithRelations(row),
       commentsByTask.get(row.id) ?? [],
       activitiesByTask.get(row.id) ?? [],
       previewImagesByTask.get(row.id) ?? null,
-    ));
+    )));
   }
 
   getTask(id) {
@@ -1887,7 +2117,138 @@ export class TaskboardDatabase {
     const comments = this.#commentsForTaskActivity([task.id]).get(task.id) ?? [];
     const activities = this.#activitiesForTasks([task.id]).get(task.id) ?? [];
     const previewImage = this.#taskPreviewImages([task.id]).get(task.id) ?? null;
-    return attachTaskActivity(task, comments, activities, previewImage);
+    return this.#attachTaskTiming([
+      attachTaskActivity(task, comments, activities, previewImage),
+    ])[0];
+  }
+
+  getDailyTaskTime(date, projectId) {
+    const reference = new Date();
+    const { start, end } = localDayBounds(date);
+    const where = [
+      "task_time_entries.started_at < ?",
+      "(task_time_entries.ended_at IS NULL OR task_time_entries.ended_at > ?)",
+    ];
+    const values = [end.toISOString(), start.toISOString()];
+    if (projectId) {
+      where.push("task_time_entries.project_id = ?");
+      values.push(projectId);
+    }
+    const rows = this.database.prepare(`
+      SELECT
+        task_time_entries.task_id,
+        task_time_entries.project_id,
+        task_time_entries.project_name,
+        task_time_entries.started_at,
+        task_time_entries.ended_at,
+        task_time_entries.end_reason,
+        tasks.identifier,
+        tasks.external_key,
+        tasks.title,
+        tasks.status,
+        tasks.archived_at,
+        tasks.timer_paused
+      FROM task_time_entries
+      JOIN tasks ON tasks.id = task_time_entries.task_id
+      WHERE ${where.join(" AND ")}
+      ORDER BY task_time_entries.started_at, task_time_entries.id
+    `).all(...values);
+    const projects = new Map();
+    const endedTaskIds = new Set();
+    for (const row of rows) {
+      const endedAt = row.ended_at ?? reference.toISOString();
+      // 日报按片段与自然日的交集累计，跨午夜时不会把整段归到开始日。
+      const seconds = overlapSeconds(row.started_at, endedAt, start, end);
+      if (seconds <= 0) continue;
+      if (
+        row.ended_at !== null
+        && new Date(row.ended_at) >= start
+        && new Date(row.ended_at) < end
+        && row.end_reason !== "manual_pause"
+        && row.end_reason !== "project_changed"
+      ) {
+        // 结束处理只统计离开处理中的任务；暂停和项目迁移都会关闭片段，但不代表处理结束。
+        endedTaskIds.add(row.task_id);
+      }
+      let project = projects.get(row.project_id);
+      if (!project) {
+        project = {
+          projectId: row.project_id,
+          projectName: row.project_name,
+          totalSeconds: 0,
+          tasks: new Map(),
+        };
+        projects.set(row.project_id, project);
+      }
+      let task = project.tasks.get(row.task_id);
+      if (!task) {
+        task = {
+          taskId: row.task_id,
+          identifier: row.external_key ?? row.identifier,
+          title: row.title,
+          status: row.status,
+          archivedAt: row.archived_at,
+          totalSeconds: 0,
+          active: false,
+          paused: row.timer_paused === 1,
+        };
+        project.tasks.set(row.task_id, task);
+      }
+      task.totalSeconds += seconds;
+      task.active ||= row.ended_at === null && date === localDateKey(reference);
+      project.totalSeconds += seconds;
+    }
+    const resultProjects = [...projects.values()].map((project) => ({
+      projectId: project.projectId,
+      projectName: project.projectName,
+      totalSeconds: project.totalSeconds,
+      tasks: [...project.tasks.values()].sort((left, right) => (
+        right.totalSeconds - left.totalSeconds
+        || left.identifier.localeCompare(right.identifier)
+      )),
+    })).sort((left, right) => (
+      right.totalSeconds - left.totalSeconds
+      || left.projectName.localeCompare(right.projectName)
+      || left.projectId.localeCompare(right.projectId)
+    ));
+    return {
+      date,
+      asOf: reference.toISOString(),
+      totalSeconds: resultProjects.reduce((total, project) => total + project.totalSeconds, 0),
+      endedTaskCount: endedTaskIds.size,
+      projects: resultProjects,
+    };
+  }
+
+  setTaskTimerPaused(id, version, paused) {
+    const current = this.#requireTask(id);
+    this.#requireVersion(current, version);
+    if (current.archivedAt !== null || current.status !== "in_progress") {
+      throw new ApiError(409, "TASK_TIMER_UNAVAILABLE", "Only active in-progress tasks can be paused or resumed");
+    }
+    if (current.timeTracking.paused === paused) return current;
+    const timestamp = now();
+    const project = this.database.prepare("SELECT name FROM projects WHERE id = ?")
+      .get(current.projectId);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.database.prepare(`
+        UPDATE tasks
+        SET timer_paused = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ?
+      `).run(paused ? 1 : 0, timestamp, current.id, version);
+      if (result.changes !== 1) this.#throwMissingOrConflict(id, version);
+      if (paused) {
+        this.#closeTaskTimer(current.id, timestamp, "manual_pause");
+      } else {
+        this.#openTaskTimer(current.id, current.projectId, project.name, timestamp, "manual_resume");
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getTask(current.id);
   }
 
   getTaskTree(id, direction, depth) {
@@ -2045,6 +2406,9 @@ export class TaskboardDatabase {
         timestamp,
         timestamp,
       );
+      if (input.status === "in_progress") {
+        this.#openTaskTimer(id, input.projectId, project.name, timestamp, "task_created");
+      }
       this.database.exec("COMMIT");
       return this.getTask(id);
     } catch (error) {
@@ -2060,6 +2424,8 @@ export class TaskboardDatabase {
     const targetProject = Object.hasOwn(changes, "projectId")
       ? this.database.prepare("SELECT id, name, workspace_path, labels FROM projects WHERE id = ?").get(changes.projectId)
       : null;
+    const currentProject = this.database.prepare("SELECT name FROM projects WHERE id = ?")
+      .get(current.projectId);
     if (Object.hasOwn(changes, "projectId") && !targetProject) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${changes.projectId}' does not exist`);
     }
@@ -2182,6 +2548,19 @@ export class TaskboardDatabase {
           UPDATE projects SET labels = ?, updated_at = ? WHERE id = ?
         `).run(JSON.stringify(mergedLabels), timestamp, destinationProjectId);
       }
+      this.#transitionTaskTimer({
+        taskId: current.id,
+        beforeStatus: current.status,
+        afterStatus: changes.status ?? current.status,
+        beforeProjectId: current.projectId,
+        afterProjectId: destinationProjectId,
+        afterProjectName: projectChanged ? targetProject.name : currentProject.name,
+        paused: current.timeTracking.paused,
+        beforeArchived: current.archivedAt !== null,
+        afterArchived: current.archivedAt !== null,
+        timestamp,
+        reason: "task_updated",
+      });
       this.#recordTaskActivity(current.id, actor, activityChanges, timestamp);
       this.database.exec("COMMIT");
     } catch (error) {
@@ -2191,7 +2570,10 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
-  moveTask(id, version, status, sortOrder, threadId, threadBinding, actor) {
+  /**
+   * 移动任务并原子记录 Jira 本地状态覆盖；`jiraStatusOverride` 只由 Jira 路由决策。
+   */
+  moveTask(id, version, status, sortOrder, threadId, threadBinding, actor, jiraStatusOverride = false) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     if (current.archivedAt !== null) {
@@ -2214,6 +2596,8 @@ export class TaskboardDatabase {
     }
 
     const timestamp = now();
+    const project = this.database.prepare("SELECT name FROM projects WHERE id = ?")
+      .get(current.projectId);
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
@@ -2223,12 +2607,34 @@ export class TaskboardDatabase {
     try {
       const result = this.database.prepare(`
         UPDATE tasks
-        SET status = ?, sort_order = ?, ${threadAssignment} version = version + 1, updated_at = ?
+        SET status = ?, sort_order = ?, jira_status_override = ?,
+          ${threadAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
-      `).run(status, sortOrder, ...(storedBinding ?? []), timestamp, current.id, version);
+      `).run(
+        status,
+        sortOrder,
+        jiraStatusOverride ? 1 : 0,
+        ...(storedBinding ?? []),
+        timestamp,
+        current.id,
+        version,
+      );
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
+      this.#transitionTaskTimer({
+        taskId: current.id,
+        beforeStatus: current.status,
+        afterStatus: status,
+        beforeProjectId: current.projectId,
+        afterProjectId: current.projectId,
+        afterProjectName: project.name,
+        paused: current.timeTracking.paused,
+        beforeArchived: current.archivedAt !== null,
+        afterArchived: current.archivedAt !== null,
+        timestamp,
+        reason: "task_moved",
+      });
       this.#recordTaskActivity(
         current.id,
         actor,
@@ -2247,6 +2653,8 @@ export class TaskboardDatabase {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     const timestamp = now();
+    const project = this.database.prepare("SELECT name FROM projects WHERE id = ?")
+      .get(current.projectId);
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
@@ -2262,6 +2670,19 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
+      this.#transitionTaskTimer({
+        taskId: current.id,
+        beforeStatus: current.status,
+        afterStatus: current.status,
+        beforeProjectId: current.projectId,
+        afterProjectId: current.projectId,
+        afterProjectName: project.name,
+        paused: current.timeTracking.paused,
+        beforeArchived: current.archivedAt !== null,
+        afterArchived: true,
+        timestamp,
+        reason: "task_archived",
+      });
       this.#recordTaskActivity(
         current.id,
         actor,
@@ -2283,6 +2704,8 @@ export class TaskboardDatabase {
       throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be restored");
     }
     const timestamp = now();
+    const project = this.database.prepare("SELECT name FROM projects WHERE id = ?")
+      .get(current.projectId);
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
@@ -2298,6 +2721,19 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
+      this.#transitionTaskTimer({
+        taskId: current.id,
+        beforeStatus: current.status,
+        afterStatus: current.status,
+        beforeProjectId: current.projectId,
+        afterProjectId: current.projectId,
+        afterProjectName: project.name,
+        paused: current.timeTracking.paused,
+        beforeArchived: true,
+        afterArchived: false,
+        timestamp,
+        reason: "task_restored",
+      });
       this.#recordTaskActivity(
         current.id,
         actor,

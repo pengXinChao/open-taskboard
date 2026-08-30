@@ -158,6 +158,7 @@ interface OtherTasksPanelProps {
   onDelete: (task: Task) => void;
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
+  onTimerPausedChange: (task: Task, paused: boolean) => Promise<Task>;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
@@ -195,6 +196,7 @@ export function OtherTasksPanel({
   onDelete,
   onEdit,
   onUpdate,
+  onTimerPausedChange,
   onContextMenu,
   onDragStart,
   onDragEnd,
@@ -356,6 +358,7 @@ export function OtherTasksPanel({
               onCreateLabel={(label) => onCreateLabel(label, task.projectId)}
               onEdit={onEdit}
               onUpdate={onUpdate}
+              onTimerPausedChange={onTimerPausedChange}
               onContextMenu={onContextMenu}
               onDragStart={onDragStart}
               onDragEnd={onDragEnd}

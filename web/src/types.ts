@@ -398,6 +398,39 @@ export type TaskConversationRef = TaskConversationRefBase & (
   | { threadId: string; legacyLocal: true }
 );
 
+export interface TaskTimeTracking {
+  paused: boolean;
+  date: string;
+  closedSeconds: number;
+  activeStartedAt: string | null;
+}
+
+export interface DailyTaskTimeItem {
+  taskId: string;
+  identifier: string;
+  title: string;
+  status: TaskStatus;
+  archivedAt: string | null;
+  totalSeconds: number;
+  active: boolean;
+  paused: boolean;
+}
+
+export interface DailyProjectTime {
+  projectId: string;
+  projectName: string;
+  totalSeconds: number;
+  tasks: DailyTaskTimeItem[];
+}
+
+export interface DailyTaskTimeSummary {
+  date: string;
+  asOf: string;
+  totalSeconds: number;
+  endedTaskCount: number;
+  projects: DailyProjectTime[];
+}
+
 export interface Task {
   id: string;
   identifier: string;
@@ -429,6 +462,8 @@ export interface Task {
   externalOrigin?: string | null;
   externalKey?: string | null;
   externalUrl: string | null;
+  jiraStatusOverride: boolean;
+  timeTracking?: TaskTimeTracking;
   archivedAt: string | null;
   relations: TaskRelations;
   version: number;

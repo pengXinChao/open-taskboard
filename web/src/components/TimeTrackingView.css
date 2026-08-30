@@ -1,0 +1,477 @@
+.time-tracking-view {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: clamp(18px, 3vw, 32px) clamp(16px, 3.5vw, 42px) 56px;
+  background: var(--bg);
+}
+
+.time-tracking-content {
+  display: grid;
+  max-width: 1180px;
+  margin: 0 auto;
+  gap: 16px;
+}
+
+.time-tracking-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.time-tracking-heading h1,
+.time-tracking-heading p,
+.time-tracking-panel h2,
+.time-tracking-panel p {
+  margin: 0;
+}
+
+.time-tracking-heading h1 {
+  color: var(--text-primary);
+  font-size: 22px;
+  line-height: 1.25;
+}
+
+.time-tracking-heading > p {
+  margin-top: 4px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.time-tracking-live-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 8px;
+  gap: 8px 16px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.time-tracking-live-status span:first-child {
+  color: var(--text-secondary);
+}
+
+.time-tracking-live-status i {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.time-tracking-date-controls {
+  display: flex;
+  align-items: center;
+  padding: 4px;
+  gap: 4px;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.time-tracking-date-controls button,
+.time-tracking-date-controls label {
+  min-height: 30px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+}
+
+.time-tracking-date-controls button {
+  cursor: pointer;
+}
+
+.time-tracking-date-controls button:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+
+.time-tracking-date-controls label {
+  position: relative;
+  min-width: 184px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.time-tracking-date-controls input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.time-tracking-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.time-tracking-kpis article {
+  display: grid;
+  min-width: 0;
+  padding: 15px 16px;
+  gap: 6px;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.time-tracking-kpis span,
+.time-tracking-kpis small {
+  color: var(--text-tertiary);
+}
+
+.time-tracking-kpis span {
+  font-size: 11px;
+}
+
+.time-tracking-kpis strong {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: clamp(22px, 3vw, 28px);
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.time-tracking-kpis small {
+  min-height: 28px;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.time-tracking-dashboard {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.85fr) minmax(440px, 1.35fr);
+  align-items: start;
+  gap: 16px;
+}
+
+.time-tracking-panel {
+  min-width: 0;
+  overflow: hidden;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.time-tracking-panel > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 58px;
+  padding: 12px 15px;
+  gap: 12px;
+  border-bottom: var(--border-hairline) solid var(--border);
+}
+
+.time-tracking-panel h2 {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.time-tracking-panel header p,
+.time-tracking-panel footer {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.time-tracking-panel header p {
+  margin-top: 3px;
+}
+
+.time-tracking-panel header button {
+  min-height: 28px;
+  padding: 5px 9px;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-hover);
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.time-tracking-project-bars {
+  display: grid;
+  padding: 8px;
+  gap: 3px;
+}
+
+.time-tracking-project-row {
+  display: grid;
+  grid-template-columns: minmax(94px, 116px) minmax(80px, 1fr) minmax(54px, auto);
+  align-items: center;
+  width: 100%;
+  min-height: 52px;
+  padding: 7px;
+  gap: 9px;
+  border: var(--border-hairline) solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.time-tracking-project-row:hover {
+  background: var(--surface-hover);
+}
+
+.time-tracking-project-row[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--surface-hover);
+}
+
+.time-tracking-project-name,
+.time-tracking-project-value {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.time-tracking-project-name strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.time-tracking-project-name small,
+.time-tracking-project-value small {
+  color: var(--text-tertiary);
+  font-size: 9px;
+}
+
+.time-tracking-project-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-hover);
+}
+
+.time-tracking-project-track i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+
+.time-tracking-project-value {
+  text-align: right;
+}
+
+.time-tracking-project-value strong {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.time-tracking-panel footer {
+  padding: 9px 15px;
+  border-top: var(--border-hairline) solid var(--border);
+  line-height: 1.45;
+}
+
+.time-tracking-table-wrap {
+  overflow-x: auto;
+}
+
+.time-tracking-task-panel table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.time-tracking-task-panel th,
+.time-tracking-task-panel td {
+  padding: 10px 11px;
+  border-bottom: var(--border-hairline) solid var(--border);
+  color: var(--text-secondary);
+  font-size: 10px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.time-tracking-task-panel th {
+  background: var(--surface-hover);
+  color: var(--text-tertiary);
+  font-weight: 600;
+}
+
+.time-tracking-task-panel th:first-child { width: 36%; }
+.time-tracking-task-panel th:nth-child(2) { width: 19%; }
+.time-tracking-task-panel th:nth-child(3) { width: 17%; }
+.time-tracking-task-panel th:nth-child(4) { width: 15%; }
+.time-tracking-task-panel th:nth-child(5) { width: 13%; }
+.time-tracking-task-panel tbody tr:last-child td { border-bottom: 0; }
+.time-tracking-task-panel tbody tr:hover td { background: var(--surface-hover); }
+
+.time-tracking-task-cell small,
+.time-tracking-task-cell strong {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.time-tracking-task-cell small {
+  color: var(--text-tertiary);
+  font-size: 9px;
+}
+
+.time-tracking-task-cell strong {
+  margin-top: 2px;
+  color: var(--text-primary);
+  font-size: 11px;
+}
+
+.time-tracking-tag,
+.time-tracking-timer {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  color: var(--text-tertiary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.time-tracking-timer.is-running {
+  color: var(--accent);
+}
+
+.time-tracking-timer.is-paused {
+  color: var(--warning, var(--text-secondary));
+}
+
+.time-tracking-duration-cell {
+  color: var(--text-primary) !important;
+  font-weight: 700;
+  text-align: right !important;
+  white-space: nowrap;
+}
+
+.time-tracking-message,
+.time-tracking-panel-empty {
+  padding: 36px 20px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+.time-tracking-message.is-error {
+  color: var(--danger);
+}
+
+@media (max-width: 900px) {
+  .time-tracking-kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .time-tracking-dashboard {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 620px) {
+  .time-tracking-view {
+    padding: 14px 12px 44px;
+  }
+
+  .time-tracking-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .time-tracking-date-controls {
+    align-self: stretch;
+  }
+
+  .time-tracking-date-controls label {
+    flex: 1 1 auto;
+    min-width: 120px;
+  }
+
+  .time-tracking-kpis {
+    gap: 8px;
+  }
+
+  .time-tracking-kpis article {
+    padding: 12px;
+  }
+
+  .time-tracking-table-wrap {
+    overflow: visible;
+  }
+
+  .time-tracking-task-panel table,
+  .time-tracking-task-panel tbody,
+  .time-tracking-task-panel tr,
+  .time-tracking-task-panel td {
+    display: block;
+    width: 100%;
+  }
+
+  .time-tracking-task-panel thead {
+    display: none;
+  }
+
+  .time-tracking-task-panel tbody {
+    padding: 6px 10px 10px;
+  }
+
+  .time-tracking-task-panel tbody tr {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    padding: 11px 2px;
+    gap: 8px 12px;
+    border-bottom: var(--border-hairline) solid var(--border);
+  }
+
+  .time-tracking-task-panel tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .time-tracking-task-panel td {
+    padding: 0;
+    border: 0;
+  }
+
+  .time-tracking-task-panel td:first-child {
+    grid-column: 1 / -1;
+  }
+
+  .time-tracking-task-panel td:nth-child(2),
+  .time-tracking-task-panel td:nth-child(3) {
+    grid-column: 1;
+  }
+
+  .time-tracking-task-panel td:nth-child(4) {
+    grid-column: 2;
+    grid-row: 1;
+    font-size: 13px;
+  }
+
+  .time-tracking-task-panel td:nth-child(5) {
+    grid-column: 2;
+    grid-row: 2 / span 2;
+    align-self: center;
+  }
+
+  .time-tracking-task-cell strong {
+    white-space: normal;
+  }
+}
