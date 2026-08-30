@@ -60,6 +60,7 @@ import type {
   AiChatSkill,
   AiChatThread,
   AiChatThreadSnapshot,
+  CodexProjectIdentity,
   ComposerCandidatesResponse,
   ComposerDocument,
   ComposerPersistedDocument,
@@ -111,6 +112,7 @@ interface AiChatProps {
   available: boolean;
   projectId: string | null;
   issueId: string | null;
+  codexProjectIdentity: CodexProjectIdentity | null;
   onThreadsChange?: (threads: AiChatThread[]) => void;
   openThreadRequest?: AiChatOpenThreadRequest | null;
 }
@@ -171,6 +173,7 @@ type ComposerBeforeInput = {
 type DraftThreadOrigin = {
   projectId: string;
   issueId: string | null;
+  codexProjectIdentity: CodexProjectIdentity | null;
 };
 type PanelResizeEdge = "top" | "left" | "top-left";
 type PanelGeometry = {
@@ -1299,6 +1302,7 @@ export function AiChat({
   available,
   projectId,
   issueId,
+  codexProjectIdentity,
   onThreadsChange,
   openThreadRequest,
 }: AiChatProps) {
@@ -1648,6 +1652,23 @@ export function AiChat({
     ?? selectedThreadSummary?.origin.projectId
     ?? draftOrigin?.projectId
     ?? projectId;
+  const catalogThreadOrigin = snapshot?.thread.origin ?? selectedThreadSummary?.origin;
+  const catalogCodexProjectIdentity = catalogThreadOrigin
+    ? catalogThreadOrigin.codexProjectKind === "remote"
+      && catalogThreadOrigin.codexProjectId
+      && catalogThreadOrigin.codexHostId
+        ? {
+            codexProjectId: catalogThreadOrigin.codexProjectId,
+            codexProjectKind: "remote" as const,
+            codexHostId: catalogThreadOrigin.codexHostId,
+            workspacePath: catalogThreadOrigin.workspacePath,
+          }
+        : null
+    : draftOrigin?.projectId === catalogProjectId
+      ? draftOrigin.codexProjectIdentity
+      : projectId === catalogProjectId
+        ? codexProjectIdentity
+        : null;
   const activeCatalog = catalogLoadedProjectId === catalogProjectId ? catalog : null;
   useEffect(() => {
     if (!available || !catalogProjectId) {
@@ -1660,7 +1681,7 @@ export function AiChat({
     setCatalog(null);
     setCatalogLoadedProjectId(null);
     setCatalogError(null);
-    void getAiChatCatalog(catalogProjectId, controller.signal).then(
+    void getAiChatCatalog(catalogProjectId, controller.signal, catalogCodexProjectIdentity).then(
       (next) => {
         if (controller.signal.aborted) return;
         setCatalog(next);
@@ -1677,7 +1698,14 @@ export function AiChat({
       },
     );
     return () => controller.abort();
-  }, [available, catalogProjectId]);
+  }, [
+    available,
+    catalogProjectId,
+    catalogCodexProjectIdentity?.codexHostId,
+    catalogCodexProjectIdentity?.codexProjectId,
+    catalogCodexProjectIdentity?.codexProjectKind,
+    catalogCodexProjectIdentity?.workspacePath,
+  ]);
 
   const composerRequestQuery = useMemo(() => {
     if (!composerQueryState) return "";
@@ -1700,6 +1728,7 @@ export function AiChat({
     void getAiChatComposerCandidates({
       ...(catalogProjectId ? { projectId: catalogProjectId } : {}),
       ...(selectedThreadId ? { threadId: selectedThreadId } : {}),
+      ...(!selectedThreadId && catalogCodexProjectIdentity ? catalogCodexProjectIdentity : {}),
       trigger: composerQueryState.trigger,
       query: composerRequestQuery,
     }, controller.signal).then(
@@ -1718,7 +1747,16 @@ export function AiChat({
       },
     );
     return () => controller.abort();
-  }, [catalogProjectId, composerQueryState, composerRequestQuery, selectedThreadId]);
+  }, [
+    catalogProjectId,
+    catalogCodexProjectIdentity?.codexHostId,
+    catalogCodexProjectIdentity?.codexProjectId,
+    catalogCodexProjectIdentity?.codexProjectKind,
+    catalogCodexProjectIdentity?.workspacePath,
+    composerQueryState,
+    composerRequestQuery,
+    selectedThreadId,
+  ]);
 
   const restoreDraftSettings = useCallback((thread: AiChatThread) => {
     setDraftModel(thread.model);
@@ -1864,10 +1902,16 @@ export function AiChat({
       setDraftOrigin({
         projectId: openThreadRequest.projectId,
         issueId: openThreadRequest.issueId,
+        codexProjectIdentity: openThreadRequest.projectId === projectId
+          ? codexProjectIdentity
+          : null,
       });
       taskComposerDraftOriginRef.current = {
         projectId: openThreadRequest.projectId,
         issueId: openThreadRequest.issueId,
+        codexProjectIdentity: openThreadRequest.projectId === projectId
+          ? codexProjectIdentity
+          : null,
       };
       setSnapshot(null);
       selectThread(null);
@@ -2028,6 +2072,7 @@ export function AiChat({
     setDraftOrigin({
       projectId: input.projectId,
       issueId: input.issueId ?? null,
+      codexProjectIdentity,
     });
     setSnapshot(null);
     selectThread(null);
@@ -2038,7 +2083,7 @@ export function AiChat({
 
   async function createThreadForDraftOrigin(): Promise<AiChatThread | null> {
     const origin = draftOrigin ?? (
-      projectId ? { projectId, issueId } : null
+      projectId ? { projectId, issueId, codexProjectIdentity } : null
     );
     const input = buildThreadCreateInput(origin?.projectId ?? "", origin?.issueId ?? null);
     if (!input) {
@@ -2057,7 +2102,7 @@ export function AiChat({
     try {
       const targetCatalog = catalogLoadedProjectId === input.projectId && activeCatalog
         ? activeCatalog
-        : await getAiChatCatalog(input.projectId);
+        : await getAiChatCatalog(input.projectId, undefined, origin?.codexProjectIdentity);
       const normalized = normalizeChatSelection(
         targetCatalog.models,
         inheritedSettings.model,
@@ -2076,6 +2121,7 @@ export function AiChat({
       const thread = await createAiChatThread({
         ...input,
         ...settings,
+        ...(origin?.codexProjectIdentity ?? {}),
       });
       replaceThread(thread);
       selectThread(thread.id);
@@ -2488,6 +2534,7 @@ export function AiChat({
         try {
           const candidates = await getAiChatComposerCandidates({
             projectId: taskComposerDraftOriginRef.current?.projectId,
+            ...(catalogCodexProjectIdentity ?? {}),
             trigger: "@",
             query: "",
           });
