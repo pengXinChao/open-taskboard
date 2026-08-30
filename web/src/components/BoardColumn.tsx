@@ -43,7 +43,7 @@ interface BoardColumnProps {
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onTimerPausedChange: (task: Task, paused: boolean) => Promise<Task>;
-  onComplete: (task: Task) => void;
+  onComplete: (task: Task) => Promise<void>;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
