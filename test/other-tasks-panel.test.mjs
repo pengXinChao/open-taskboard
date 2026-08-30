@@ -33,7 +33,7 @@ test("the issue workspace projects configured statuses into adaptive main and se
   assert.match(boardColumnSource, /todo: \{ label: "等待认领", tone: "todo" \}/);
   assert.match(boardColumnSource, /in_progress: \{ label: "处理中", tone: "progress" \}/);
   assert.match(boardColumnSource, /blocked: \{ label: "遇到阻碍", tone: "blocked" \}/);
-  assert.match(boardColumnSource, /in_review: \{ label: "等你确认", tone: "review" \}/);
+  assert.match(boardColumnSource, /in_review: \{ label: "等待验证", tone: "review" \}/);
 });
 
 test("other tasks is a closed-by-default non-modal panel with archived issues", () => {

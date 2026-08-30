@@ -95,14 +95,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   const readRequest = method === "GET" || method === "HEAD";
   let response: Response;
+  // Codex 启动或重启 Taskboard 服务时，读取请求可能暂时落在服务就绪之前；退避窗口覆盖完整的启动恢复周期。
   for (let attempt = 0; ; attempt += 1) {
     try {
       response = await fetch(resolveTaskboardUrl(path), { ...init, headers });
       break;
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") throw error;
-      if (readRequest && attempt < 2) {
-        await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+      if (readRequest && attempt < 5) {
+        await new Promise((resolve) => setTimeout(resolve, 250 * (2 ** attempt)));
         continue;
       }
       const failure = error instanceof Error && error.name === "TimeoutError"

@@ -45,7 +45,7 @@ let pendingDetailViewport: { projectId: string; x: number; y: number } | null = 
 
 const GANTT_GROUPS: GanttGroupDefinition[] = [
   { id: "in-progress", chineseLabel: "处理中", englishLabel: "In progress", statuses: ["in_progress"], defaultOpen: true },
-  { id: "in-review", chineseLabel: "等你确认", englishLabel: "In review", statuses: ["in_review"], defaultOpen: true },
+  { id: "in-review", chineseLabel: "等待验证", englishLabel: "Waiting for verification", statuses: ["in_review"], defaultOpen: true },
   { id: "blocked", chineseLabel: "遇到阻碍", englishLabel: "Blocked", statuses: ["blocked"], defaultOpen: true },
   { id: "todo", chineseLabel: "待处理", englishLabel: "To do", statuses: ["backlog", "todo"], defaultOpen: true },
   { id: "done", chineseLabel: "已完成", englishLabel: "Completed", statuses: ["done"], defaultOpen: false },

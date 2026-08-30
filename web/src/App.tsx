@@ -721,7 +721,12 @@ export function App() {
   const [hasLoadedTasks, setHasLoadedTasks] = useState(false);
   const [projectLoadError, setProjectLoadError] = useState<ProjectLoadError | null>(null);
   const [tasksLoadError, setTasksLoadError] = useState<TasksLoadError | null>(null);
-  const loadError: LoadError | null = projectLoadError ?? tasksLoadError;
+  // 已有可展示数据时，后台刷新失败不应遮挡当前看板；只有首次加载无数据时才阻断页面。
+  const loadError: LoadError | null = projects.length === 0 && projectLoadError
+    ? projectLoadError
+    : tasks.length === 0 && !hasLoadedTasks && tasksLoadError
+      ? tasksLoadError
+      : null;
   const [actionError, setActionError] = useState<ActionError | null>(null);
   const actionErrorText = actionError === null
     ? null
@@ -1945,6 +1950,20 @@ export function App() {
     void refreshTasks(taskScopeProjectId, { signal: controller.signal });
     return () => controller.abort();
   }, [refreshTasks, taskScopeProjectId]);
+
+  useEffect(() => {
+    if (!loadError) return;
+    const retryDelay = Math.min(10_000, 1_000 * (2 ** Math.min(loadError.requestId - 1, 3)));
+    const timer = window.setTimeout(() => {
+      if (loadError.source === "projects") {
+        if (loadError.operation === "initial") void loadProjectList();
+        else void refreshProjectList();
+      } else if (taskScopeProjectId) {
+        void refreshTasks(taskScopeProjectId);
+      }
+    }, retryDelay);
+    return () => window.clearTimeout(timer);
+  }, [loadError, loadProjectList, refreshProjectList, refreshTasks, taskScopeProjectId]);
 
   useEffect(() => {
     const isAllProjectTaskScope = taskScopeProjectId === ALL_PROJECTS_ID;
