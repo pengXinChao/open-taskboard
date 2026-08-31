@@ -18,6 +18,8 @@ const cardSource = await readFile(new URL("../web/src/components/TaskCard.tsx", 
 const filterSource = await readFile(new URL("../web/src/taskFilters.ts", import.meta.url), "utf8");
 const typesSource = await readFile(new URL("../web/src/types.ts", import.meta.url), "utf8");
 const composerSource = await readFile(new URL("../web/src/components/InlineMediaComposer.tsx", import.meta.url), "utf8");
+const cliSource = await readFile(new URL("../cli/taskctl.mjs", import.meta.url), "utf8");
+const serverSource = await readFile(new URL("../server/app.mjs", import.meta.url), "utf8");
 
 function taskStatuses() {
   const match = typesSource.match(/export const TASK_STATUSES = (\[[\s\S]*?\]) as const/);
@@ -133,10 +135,19 @@ test("common issue mutations enter a Linear-style undo queue", () => {
   assert.match(apiSource, /export async function restoreTask/);
 });
 
-test("issues expose processing conversations without manual binding", () => {
-  assert.match(detailSource, /<TaskSessionOrchestrationPanel/);
-  assert.match(detailSource, /onCreateParentTaskSession/);
-  assert.match(detailSource, /onDispatchTaskSession/);
+test("Jira issues open a projectless main session with a read-only orchestration panel", () => {
+  assert.match(detailSource, /TaskSessionOrchestrationPanel/);
+  assert.match(detailSource, /orchestrationRevision=\{orchestrationRevision\}/);
+  assert.match(orchestrationPanelSource, /getTaskSessionForTask/);
+  assert.match(orchestrationPanelSource, /onOpenThread/);
+  assert.match(orchestrationPanelSource, /task-session-row/);
+  assert.match(orchestrationPanelSource, /waiting_for_user/);
+  assert.match(orchestrationPanelSource, /阻塞/);
+  assert.doesNotMatch(orchestrationPanelSource, /保存意图|确认意图|派发|报告|集成/);
+  assert.doesNotMatch(detailSource, /onCreateParentTaskSession|onDispatchTaskSession/);
+  assert.match(appSource, /taskboardProject\?\.source === "jira"/);
+  assert.match(appSource, /jiraEntry[\s\S]*conversationRole = session\?\.conversationRole[\s\S]*?jiraEntry \? "parent"/);
+  assert.match(appSource, /const projectless = conversationRole === "parent" \|\| jiraEntry/);
   assert.doesNotMatch(detailSource, /在新对话打开/);
   assert.doesNotMatch(detailSource, /onOpenInThread\(currentTask\)/);
   assert.doesNotMatch(appSource, /detail-thread-button/);
@@ -160,16 +171,16 @@ test("issues expose processing conversations without manual binding", () => {
   assert.match(contextMenuSource, /onOpenInThread/);
 });
 
-test("dispatch waits for the child handshake and persistence before releasing its lock", () => {
-  assert.match(orchestrationPanelSource, /const pendingDispatchRef = useRef<PendingDispatch \| null>\(null\)/);
-  assert.match(orchestrationPanelSource, /pendingDispatch\.handled/);
-  assert.match(orchestrationPanelSource, /await persisted/);
-  assert.match(orchestrationPanelSource, /settleDispatch\(pendingDispatch\)/);
-  assert.match(appSource, /const pendingThreadOpeningsRef = useRef\(new Map<string, PendingThreadOpening>\(\)\)/);
-  assert.match(appSource, /const openingKey = session\?\.orchestrationId \?\? `task:\$\{task\.id\}`/);
-  assert.match(appSource, /pendingThreadOpeningsRef\.current\.has\(openingKey\)/);
-  assert.match(appSource, /特定握手[\s\S]*?dispatch API/);
-  assert.match(appSource, /onTaskSessionThreadSettled=\{settleTaskSessionThread\}/);
+test("main sessions can create and message a worker through the local bridge", () => {
+  assert.match(appSource, /taskctl session create-child/);
+  assert.match(cliSource, /\["session create-child"/);
+  assert.match(cliSource, /\/child-session/);
+  assert.match(serverSource, /createTaskSessionChild/);
+  assert.match(serverSource, /options\.createChildSession/);
+  assert.match(serverSource, /analysis: input\.analysis/);
+  assert.match(serverSource, /attachmentRefs: input\.attachmentRefs/);
+  assert.match(serverSource, /analysis_forwarded/);
+  assert.match(appSource, /projectless/);
 });
 
 test("orchestration realtime events refresh only the open issue panel", () => {
@@ -179,7 +190,7 @@ test("orchestration realtime events refresh only the open issue panel", () => {
   assert.match(appSource, /orchestration: detailTaskId === eventTaskId/);
   assert.match(appSource, /if \(refreshOrchestrationPending && detailTaskId\)/);
   assert.match(appSource, /orchestrationRevision=\{orchestrationRevision\}/);
-  assert.match(orchestrationPanelSource, /保留用户尚未保存的意图\/报告草稿/);
+  assert.match(orchestrationPanelSource, /orchestrationRevision/);
 });
 
 test("comments upload and render their own attachments in the content flow", () => {

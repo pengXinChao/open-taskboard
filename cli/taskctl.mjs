@@ -117,6 +117,15 @@ const COMMAND_OPTIONS = new Map([
   ["attachment download", new Set(["output", "json"])],
   ["attachment upload", new Set(["file", "task", "comment", "content-type", "kind", "json"])],
   ["context current", new Set(["cwd", "json"])],
+  ["session create-child", new Set([
+    "analysis-file",
+    "instruction",
+    "instruction-file",
+    "title",
+    "idempotency-key",
+    "thread-id",
+    "json",
+  ])],
 ]);
 
 const HELP_TEXT = new Map([
@@ -139,6 +148,9 @@ Commands:
   attachment list (--task ISSUE_ID | --comment COMMENT_ID) [--after CURSOR]
   attachment download ATTACHMENT_ID --output PATH
   attachment upload --file PATH (--task ISSUE_ID | --comment COMMENT_ID)
+  session create-child ISSUE_ID --analysis-file FILE
+    (--instruction TEXT | --instruction-file FILE)
+    [--title TITLE] [--idempotency-key KEY] [--thread-id ID]
 
 Global options:
   --runtime-file FILE  Use an explicit launcher runtime descriptor
@@ -471,6 +483,54 @@ async function execute(parsed, overrides) {
     case "context current":
       expectOperandCount(parsed, 0);
       return currentContext(api, parsed.options, overrides);
+    case "session create-child": {
+      expectOperandCount(parsed, 1);
+      const analysisFile = requiredOption(parsed.options, "analysis-file");
+      const read = overrides.readFile ?? readFile;
+      let analysis;
+      try {
+        analysis = JSON.parse(await read(analysisFile, "utf8"));
+      } catch (error) {
+        throw new TaskctlError(`Cannot read analysis file: ${analysisFile}`, {
+          code: "FILE_READ_FAILED",
+          exitCode: 2,
+          details: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
+        throw usageError("--analysis-file must contain a JSON object");
+      }
+      if (parsed.options.instruction !== undefined && parsed.options["instruction-file"] !== undefined) {
+        throw usageError("Use either --instruction or --instruction-file, not both");
+      }
+      let instruction = parsed.options.instruction;
+      if (parsed.options["instruction-file"] !== undefined) {
+        try {
+          instruction = await read(parsed.options["instruction-file"], "utf8");
+        } catch (error) {
+          throw new TaskctlError(`Cannot read instruction file: ${parsed.options["instruction-file"]}`, {
+            code: "FILE_READ_FAILED",
+            exitCode: 2,
+            details: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      if (typeof instruction !== "string" || instruction.trim().length === 0) {
+        throw usageError("session create-child requires --instruction or --instruction-file");
+      }
+      const threadId = resolveThreadId(parsed.options, overrides);
+      return api.request("POST", `${taskPath(parsed.operands[0])}/child-session`, {
+        parentThreadId: threadId,
+        title: parsed.options.title ?? `${parsed.operands[0]} worker`,
+        instruction,
+        analysis,
+        attachmentRefs: Array.isArray(analysis.attachmentRefs)
+          ? analysis.attachmentRefs.filter((value) => typeof value === "string").slice(0, 128)
+          : [],
+        idempotencyKey: parsed.options["idempotency-key"]
+          ?? `child-session:${parsed.operands[0]}:${threadId}`,
+      });
+    }
     default:
       throw usageError(`Unsupported command: ${command}`);
   }

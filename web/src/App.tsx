@@ -19,6 +19,7 @@ import {
   createProjectLabel as createProjectLabelRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
+  createTaskSessionOrchestration,
   configureJiraConnection,
   deleteArchivedTask as deleteArchivedTaskRequest,
   deleteProjectLabel as deleteProjectLabelRequest,
@@ -586,6 +587,29 @@ function hostThreadBinding(context: HostContext | null): CodexThreadBinding | { 
     };
   }
   // 宿主有时先上报 threadId、稍后才补齐项目元数据；短绑定可由服务端再解析。
+  return { threadId };
+}
+
+function threadBindingFromHandshake(threadId: string, identity: unknown): CodexThreadBinding | { threadId: string } {
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)) return { threadId };
+  const value = identity as Record<string, unknown>;
+  const projectId = value.codexProjectId ?? value.projectId;
+  const projectKind = value.codexProjectKind ?? value.projectKind;
+  const hostId = value.codexHostId ?? value.hostId;
+  if (
+    typeof projectId === "string" && projectId.trim()
+    && (projectKind === "local" || projectKind === "remote")
+    && typeof hostId === "string" && hostId.trim()
+    && typeof value.workspacePath === "string" && value.workspacePath.trim()
+  ) {
+    return {
+      threadId,
+      codexProjectId: projectId,
+      codexProjectKind: projectKind,
+      codexHostId: hostId,
+      workspacePath: value.workspacePath,
+    };
+  }
   return { threadId };
 }
 
@@ -1921,7 +1945,43 @@ export function App() {
       }
 
       if (message.type === "taskboard:parent-thread-ready" && message.payload) {
-        // parent 身份同样只接受宿主握手结果；面板完成绑定持久化后再释放锁。
+        // Jira 主会话先在 Codex 中创建；握手拿到 threadId 后再落 active orchestration，允许面板立即读取和导航。
+        const payload = message.payload as {
+          taskId?: unknown;
+          orchestrationId?: unknown;
+          openingRequestId?: unknown;
+          threadId?: unknown;
+          identity?: unknown;
+        };
+        if (typeof payload.taskId !== "string" || typeof payload.threadId !== "string") return;
+        const binding = threadBindingFromHandshake(payload.threadId, payload.identity);
+        void createTaskSessionOrchestration(payload.taskId, {
+          parentThreadBinding: binding,
+        }).then(() => {
+          setOrchestrationRevision((current) => current + 1);
+          releaseThreadOpening(
+            typeof payload.orchestrationId === "string" ? payload.orchestrationId : undefined,
+            payload.taskId as string,
+            typeof payload.openingRequestId === "string" ? payload.openingRequestId : undefined,
+          );
+          postEmbeddedHostMessage({
+            type: "taskboard:thread-handshake-ack",
+            payload: {
+              taskId: payload.taskId,
+              ...(typeof payload.orchestrationId === "string" ? { orchestrationId: payload.orchestrationId } : {}),
+              conversationRole: "parent",
+              messageType: "taskboard:parent-thread-ready",
+              ...(typeof payload.openingRequestId === "string" ? { openingRequestId: payload.openingRequestId } : {}),
+            },
+          });
+        }).catch((error) => {
+          releaseThreadOpening(
+            typeof payload.orchestrationId === "string" ? payload.orchestrationId : undefined,
+            payload.taskId as string,
+            typeof payload.openingRequestId === "string" ? payload.openingRequestId : undefined,
+          );
+          setActionError(errorMessage(error));
+        });
         return;
       }
 
@@ -3245,15 +3305,24 @@ export function App() {
     },
   ): Promise<boolean | string> {
     const standalone = !embedded || window.parent === window;
-    const projectless = task.projectId === GLOBAL_PROJECT_ID;
     const taskboardProject = projects.find((project) => project.id === task.projectId);
-    const savedRemoteIdentity = projectCodexIdentities[task.projectId]?.codexProjectKind === "remote"
+    const jiraEntry = taskboardProject?.source === "jira"
+      || task.externalOrigin?.toLowerCase().startsWith("jira") === true;
+    const conversationRole = session?.conversationRole
+      ?? (session ? "child" : jiraEntry ? "parent" : null);
+    // Jira 入口先建立无项目主会话，让用户在 Codex 原生界面选择实际项目空间。
+    // child 会话仍可沿用任务的已验证工作目录，避免改变执行会话的隔离边界。
+    const projectless = conversationRole === "parent" || jiraEntry;
+    const savedRemoteIdentity = !projectless
+      && projectCodexIdentities[task.projectId]?.codexProjectKind === "remote"
       ? projectCodexIdentities[task.projectId]
       : null;
-    let codexProjectContext = savedRemoteIdentity
-      ?? codexProjectContextForTaskProject(task.projectId);
+    let codexProjectContext = projectless
+      ? null
+      : savedRemoteIdentity ?? codexProjectContextForTaskProject(task.projectId);
     if (
-      projectCodexIdentities[task.projectId]?.codexProjectKind === "remote"
+      !projectless
+      && projectCodexIdentities[task.projectId]?.codexProjectKind === "remote"
       && !codexProjectContext
     ) {
       setActionError(text(
@@ -3285,15 +3354,27 @@ export function App() {
         : codexProjectContext?.workspacePath
           ?? deviceWorkspacePaths[task.projectId]
           ?? taskboardProject?.workspacePath;
-    const conversationRole = session?.conversationRole
-      ?? (session ? "child" : null);
     const openingKey = session?.orchestrationId ?? `task:${task.id}`;
     const openingRequestId = standalone ? undefined : window.crypto.randomUUID();
     const embeddedInstruction = conversationRole === "parent"
       ? [
           text(
-            `你是议题 ${task.identifier} 的主会话。请使用 [$manage-taskboard](${manageTaskboardSkillPath}) 读取 Jira 上下文，提炼并确认 task-intent.v1；不要直接替任务会话修改工作区。`,
-            `You are the main session for issue ${task.identifier}. Use [$manage-taskboard](${manageTaskboardSkillPath}) to read Jira context and produce/confirm task-intent.v1; do not modify the workspace on behalf of the worker session.`,
+            [
+              `你是 Jira 任务 ${task.identifier} 的主会话。`,
+              `请先使用 [$manage-taskboard](${manageTaskboardSkillPath}) 读取完整 Jira 上下文：任务正文、所有评论、任务附件、评论附件，以及能帮助判断需求、问题、范围和约束的上下文。`,
+              "然后分析真正要解决的问题、执行范围、验收标准、有价值的评论或附件、以及待澄清问题。",
+              "分析完成后，把分析结果写入 JSON 文件，并调用 `taskctl session create-child <任务ID> --analysis-file <文件> --instruction-file <执行提示词文件>` 创建独立任务会话；该命令会把分析结果、确认后的执行要求和必要的附件引用发送给任务会话。",
+              "任务会话负责执行工作，不要让它重新解释 Jira；你负责上下文分析、主子会话通信、结果检查和后续 Jira 写回。不要直接替任务会话修改工作区。",
+              "创建任务会话前，确认用户已在 Codex 原生界面选择目标项目空间；主会话本身保持无项目。",
+            ].join("\n"),
+            [
+              `You are the main session for Jira issue ${task.identifier}.`,
+              `First use [$manage-taskboard](${manageTaskboardSkillPath}) to read the complete Jira context: issue body, all comments, task attachments, comment attachments, and any context that clarifies the requirement, problem, scope, and constraints.`,
+              "Then analyze the real problem, execution scope, acceptance criteria, valuable comments or attachments, and unresolved questions.",
+              "After analysis, write the result to a JSON file and run `taskctl session create-child <issue-id> --analysis-file <file> --instruction-file <worker-prompt-file>`; the command creates an independent worker session and sends it the analysis, confirmed execution requirements, and necessary attachment references.",
+              "The worker session executes the work and must not reinterpret Jira. You own context analysis, parent/worker communication, result review, and later Jira writeback. Do not modify the workspace on behalf of the worker session.",
+              "Before creating the worker session, confirm that the user selected the target project in the native Codex UI; the main session itself remains projectless.",
+            ].join("\n"),
           ),
         ].join("\n")
       : conversationRole === "child"
@@ -3423,11 +3504,13 @@ export function App() {
               : task.title,
           instruction: embeddedInstruction,
           projectless,
-          codexProjectId: codexProjectContext?.codexProjectId,
-          codexProjectKind: codexProjectContext?.codexProjectKind ?? "local",
-          codexHostId: codexProjectContext?.codexHostId ?? "local",
-          codexProjectWorkspacePath: codexProjectContext?.workspacePath,
-          workspacePath,
+          ...(projectless ? {} : {
+            codexProjectId: codexProjectContext?.codexProjectId,
+            codexProjectKind: codexProjectContext?.codexProjectKind ?? "local",
+            codexHostId: codexProjectContext?.codexHostId ?? "local",
+            codexProjectWorkspacePath: codexProjectContext?.workspacePath,
+            workspacePath,
+          }),
           ...(session ? {
             orchestrationId: session.orchestrationId,
             parentThreadId: session.parentThreadBinding?.threadId,
@@ -4124,11 +4207,6 @@ export function App() {
             )}
             onOpenThread={openThread}
             onOpenLegacyLocalThread={openLegacyLocalThread}
-            parentThreadBinding={currentParentThreadBinding ?? detailTask.threadBinding}
-            onCreateParentTaskSession={createParentTaskSessionFromPanel}
-            onDispatchTaskSession={dispatchTaskSessionFromPanel}
-            onOpenChildThread={openThread}
-            onTaskSessionThreadSettled={settleTaskSessionThread}
             onCopy={(text, message) => void copyText(text, message)}
             onError={setActionError}
           />

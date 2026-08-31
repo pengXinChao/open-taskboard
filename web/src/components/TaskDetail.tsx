@@ -42,10 +42,8 @@ import type {
   Task,
   TaskChangeActivity,
   TaskDraft,
-  TaskIntentRevision,
   TaskPriority,
   TaskRelationSummary,
-  TaskSessionOrchestration,
   TaskStatus,
 } from "../types";
 import {
@@ -129,20 +127,8 @@ interface TaskDetailProps {
     relatedTaskId: string,
     origin?: IssueRelationOrigin,
   ) => Promise<RelationMutationResult>;
-  onOpenThread: (binding: CodexThreadBinding) => void;
+  onOpenThread: (binding: CodexThreadBinding | { threadId: string }) => void;
   onOpenLegacyLocalThread: (threadId: string) => void;
-  parentThreadBinding: CodexThreadBinding | { threadId: string } | null;
-  onCreateParentTaskSession: (
-    task: Task,
-    orchestration: TaskSessionOrchestration,
-  ) => Promise<string>;
-  onDispatchTaskSession: (
-    task: Task,
-    orchestration: TaskSessionOrchestration,
-    intent: TaskIntentRevision,
-  ) => Promise<string>;
-  onOpenChildThread: (binding: CodexThreadBinding | { threadId: string }) => void;
-  onTaskSessionThreadSettled: (orchestrationId: string, openingRequestId?: string) => void;
   onCopy: (text: string, announcement: string) => void;
   onError: (message: TaskDetailError | null) => void;
 }
@@ -401,11 +387,6 @@ export function TaskDetail({
   onRemoveRelation,
   onOpenThread,
   onOpenLegacyLocalThread,
-  parentThreadBinding,
-  onCreateParentTaskSession,
-  onDispatchTaskSession,
-  onOpenChildThread,
-  onTaskSessionThreadSettled,
   onCopy,
   onError,
 }: TaskDetailProps) {
@@ -464,7 +445,6 @@ export function TaskDetail({
   const taskSessionError = useCallback((error: unknown) => {
     onError(messageFor(error));
   }, [onError]);
-
   useEffect(() => {
     const taskChanged = currentTask.id !== task.id;
     setCurrentTask(task);
@@ -1592,6 +1572,12 @@ export function TaskDetail({
           </div>
 
           <aside className="issue-properties" aria-label={text("议题属性", "Issue properties")}>
+            <TaskSessionOrchestrationPanel
+              task={currentTask}
+              orchestrationRevision={orchestrationRevision}
+              onOpenThread={onOpenThread}
+              onError={taskSessionError}
+            />
             <div className="detail-primary-actions">
               {currentTask.externalUrl && (
                 <a
@@ -1638,16 +1624,6 @@ export function TaskDetail({
                 <span className="detail-copy-action-label">{text("复制链接", "Copy link")}</span>
               </button>
             </div>
-            <TaskSessionOrchestrationPanel
-              task={currentTask}
-              parentThreadBinding={parentThreadBinding}
-              orchestrationRevision={orchestrationRevision}
-              onCreateParent={onCreateParentTaskSession}
-              onDispatch={onDispatchTaskSession}
-              onOpenChild={onOpenChildThread}
-              onThreadSettled={onTaskSessionThreadSettled}
-              onError={taskSessionError}
-            />
             <h2>{text("属性", "Properties")}</h2>
             <div className="detail-property-row">
               <span className="detail-property-label">{text("状态", "Status")}</span>

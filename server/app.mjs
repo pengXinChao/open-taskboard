@@ -81,7 +81,7 @@ const CONTENT_TYPES = new Map([
 function isTaskSessionRoute(pathname) {
   return pathname === "/api/orchestrations"
     || pathname.startsWith("/api/orchestrations/")
-    || /^\/api\/tasks\/[^/]+\/orchestrations(?:\/|$)/.test(pathname);
+    || /^\/api\/tasks\/[^/]+\/(?:orchestrations|child-session)(?:\/|$)/.test(pathname);
 }
 
 function sendJson(response, status, value, headers = {}) {
@@ -875,6 +875,33 @@ function parseTaskSessionMessage(body) {
     childThreadId,
     intentVersion,
   };
+}
+
+function parseTaskSessionChildRequest(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "parentThreadId",
+    "title",
+    "instruction",
+    "analysis",
+    "attachmentRefs",
+    "idempotencyKey",
+  ]));
+  const parentThreadId = parseThreadId(body.parentThreadId);
+  if (!parentThreadId) {
+    throw new ApiError(400, "INVALID_FIELD", "'parentThreadId' is required");
+  }
+  const title = stringField(body.title, "title", { required: true, maxLength: 240 });
+  const instruction = stringField(body.instruction, "instruction", { required: true, maxLength: 4_000_000 });
+  const idempotencyKey = stringField(body.idempotencyKey, "idempotencyKey", {
+    required: true,
+    maxLength: 512,
+  });
+  const analysis = parseTaskSessionObject(body.analysis ?? {}, "analysis", { nullable: false });
+  const attachmentRefs = Array.isArray(body.attachmentRefs)
+    ? body.attachmentRefs.filter((value) => typeof value === "string").slice(0, 128)
+    : [];
+  return { parentThreadId, title, instruction, analysis, attachmentRefs, idempotencyKey };
 }
 
 function parseTaskSessionReport(body) {
@@ -2288,6 +2315,76 @@ export function createTaskboardServer(options = {}) {
       taskId: orchestration.taskId,
     });
   }
+  async function createTaskSessionChild(taskId, input) {
+    const task = database.getTask(taskId);
+    if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+    const parentBinding = currentHostThreadBinding(input.parentThreadId) ?? {
+      threadId: input.parentThreadId,
+    };
+    let orchestration = database.getActiveTaskSessionOrchestration(task.id);
+    orchestration = database.createTaskSessionOrchestration(task.id, {
+      parentThreadBinding: parentBinding,
+      ...(orchestration?.intent ? {} : { intent: input.analysis }),
+    });
+    if (!orchestration.intent) {
+      orchestration = database.saveTaskSessionIntent(orchestration.id, {
+        intent: input.analysis,
+        captureDigest: orchestration.intentDigest,
+        parentThreadId: input.parentThreadId,
+      });
+    }
+    if (orchestration.state === "intent_draft" || orchestration.state === "unbound") {
+      orchestration = database.confirmTaskSessionIntent(orchestration.id, {
+        intentVersion: orchestration.intentVersion,
+        captureDigest: orchestration.intentDigest,
+        allowOpenQuestions: true,
+        parentThreadId: input.parentThreadId,
+      });
+    }
+    let child = orchestration.childThreadBinding;
+    if (!child) {
+      if (typeof options.createChildSession !== "function") {
+        throw new ApiError(
+          503,
+          "CHILD_SESSION_BRIDGE_UNAVAILABLE",
+          "The Codex child-session bridge is unavailable",
+        );
+      }
+      child = await options.createChildSession({
+        taskId,
+        parentThreadId: input.parentThreadId,
+        title: input.title,
+        instruction: input.instruction,
+        analysis: input.analysis,
+        attachmentRefs: input.attachmentRefs,
+        parentBinding,
+      });
+      if (!child?.threadId) {
+        throw new ApiError(502, "CHILD_SESSION_CREATE_FAILED", "Codex did not return a child thread ID");
+      }
+      orchestration = database.dispatchTaskSessionOrchestration(orchestration.id, {
+        intentVersion: orchestration.intentVersion,
+        parentThreadId: input.parentThreadId,
+        childThreadBinding: child,
+      });
+    }
+    const message = database.appendTaskSessionMessage(orchestration.id, {
+      direction: "parent_to_child",
+      type: "analysis_forwarded",
+      idempotencyKey: input.idempotencyKey,
+      parentThreadId: input.parentThreadId,
+      childThreadId: child.threadId,
+      intentVersion: orchestration.intentVersion,
+      deliveryState: "sent",
+      payload: {
+        analysis: input.analysis,
+        attachmentRefs: input.attachmentRefs,
+        instruction: input.instruction,
+      },
+    });
+    emitOrchestrationUpdate(orchestration.id, message);
+    return { orchestrationId: orchestration.id, orchestration, child, message };
+  }
   const cloudProxy = createCloudProxy({
     configStore: cloudConfig,
     fetch: options.remoteFetch ?? globalThis.fetch,
@@ -3172,6 +3269,19 @@ export function createTaskboardServer(options = {}) {
         });
         emitOrchestrationUpdate(orchestration.id);
         return sendJson(response, existing ? 200 : 201, orchestrationView(orchestration.id));
+      }
+
+      const taskSessionChildRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/child-session$/);
+      if (taskSessionChildRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/child-session");
+        const taskId = decodeRouteSegment(taskSessionChildRoute[1], "Task id");
+        const input = parseTaskSessionChildRequest(await readJson(request));
+        const result = await createTaskSessionChild(taskId, input);
+        return sendJson(response, 202, {
+          ...result,
+          view: orchestrationView(result.orchestrationId),
+        });
       }
 
       const taskSessionTimelineRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/timeline$/);

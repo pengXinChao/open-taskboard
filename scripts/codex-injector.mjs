@@ -216,7 +216,7 @@ async function waitUntilTaskboardReachable(timeoutMs) {
   throw new Error(`Timed out waiting for authenticated ${taskboardHealthUrl}`);
 }
 
-function startTaskboard({ detached, onCodexAppServerRequest }) {
+function startTaskboard({ detached, onCodexAppServerRequest, onChildSessionRequest }) {
   const baseStdio = taskboardListenFd === null
     ? Array(3).fill(detached ? "ignore" : "inherit")
     : Array.from(
@@ -229,23 +229,30 @@ function startTaskboard({ detached, onCodexAppServerRequest }) {
     stdio: [...baseStdio, "ipc"],
   });
   child.on("message", (message) => {
-    if (message?.type !== "taskboard:codex-app-server-request") return;
-    void Promise.resolve(onCodexAppServerRequest(message)).then(
+    const isAppServerRequest = message?.type === "taskboard:codex-app-server-request";
+    const isChildSessionRequest = message?.type === "taskboard:child-session-request";
+    if (!isAppServerRequest && !isChildSessionRequest) return;
+    const handler = isAppServerRequest ? onCodexAppServerRequest : onChildSessionRequest;
+    void Promise.resolve(handler(message)).then(
       (result) => {
         if (!child.connected) return;
         child.send({
-          type: "taskboard:codex-app-server-response",
+          type: isAppServerRequest
+            ? "taskboard:codex-app-server-response"
+            : "taskboard:child-session-response",
           requestId: message.requestId,
-          hostId: message.hostId,
+          ...(message.hostId ? { hostId: message.hostId } : {}),
           result,
         });
       },
       (error) => {
         if (!child.connected) return;
         child.send({
-          type: "taskboard:codex-app-server-response",
+          type: isAppServerRequest
+            ? "taskboard:codex-app-server-response"
+            : "taskboard:child-session-response",
           requestId: message.requestId,
-          hostId: message.hostId,
+          ...(message.hostId ? { hostId: message.hostId } : {}),
           error: error instanceof Error ? error.message : String(error),
         });
       },
@@ -2920,6 +2927,75 @@ async function main() {
       message.params,
     );
   };
+  const handleChildSessionRequest = async (message) => {
+    const request = message?.payload;
+    const parentBinding = request?.parentBinding ?? {};
+    const codexHostId = typeof parentBinding.codexHostId === "string"
+      ? parentBinding.codexHostId
+      : "local";
+    const workspacePath = typeof parentBinding.workspacePath === "string"
+      ? parentBinding.workspacePath.trim()
+      : "";
+    if (!workspacePath) {
+      throw new Error("Select a Codex project before creating the worker session");
+    }
+    const connection = await codexConnectionForHost(codexHostId);
+    const started = await requestCodexAppServerViaCdp(
+      connection,
+      undefined,
+      codexHostId,
+      "thread/start",
+      {
+        cwd: workspacePath,
+        runtimeWorkspaceRoots: [workspacePath],
+        approvalPolicy: "on-request",
+        sandbox: "danger-full-access",
+      },
+    );
+    const threadId = typeof started?.thread?.id === "string" ? started.thread.id : "";
+    if (!threadId) throw new Error("Codex did not return a worker thread ID");
+    const title = typeof request.title === "string" ? request.title.trim() : "Taskboard worker";
+    const analysis = request.analysis && typeof request.analysis === "object" && !Array.isArray(request.analysis)
+      ? request.analysis
+      : {};
+    const attachmentRefs = Array.isArray(request.attachmentRefs)
+      ? request.attachmentRefs.filter((value) => typeof value === "string").slice(0, 128)
+      : [];
+    // 将主会话的结构化分析和附件引用放进 child 首个 turn，确保任务会话拿到实际上下文而不是只有时间线记录。
+    const workerInstruction = [
+      "主会话已完成 Jira 上下文分析。请按以下结构化结果和执行要求工作，不要重新解释或重新抓取 Jira。",
+      "<taskboard-analysis>",
+      JSON.stringify({ analysis, attachmentRefs }, null, 2),
+      "</taskboard-analysis>",
+      "<taskboard-execution-instruction>",
+      request.instruction,
+      "</taskboard-execution-instruction>",
+    ].join("\n\n");
+    await requestCodexAppServerViaCdp(
+      connection,
+      undefined,
+      codexHostId,
+      "thread/name/set",
+      { threadId, name: title },
+    );
+    await requestCodexAppServerViaCdp(
+      connection,
+      undefined,
+      codexHostId,
+      "turn/start",
+      {
+        threadId,
+        input: [{ type: "text", text: workerInstruction }],
+      },
+    );
+    return {
+      threadId,
+      codexProjectId: parentBinding.codexProjectId ?? null,
+      codexProjectKind: parentBinding.codexProjectKind ?? "local",
+      codexHostId,
+      workspacePath,
+    };
+  };
   const forwardCodexAppServerNotification = (cdp, notification) => {
     handleRemoteAutomationDecisionNotification(notification);
     if (remoteCodexConnections.get(notification.hostId) !== cdp) return;
@@ -2939,6 +3015,7 @@ async function main() {
       const child = startTaskboard({
         detached,
         onCodexAppServerRequest: handleCodexAppServerRequest,
+        onChildSessionRequest: handleChildSessionRequest,
       });
       taskboardChild = child;
       child.once("exit", () => {
