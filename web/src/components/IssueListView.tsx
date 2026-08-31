@@ -1,7 +1,7 @@
 import { useState, type KeyboardEvent, type MouseEvent, type RefObject } from "react";
 import { assigneeTargetForActor } from "../actors";
 import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
-import { labelPresentation } from "../labels";
+import { issueTypePresentation, labelPresentation } from "../labels";
 import type { TaskCardPresentation } from "../taskConversations";
 import { TASK_PRIORITIES, TASK_STATUSES, type ActorIdentity, type Task, type TaskDraft, type TaskStatus } from "../types";
 import { ActorAvatar } from "./ActorAvatar";
@@ -30,6 +30,19 @@ function createdDate(value: string, locale: string) {
 function calendarDate(value: string, locale: string) {
   return new Intl.DateTimeFormat(locale, { month: "numeric", day: "numeric" })
     .format(new Date(`${value}T12:00:00`));
+}
+
+function IssueTypeMark({ issueType }: { issueType: string }) {
+  const presentation = issueTypePresentation(issueType);
+  return (
+    <i
+      className={`issue-type-chip${presentation.tone ? ` tone-${presentation.tone}` : ""}`}
+      title={issueType}
+    >
+      {presentation.tone && <span aria-hidden="true" />}
+      <b>{presentation.name}</b>
+    </i>
+  );
 }
 
 export function IssueListView({
@@ -114,6 +127,7 @@ export function IssueListView({
                             />
                           </span>
                           <span className="issue-list-labels">
+                            {task.issueType && <IssueTypeMark issueType={task.issueType} />}
                             {task.labels.slice(0, 2).map((label) => {
                               const presentation = labelPresentation(label, language);
                               return (

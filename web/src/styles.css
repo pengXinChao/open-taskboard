@@ -2691,6 +2691,10 @@ kbd {
   max-width: 76px;
 }
 
+.issue-type-chip {
+  flex: 0 0 auto;
+}
+
 .due-date-chip {
   flex: 0 0 auto;
   color: var(--text-tertiary);
@@ -11244,6 +11248,11 @@ kbd {
   min-width: 0;
   gap: 4px;
   overflow: hidden;
+}
+
+.issue-list-labels > i.issue-type-chip {
+  color: var(--text-primary);
+  font-weight: 560;
 }
 
 .issue-list-labels > i,

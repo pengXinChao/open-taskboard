@@ -298,6 +298,22 @@ function decodeRouteSegment(value, name) {
   return decoded;
 }
 
+async function openWithLaunchServices(args) {
+  await execFileAsync("/usr/bin/open", args, { timeout: 15_000 });
+}
+
+async function openProjectlessCodexThread(instruction) {
+  // ChatGPT 打开本机文件会发 new-projectless-task（activeProject:null）。
+  // 随后的 threads/new?prompt 不带 path，不会改项目，只会预填提示词。
+  const marker = path.join(os.tmpdir(), "taskboard-projectless-open.txt");
+  await writeFile(marker, "");
+  await openWithLaunchServices(["-a", "ChatGPT", marker]);
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  const deepLink = new URL("codex://threads/new");
+  deepLink.searchParams.set("prompt", instruction);
+  await openWithLaunchServices([deepLink.toString()]);
+}
+
 function isLoopbackAddress(value) {
   if (typeof value !== "string") return false;
   const address = value.toLowerCase().split("%", 1)[0];
@@ -1761,6 +1777,7 @@ export function createTaskboardServer(options = {}) {
   const jira = createJiraIntegration({
     configStore: jiraConfig,
     database,
+    attachmentsDirectory: resolved.attachmentsDirectory,
     fetch: options.jiraFetch ?? globalThis.fetch,
   });
   let hostRuntime = null;
@@ -2369,6 +2386,19 @@ export function createTaskboardServer(options = {}) {
           }
         }
         return methodNotAllowed(response, ["GET", "PUT"]);
+      }
+
+      if (pathname === "/api/local/open-codex-thread") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "POST /api/local/open-codex-thread does not accept query parameters");
+        }
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["instruction"]));
+        const instruction = stringField(body.instruction, "instruction", { required: true, maxLength: 100_000 });
+        await openProjectlessCodexThread(instruction);
+        return sendJson(response, 200, { ok: true });
       }
 
       if (pathname === "/api/local/jira-connection/sync") {
@@ -3188,8 +3218,12 @@ export function createTaskboardServer(options = {}) {
           if ([...url.searchParams.keys()].length > 0) {
             throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/tasks/:id does not accept query parameters");
           }
-          const task = database.getTask(id);
+          let task = database.getTask(id);
           if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          if (task.source === "jira") {
+            await jira.sync();
+            task = database.getTask(task.id) ?? task;
+          }
           return sendJson(response, 200, { task });
         }
         if (!action && request.method === "PATCH") {

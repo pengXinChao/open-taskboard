@@ -264,6 +264,7 @@ function taskFromRow(row) {
     externalOrigin: row.external_origin ?? null,
     externalKey: row.external_key ?? null,
     externalUrl: row.external_url ?? null,
+    issueType: row.issue_type ?? null,
     archivedAt: row.archived_at,
     version: row.version,
     createdAt: row.created_at,
@@ -505,6 +506,7 @@ export class TaskboardDatabase {
         external_id TEXT,
         external_key TEXT,
         external_url TEXT,
+        issue_type TEXT,
         archived_at TEXT,
         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
         created_at TEXT NOT NULL,
@@ -748,6 +750,9 @@ export class TaskboardDatabase {
     }
     if (!migratedTaskColumns.some((column) => column.name === "external_url")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN external_url TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "issue_type")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN issue_type TEXT");
     }
     this.database.exec(`
       DROP INDEX IF EXISTS tasks_external_source_id;
@@ -1211,6 +1216,7 @@ export class TaskboardDatabase {
           git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
           external_source, external_origin, external_id, external_key, external_url,
+          issue_type,
           archived_at, version, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?,
@@ -1220,6 +1226,7 @@ export class TaskboardDatabase {
           NULL, NULL, NULL,
           NULL, ?, NULL, NULL,
           'jira', ?, ?, ?, ?,
+          ?,
           NULL, 1, ?, ?
         )
       `);
@@ -1229,6 +1236,7 @@ export class TaskboardDatabase {
           sort_order = ?, creator_type = ?, creator_id = ?, creator_name = ?, creator_avatar_url = ?,
           assignee_type = ?, assignee_id = ?, assignee_name = ?, assignee_avatar_url = ?,
           due_date = ?, external_origin = ?, external_id = ?, external_key = ?, external_url = ?,
+          issue_type = ?,
           archived_at = NULL,
           version = version + 1, updated_at = ?
         WHERE id = ?
@@ -1262,6 +1270,7 @@ export class TaskboardDatabase {
             issue.externalId,
             issue.externalKey,
             issue.externalUrl,
+            issue.issueType,
             issue.createdAt,
             issue.updatedAt,
           );
@@ -1288,6 +1297,7 @@ export class TaskboardDatabase {
           || existing.external_id !== issue.externalId
           || existing.external_key !== issue.externalKey
           || existing.external_url !== issue.externalUrl
+          || existing.issue_type !== issue.issueType
           || existing.archived_at !== null;
         if (!changed) continue;
         updateTask.run(
@@ -1311,6 +1321,7 @@ export class TaskboardDatabase {
           issue.externalId,
           issue.externalKey,
           issue.externalUrl,
+          issue.issueType,
           issue.updatedAt,
           existing.id,
         );
@@ -1901,8 +1912,20 @@ export class TaskboardDatabase {
     ));
   }
 
+  #taskRowByReference(id) {
+    const exact = this.database.prepare(
+      "SELECT * FROM tasks WHERE id = ? OR identifier = ?",
+    ).get(id, id);
+    if (exact) return exact;
+    // Jira 票可用 GITIOMS-731 这类 external_key 定位；不唯一时不猜测。
+    const matches = this.database.prepare(
+      "SELECT * FROM tasks WHERE external_key = ?",
+    ).all(id);
+    return matches.length === 1 ? matches[0] : null;
+  }
+
   getTask(id) {
-    const row = this.database.prepare("SELECT * FROM tasks WHERE id = ? OR identifier = ?").get(id, id);
+    const row = this.#taskRowByReference(id);
     if (!row) return null;
     const task = this.#taskWithRelations(row);
     const comments = this.#commentsForTaskActivity([task.id]).get(task.id) ?? [];
@@ -1912,9 +1935,7 @@ export class TaskboardDatabase {
   }
 
   getTaskTree(id, direction, depth) {
-    const root = this.database.prepare(
-      "SELECT * FROM tasks WHERE id = ? OR identifier = ?",
-    ).get(id, id);
+    const root = this.#taskRowByReference(id);
     if (!root) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
 
     const nodes = [taskTreeNode(root, null, 0, [root.id])];

@@ -19,6 +19,7 @@ import {
   createProjectLabel as createProjectLabelRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
+  openProjectlessCodexThread,
   configureJiraConnection,
   deleteArchivedTask as deleteArchivedTaskRequest,
   deleteProjectLabel as deleteProjectLabelRequest,
@@ -302,7 +303,32 @@ const DEFAULT_USER_ACTOR: ActorIdentity = {
 };
 
 const GLOBAL_PROJECT_ID = "local";
+const JIRA_PROJECT_ID = "jira-my-tasks";
 const ALL_PROJECTS_ID = "__all_projects__";
+
+function isJiraDefectType(issueType: string | null | undefined) {
+  const name = issueType?.trim() ?? "";
+  return name === "故障" || name.toLocaleLowerCase() === "bug";
+}
+
+function buildOpenThreadInstruction(
+  task: Task,
+  skillPath: string,
+  text: (chinese: string, english: string) => string,
+) {
+  const issueRef = task.externalKey ?? task.identifier;
+  const prefix = `[$manage-taskboard](${skillPath}) [${issueRef}] ${task.title}`;
+  if (isJiraDefectType(task.issueType)) {
+    return text(
+      `${prefix}\n这是 Jira 故障。先阅读议题和附件，做诊断审查（现象、复现、影响面、可能原因）并书面报告。`,
+      `${prefix}\nThis is a Jira defect. First read the issue and attachments, then diagnose (symptoms, reproduction, impact, likely cause) and report in writing.`,
+    );
+  }
+  return text(
+    `${prefix}\n先阅读议题，复述需求、范围、缺口和验收标准并报告你的理解。`,
+    `${prefix}\nFirst read the issue, then restate the requirement, scope, gaps, and acceptance criteria, and report your understanding.`,
+  );
+}
 const RECENT_PROJECT_IDS_KEY = "taskboard.recentProjectIds.v1";
 const PROJECT_VIEW_KEY_PREFIX = "taskboard.project-view.v1.";
 const DEVICE_WORKSPACE_PATHS_KEY = "taskboard.deviceWorkspacePaths.v1";
@@ -874,7 +900,8 @@ export function App() {
   }, []);
 
   const rememberDeviceWorkspacePath = useCallback((projectId: string, workspacePath: string) => {
-    if (projectId === GLOBAL_PROJECT_ID) return;
+    // Jira 不是本地仓库。当前 Codex 会话的 cwd 不能记成它的映射，否则「在新对话打开」会去切项目。
+    if (projectId === GLOBAL_PROJECT_ID || projectId === JIRA_PROJECT_ID) return;
     const normalizedPath = workspacePath.trim();
     setDeviceWorkspacePaths((current) => {
       if (current[projectId] === normalizedPath || (!normalizedPath && !(projectId in current))) {
@@ -2973,7 +3000,6 @@ export function App() {
 
   async function openTaskInThread(task: Task) {
     const standalone = !embedded || window.parent === window;
-    const projectless = task.projectId === GLOBAL_PROJECT_ID;
     const taskboardProject = projects.find((project) => project.id === task.projectId);
     const savedRemoteIdentity = projectCodexIdentities[task.projectId]?.codexProjectKind === "remote"
       ? projectCodexIdentities[task.projectId]
@@ -3006,20 +3032,17 @@ export function App() {
       }
       codexProjectContext = identity;
     }
-    let workspacePath = projectless
+    let workspacePath = task.projectId === GLOBAL_PROJECT_ID
       ? undefined
       : task.developmentContext?.type === "worktree"
         ? task.developmentContext.path
         : codexProjectContext?.workspacePath
           ?? deviceWorkspacePaths[task.projectId]
           ?? taskboardProject?.workspacePath;
-    const embeddedInstruction = text(
-      `[$manage-taskboard](${manageTaskboardSkillPath}) 议题 ID：${task.identifier}`,
-      `[$manage-taskboard](${manageTaskboardSkillPath}) Issue ID: ${task.identifier}`,
-    );
+    const embeddedInstruction = buildOpenThreadInstruction(task, manageTaskboardSkillPath, text);
 
     if (
-      !projectless
+      task.projectId !== GLOBAL_PROJECT_ID
       && task.developmentContext?.type === "worktree"
       && codexProjectContext?.codexProjectKind !== "remote"
     ) {
@@ -3060,6 +3083,10 @@ export function App() {
       return;
     }
     if (openingThreadTaskId) return;
+    // Jira 没有可切换的本地仓库。development-context 扫描会把当前 Codex cwd 记到
+    // jira-my-tasks，inject 就会走 waitForNativeProject 并在 8 秒后报切换超时。
+    if (task.source === "jira") workspacePath = undefined;
+    const projectless = !workspacePath;
     if (standalone) {
       if (codexProjectContext?.codexProjectKind === "remote") {
         setActionError(text(
@@ -3068,8 +3095,20 @@ export function App() {
         ));
         return;
       }
+      if (!workspacePath) {
+        setOpeningThreadTaskId(task.id);
+        setActionError(null);
+        try {
+          await openProjectlessCodexThread(embeddedInstruction);
+        } catch (error) {
+          setActionError(errorMessage(error));
+        } finally {
+          setOpeningThreadTaskId(null);
+        }
+        return;
+      }
       const deepLink = new URL("codex://threads/new");
-      if (workspacePath) deepLink.searchParams.set("path", workspacePath);
+      deepLink.searchParams.set("path", workspacePath);
       deepLink.searchParams.set("prompt", embeddedInstruction);
       window.location.assign(deepLink.toString());
       return;

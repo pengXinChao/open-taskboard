@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { mkdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import path from "node:path";
 
 import { JIRA_PROJECT_ID } from "../shared/domain.mjs";
 import { ApiError } from "./database.mjs";
@@ -9,6 +11,8 @@ const JIRA_FIELDS = [
   "status",
   "priority",
   "labels",
+  "issuetype",
+  "attachment",
   "duedate",
   "assignee",
   "reporter",
@@ -17,6 +21,8 @@ const JIRA_FIELDS = [
 ];
 const SYNC_INTERVAL_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 20_000;
+const JIRA_IMAGE_ATTACHMENT_LIMIT = 25 * 1024 * 1024;
+const JIRA_IMAGE_REDIRECT_LIMIT = 3;
 
 function quoteJqlString(value) {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
@@ -88,6 +94,70 @@ function legacyJiraOriginId(baseUrl) {
   return createHash("sha256").update(baseUrl).digest("hex").slice(0, 16);
 }
 
+function issueTypeFromJira(fields) {
+  // 存 Jira 类型显示名（故障/任务/故事），打开对话和列表标签都按名称分支，不使用易变的数字 id。
+  const name = typeof fields?.issuetype?.name === "string" ? fields.issuetype.name.trim() : "";
+  return name ? name.slice(0, 64) : null;
+}
+
+function jiraImageContentType(value) {
+  const contentType = String(value ?? "").split(";", 1)[0].trim().toLowerCase();
+  return contentType.startsWith("image/") && contentType.length <= 200 ? contentType : null;
+}
+
+function jiraAttachmentFilename(value) {
+  const filename = String(value ?? "image").trim().slice(0, 240) || "image";
+  const safe = filename.replace(/[\u0000-\u001f\u007f/\\]/g, "_");
+  return safe === "." || safe === ".." ? "image" : safe;
+}
+
+function jiraImageAttachmentId(originId, jiraAttachmentId) {
+  // 同一 Jira 附件始终映射到同一本地 id，手动删除后下次同步会按原 URL 重建。
+  const digest = createHash("sha256")
+    .update(`${originId}:${jiraAttachmentId}`)
+    .digest("hex")
+    .slice(0, 32);
+  return `jimg-${digest}`;
+}
+
+function markdownAlt(value) {
+  return String(value ?? "image").replace(/[[\]]/g, "");
+}
+
+export function rewriteJiraWikiImages(description, images) {
+  const attachments = Array.isArray(images) ? images.filter(Boolean) : [];
+  const text = String(description ?? "");
+  if (attachments.length === 0) return text.slice(0, 100_000);
+
+  const byName = new Map();
+  for (const image of attachments) {
+    if (!byName.has(image.filename)) byName.set(image.filename, image);
+  }
+  const used = new Set();
+  let rewritten = text.replace(/!([^!\n|]+)(?:\|[^!\n]*)?!/g, (match, rawName) => {
+    const name = String(rawName ?? "").trim();
+    const image = byName.get(name);
+    if (!image) return match;
+    used.add(image.id);
+    return `![${markdownAlt(name)}](api/attachments/${image.id}/content)`;
+  });
+  const extras = attachments.filter((image) => !used.has(image.id));
+  if (extras.length > 0) {
+    const block = extras
+      .map((image) => `![${markdownAlt(image.filename)}](api/attachments/${image.id}/content)`)
+      .join("\n");
+    rewritten = rewritten.trimEnd() ? `${rewritten.trimEnd()}\n\n${block}` : block;
+  }
+  return rewritten.slice(0, 100_000);
+}
+
+export function restoreJiraWikiImages(description) {
+  return String(description ?? "").replace(
+    /!\[([^\]]*)\]\(api\/attachments\/(jimg-[a-f0-9]{32})\/content\)/g,
+    (_match, alt) => `!${alt || "image"}!`,
+  );
+}
+
 function normalizeIssue(issue, config, index = 0) {
   const fields = issue?.fields ?? {};
   const externalId = String(issue.id);
@@ -109,6 +179,7 @@ function normalizeIssue(issue, config, index = 0) {
     description: typeof fields.description === "string" ? fields.description.slice(0, 100_000) : "",
     status: taskStatusFromJira(fields.status),
     priority: taskPriorityFromJira(fields.priority),
+    issueType: issueTypeFromJira(fields),
     labels,
     sortOrder: (index + 1) * 1024,
     creator: reporter,
@@ -147,9 +218,18 @@ function safeConfig(config, lastSyncedAt = null) {
     };
 }
 
-export function createJiraIntegration({ configStore, database, fetch: fetchImplementation = globalThis.fetch }) {
+export function createJiraIntegration({
+  configStore,
+  database,
+  attachmentsDirectory = null,
+  fetch: fetchImplementation = globalThis.fetch,
+}) {
   let lastSyncedAt = null;
   let pendingSync = null;
+
+  function authorizationHeader(config) {
+    return `Basic ${Buffer.from(`${config.username}:${config.password}`, "utf8").toString("base64")}`;
+  }
 
   async function request(config, pathname, init = {}) {
     const controller = new AbortController();
@@ -163,7 +243,7 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
         signal: controller.signal,
         headers: {
           accept: "application/json",
-          authorization: `Basic ${Buffer.from(`${config.username}:${config.password}`, "utf8").toString("base64")}`,
+          authorization: authorizationHeader(config),
           ...(init.body ? { "content-type": "application/json" } : {}),
           ...init.headers,
         },
@@ -201,6 +281,184 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
     } catch {
       throw new ApiError(502, "INVALID_JIRA_RESPONSE", "Jira 返回了无效的 JSON 数据");
     }
+  }
+
+  function sameOriginUrl(config, target) {
+    try {
+      const base = new URL(config.baseUrl);
+      const url = new URL(target, config.baseUrl);
+      return url.origin === base.origin ? url : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function downloadJiraAttachment(config, attachment) {
+    const contentType = jiraImageContentType(attachment?.mimeType);
+    if (!contentType) return null;
+    const size = Number(attachment?.size);
+    if (Number.isFinite(size) && size > JIRA_IMAGE_ATTACHMENT_LIMIT) return null;
+    let url = sameOriginUrl(config, attachment?.content ?? "");
+    if (!url) return null;
+
+    for (let hop = 0; hop <= JIRA_IMAGE_REDIRECT_LIMIT; hop += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      timeout.unref?.();
+      let response;
+      try {
+        response = await fetchImplementation(url.href, {
+          redirect: "manual",
+          signal: controller.signal,
+          headers: {
+            accept: "image/*,application/octet-stream;q=0.8,*/*;q=0.1",
+            authorization: authorizationHeader(config),
+          },
+        });
+      } catch (error) {
+        const timedOut = error instanceof Error && error.name === "AbortError";
+        throw new ApiError(
+          502,
+          timedOut ? "JIRA_TIMEOUT" : "JIRA_UNAVAILABLE",
+          timedOut ? "连接 Jira 超时" : "无法连接 Jira，请检查地址和内网连接",
+        );
+      } finally {
+        clearTimeout(timeout);
+      }
+      if (response.status === 401 || response.status === 403) {
+        throw new ApiError(
+          401,
+          "JIRA_AUTH_FAILED",
+          "Jira 登录失败，请检查用户名、密码、Basic Auth 或 CAPTCHA 状态",
+        );
+      }
+      if (response.status >= 300 && response.status < 400) {
+        const next = sameOriginUrl(config, response.headers.get("location") ?? "");
+        if (!next || hop === JIRA_IMAGE_REDIRECT_LIMIT) return null;
+        url = next;
+        continue;
+      }
+      if (response.status === 404) return null;
+      if (!response.ok) return null;
+      const body = Buffer.from(await response.arrayBuffer());
+      if (body.length === 0 || body.length > JIRA_IMAGE_ATTACHMENT_LIMIT) return null;
+      const headerType = response.headers.get("content-type");
+      const responseType = headerType ? jiraImageContentType(headerType) : contentType;
+      if (!responseType) return null;
+      return { body, contentType: responseType };
+    }
+    return null;
+  }
+
+  async function ensureJiraImageAttachments(config, task, jiraAttachments) {
+    if (!attachmentsDirectory || !task) return [];
+    const images = [];
+    const list = Array.isArray(jiraAttachments) ? jiraAttachments : [];
+    for (const attachment of list) {
+      const contentType = jiraImageContentType(attachment?.mimeType);
+      const jiraId = attachment?.id == null ? "" : String(attachment.id).trim();
+      if (!contentType || !jiraId) continue;
+      const id = jiraImageAttachmentId(config.originId, jiraId);
+      const filename = jiraAttachmentFilename(attachment.filename);
+      const existing = database.getAttachment(id);
+      const storagePath = path.join(attachmentsDirectory, id);
+      let fileOk = false;
+      try {
+        const file = await stat(storagePath);
+        fileOk = file.isFile() && file.size > 0 && (!existing || file.size === existing.size);
+      } catch {
+        fileOk = false;
+      }
+      if (existing?.taskId === task.id && fileOk) {
+        images.push(existing);
+        continue;
+      }
+      let downloaded;
+      try {
+        downloaded = await downloadJiraAttachment(config, attachment);
+      } catch (error) {
+        if (
+          error instanceof ApiError
+          && (error.code === "JIRA_AUTH_FAILED" || error.code === "JIRA_TIMEOUT" || error.code === "JIRA_UNAVAILABLE")
+        ) {
+          throw error;
+        }
+        continue;
+      }
+      if (!downloaded) continue;
+      await mkdir(attachmentsDirectory, { recursive: true });
+      const tempPath = `${storagePath}.${process.pid}.tmp`;
+      try {
+        await writeFile(tempPath, downloaded.body);
+        await rename(tempPath, storagePath);
+      } catch (error) {
+        try {
+          await unlink(tempPath);
+        } catch {
+          // 临时文件可能尚未写出。
+        }
+        throw error;
+      }
+      if (!existing) {
+        try {
+          database.createAttachment(task.id, {
+            id,
+            kind: "inline",
+            filename,
+            contentType: downloaded.contentType,
+            size: downloaded.body.length,
+          });
+        } catch {
+          const storedAfterConflict = database.getAttachment(id);
+          if (!storedAfterConflict) {
+            try {
+              await unlink(storagePath);
+            } catch {
+              // 回滚文件失败时留给下次同步覆盖。
+            }
+            continue;
+          }
+        }
+      }
+      const stored = database.getAttachment(id);
+      if (stored) images.push(stored);
+    }
+    return images;
+  }
+
+  async function persistAssignedIssues(config, rawIssues, { archiveMissing, projectName, legacyIdentity }) {
+    const items = rawIssues.map((raw, index) => ({
+      raw,
+      wikiDescription: typeof raw?.fields?.description === "string"
+        ? raw.fields.description.slice(0, 100_000)
+        : "",
+      issue: normalizeIssue(raw, config, index),
+    }));
+
+    for (const item of items) {
+      const existing = database.getTask(item.issue.id) ?? database.getTask(item.issue.externalKey);
+      if (!existing) continue;
+      const images = await ensureJiraImageAttachments(config, existing, item.raw.fields?.attachment);
+      item.issue.description = rewriteJiraWikiImages(item.wikiDescription, images);
+    }
+
+    database.syncJiraTasks(items.map((item) => item.issue), {
+      archiveMissing,
+      projectName,
+      legacyIdentity,
+    });
+
+    for (const item of items) {
+      const task = database.getTask(item.issue.id) ?? database.getTask(item.issue.externalKey);
+      if (!task) continue;
+      const images = await ensureJiraImageAttachments(config, task, item.raw.fields?.attachment);
+      item.issue.description = rewriteJiraWikiImages(item.wikiDescription, images);
+    }
+    database.syncJiraTasks(items.map((item) => item.issue), {
+      archiveMissing: false,
+      projectName,
+      legacyIdentity,
+    });
   }
 
   async function fetchAssignedIssues(config) {
@@ -261,10 +519,11 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       await assertLiveOrigin(config);
       issues = await fetchAssignedIssues(config);
     }
-    database.syncJiraTasks(
-      issues.map((issue, index) => normalizeIssue(issue, config, index)),
-      { archiveMissing, projectName: `Jira · ${config.displayName}`, legacyIdentity },
-    );
+    await persistAssignedIssues(config, issues, {
+      archiveMissing,
+      projectName: `Jira · ${config.displayName}`,
+      legacyIdentity,
+    });
     if (storedConfig.version === 1) config = await configStore.save(config);
     lastSyncedAt = new Date().toISOString();
     return safeConfig(config, lastSyncedAt);
@@ -375,14 +634,11 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       const legacyIdentity = current?.version === 1
         ? { urlHash: legacyJiraOriginId(current.baseUrl), originId: config.originId }
         : null;
-      database.syncJiraTasks(
-        issues.map((issue, index) => normalizeIssue(issue, config, index)),
-        {
-          archiveMissing: true,
-          projectName: `Jira · ${config.displayName}`,
-          legacyIdentity,
-        },
-      );
+      await persistAssignedIssues(config, issues, {
+        archiveMissing: true,
+        projectName: `Jira · ${config.displayName}`,
+        legacyIdentity,
+      });
       const savedConfig = await configStore.save(config);
       lastSyncedAt = new Date().toISOString();
       return safeConfig(savedConfig, lastSyncedAt);
@@ -411,7 +667,8 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       const fields = {};
       if (Object.hasOwn(changes, "title") && changes.title !== task.title) fields.summary = changes.title;
       if (Object.hasOwn(changes, "description") && changes.description !== task.description) {
-        fields.description = changes.description;
+        // 回写 Jira 时把本地 Markdown 图还原成 wiki，避免把 Taskboard 附件 URL 写进 Jira。
+        fields.description = restoreJiraWikiImages(changes.description);
       }
       if (Object.hasOwn(changes, "labels") && JSON.stringify(changes.labels) !== JSON.stringify(task.labels)) {
         fields.labels = changes.labels;

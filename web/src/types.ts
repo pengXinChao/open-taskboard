@@ -436,6 +436,7 @@ export interface Task {
   externalOrigin?: string | null;
   externalKey?: string | null;
   externalUrl: string | null;
+  issueType: string | null;
   archivedAt: string | null;
   relations: TaskRelations;
   version: number;

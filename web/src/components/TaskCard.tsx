@@ -11,7 +11,7 @@ import {
   type TaskDraft,
   type TaskPriority,
 } from "../types";
-import { labelPresentation } from "../labels";
+import { issueTypePresentation, labelPresentation } from "../labels";
 import { taskPriorityLabel, useTaskboardI18n } from "../i18n";
 import { CODEX_AGENT_ACTOR, actorKey, assigneeTargetForActor } from "../actors";
 import type {
@@ -248,6 +248,19 @@ function ParticipantAvatars({ participants }: { participants: ActorIdentity[] })
   );
 }
 
+function IssueTypeChip({ issueType }: { issueType: string }) {
+  const presentation = issueTypePresentation(issueType);
+  return (
+    <span
+      className={`label-chip issue-type-chip${presentation.tone ? ` label-chip-${presentation.tone}` : ""}`}
+      title={issueType}
+    >
+      {presentation.tone && <i aria-hidden="true" />}
+      <span>{presentation.name}</span>
+    </span>
+  );
+}
+
 function TaskLabels({ task }: { task: Task }) {
   const { language } = useTaskboardI18n();
   return (
@@ -431,8 +444,13 @@ export function TaskCard({
     () => showBody ? taskBodyText(task.description) : "",
     [showBody, task.description],
   );
-  const hasProperties = task.priority !== "none" || task.labels.length > 0 || task.dueDate;
+  const hasProperties = task.priority !== "none"
+    || task.labels.length > 0
+    || Boolean(task.issueType)
+    || task.dueDate;
+  // 处理中卡片不展示优先级/标签等可编辑属性，但 Jira issueType 仍要留在看板上。
   const showsProperties = Boolean(projectName)
+    || Boolean(task.issueType)
     || (!processingCard && (hasProperties || showsInlineParticipants || showsConversation));
   const propertyDisabled = savingProperty !== null;
 
@@ -532,6 +550,7 @@ export function TaskCard({
               <span>{projectName}</span>
             </span>
           )}
+          {task.issueType && <IssueTypeChip issueType={task.issueType} />}
           {!processingCard && task.priority !== "none" && (
             <PriorityControl
               task={task}
