@@ -48,7 +48,13 @@ test("the CDP bridge accepts service ensure and native task conversation start a
   assert.match(runtimeSource, /request\.title\.length <= 240/);
   assert.match(source, /async function startTaskConversationViaCdp/);
   assert.match(source, /data-composer-placement="home"/);
-  assert.match(source, /\(editor\.innerText \|\| ""\) !== \$\{JSON\.stringify\(instruction\)\}/);
+  assert.match(source, /style\.visibility !== "hidden"/);
+  assert.match(source, /style\.contentVisibility !== "hidden"/);
+  assert.match(source, /const normalizeText = \(value\) => String\(value \|\| ""\)/);
+  assert.match(source, /\.replace\(\/!?/);
+  assert.match(source, /querySelectorAll\('\[skill-mention-name\]'\)/);
+  assert.match(source, /actualEditor\?\.textContent/);
+  assert.match(source, /actual !== expected/);
   assert.doesNotMatch(source, /cdp\.send\("Input\.insertText", \{ text: instruction \}\)/);
   assert.match(
     source,

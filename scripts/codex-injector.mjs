@@ -2038,19 +2038,52 @@ async function startTaskConversationViaCdp(cdp, executionContextId, request) {
       expression: `(() => {
         const root = Array.from(document.querySelectorAll(
           '[data-codex-composer-root][data-composer-placement="home"]'
-        )).find((candidate) => candidate.getClientRects().length > 0);
+        )).find((candidate) => {
+          const style = getComputedStyle(candidate);
+          return candidate.getClientRects().length > 0
+            && style.display !== "none"
+            && style.visibility !== "hidden"
+            && style.contentVisibility !== "hidden"
+            && style.opacity !== "0";
+        });
         const conversationId = root
           ?.querySelector('[data-above-composer-conversation-id]')
           ?.getAttribute('data-above-composer-conversation-id')
           ?.trim() || "";
         const editor = Array.from(root?.querySelectorAll(
           '[data-codex-composer="true"][contenteditable="true"]'
-        ) || []).find((candidate) => candidate.getClientRects().length > 0);
+        ) || []).find((candidate) => {
+          const style = getComputedStyle(candidate);
+          return candidate.getClientRects().length > 0
+            && style.display !== "none"
+            && style.visibility !== "hidden"
+            && style.contentVisibility !== "hidden"
+            && style.opacity !== "0";
+        });
+        // Codex 会把 Markdown 提示词渲染成富文本，比较语义文本而不是原始 Markdown。
+        const normalizeText = (value) => String(value || "")
+          .replace(/\u200b/g, "")
+          .replace(/\r\n?/g, "\n")
+          .replace(/[ \t]+\n/g, "\n")
+          .replace(/\n[ \t]+/g, "\n")
+          .trim();
+        const expected = normalizeText(${JSON.stringify(instruction)}
+          .replace(/!?\\[([^\\]]+)\\]\\([^)]*\\)/g, "$1")
+          .replace(/\`([^\`]+)\`/g, "$1"));
+        let actualEditor = editor;
+        if (editor) {
+          actualEditor = editor.cloneNode(true);
+          actualEditor.querySelectorAll('[skill-mention-name]').forEach((mention) => {
+            const name = mention.getAttribute('skill-mention-name')?.trim();
+            if (name) mention.replaceWith("$" + name);
+          });
+        }
+        const actual = normalizeText(actualEditor?.textContent);
         if (
           !root
           || conversationId
           || !editor
-          || (editor.innerText || "") !== ${JSON.stringify(instruction)}
+          || actual !== expected
         ) return false;
         editor.focus();
         return true;

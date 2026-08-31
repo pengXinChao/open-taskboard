@@ -433,6 +433,52 @@ test("orchestration-driven Jira status changes retain local override until remot
   }
 });
 
+test("Jira sync maps targetless todo to backlog in newer databases", async () => {
+  const fixture = await createFixture();
+  try {
+    fixture.database.database.exec(`
+      ALTER TABLE tasks ADD COLUMN execution_target TEXT;
+      CREATE TRIGGER tasks_todo_execution_target_update
+      BEFORE UPDATE OF status, execution_target ON tasks
+      WHEN NEW.status = 'todo' AND NEW.execution_target IS NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'todo requires an execution target');
+      END;
+      CREATE TRIGGER tasks_todo_execution_target_insert
+      BEFORE INSERT ON tasks
+      WHEN NEW.status = 'todo' AND NEW.execution_target IS NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'todo requires an execution target');
+      END;
+    `);
+    const issue = {
+      id: "jira-targetless-todo",
+      identifier: "JIRA:ORCHESTRATION:jira-targetless-todo",
+      title: "Jira targetless todo",
+      description: "Jira task",
+      status: "todo",
+      priority: "none",
+      labels: [],
+      sortOrder: 1,
+      creator: actor,
+      assignee: actor,
+      dueDate: null,
+      externalOrigin: "jira-orchestration-origin",
+      externalId: "jira-targetless-todo",
+      externalKey: "ORCH-2",
+      externalUrl: "https://jira.example.test/browse/ORCH-2",
+      externalStatusId: "100",
+      createdAt: "2026-08-30T00:00:00.000Z",
+      updatedAt: "2026-08-30T00:00:00.000Z",
+    };
+
+    fixture.database.syncJiraTasks([issue], { projectName: "Jira" });
+    assert.equal(fixture.database.getTask(issue.id).status, "backlog");
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("reports require an explicit result revision and preserve idempotency", async () => {
   const fixture = await createFixture();
   try {

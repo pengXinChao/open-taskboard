@@ -1775,6 +1775,11 @@ export class TaskboardDatabase {
         SELECT * FROM tasks
         WHERE external_source = 'jira' AND external_origin = ? AND external_id = ?
       `);
+      // 新版数据库会拒绝没有 execution_target 的 todo；旧版 schema 没有该列，保持原有 Jira 状态语义。
+      const supportsExecutionTarget = this.database
+        .prepare("PRAGMA table_info(tasks)")
+        .all()
+        .some((column) => column.name === "execution_target");
       const migrateLegacyIdentity = this.database.prepare(`
         UPDATE tasks SET
           identifier = ?, external_origin = ?, external_id = ?, external_key = ?
@@ -1839,6 +1844,11 @@ export class TaskboardDatabase {
 
       for (const issue of issues) {
         const existing = findExisting.get(issue.externalOrigin, issue.externalId);
+        const persistedStatus = supportsExecutionTarget
+          && issue.status === "todo"
+          && existing?.execution_target == null
+          ? "backlog"
+          : issue.status;
         seenTaskIds.add(existing?.id ?? issue.id);
         const labels = JSON.stringify(issue.labels);
         if (!existing) {
@@ -1848,7 +1858,7 @@ export class TaskboardDatabase {
             JIRA_PROJECT_ID,
             issue.title,
             issue.description,
-            issue.status,
+            persistedStatus,
             issue.priority,
             labels,
             issue.sortOrder,
@@ -1884,7 +1894,7 @@ export class TaskboardDatabase {
         const remoteStatusChanged = existing.jira_remote_status_id !== issue.externalStatusId;
         // 本地覆盖只在远端状态未变化时有效；Jira 上的人工流转会恢复远端权威。
         const preserveStatusOverride = existing.jira_status_override === 1 && !remoteStatusChanged;
-        const nextStatus = preserveStatusOverride ? existing.status : issue.status;
+        const nextStatus = preserveStatusOverride ? existing.status : persistedStatus;
         const nextStatusOverride = preserveStatusOverride ? 1 : 0;
         const changed = existing.identifier !== issue.identifier
           || existing.title !== issue.title
