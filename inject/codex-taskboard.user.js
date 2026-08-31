@@ -25,6 +25,10 @@
   const REATTACH_DELAY_MS = 160;
   const FRAME_READY_TIMEOUT_MS = 12_000;
   const HOST_REQUEST_TIMEOUT_MS = 12_000;
+  const TASK_CONVERSATION_REQUEST_TIMEOUT_MS = 75_000;
+  const HANDSHAKE_RESULT_QUEUE_MAX = 32;
+  const HANDSHAKE_RESULT_QUEUE_TTL_MS = 90_000;
+  const HANDSHAKE_RESULT_RETRY_MS = 1_000;
   const HOST_HEARTBEAT_MAX_AGE_MS = 8_000;
   const MACOS_TITLEBAR_SAFE_LEFT = 80;
   const FRAME_REFRESH_PARAM = "__codex_taskboard_refresh";
@@ -86,6 +90,8 @@
   let mutedNativeSelections = new Map();
   let openGeneration = 0;
   let pendingThreadCreation = null;
+  let pendingHandshakeResults = new Map();
+  let handshakeResultQueueTimer = null;
   let lastNativeThreadId = "";
   let lastNativeProjectId = "";
   let suspendedNativeBrowserPanel = null;
@@ -800,8 +806,112 @@
   }
 
   function postToFrame(message, allowUnready = false) {
-    if (!frame?.contentWindow || !frameOrigin || (!allowUnready && !frameReady)) return;
-    frame.contentWindow.postMessage(message, frameOrigin === "null" ? "*" : frameOrigin);
+    if (!frame?.contentWindow || !frameOrigin || (!allowUnready && !frameReady)) return false;
+    try {
+      frame.contentWindow.postMessage(message, frameOrigin === "null" ? "*" : frameOrigin);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isHandshakeResultMessage(message) {
+    return message?.type === "taskboard:parent-thread-ready"
+      || message?.type === "taskboard:child-thread-ready"
+      || message?.type === "taskboard:thread-create-error";
+  }
+
+  function handshakeResultKeyForPayload(payload) {
+    if (!payload || typeof payload !== "object") return null;
+    const taskId = typeof payload.taskId === "string" ? payload.taskId.trim() : "";
+    if (!taskId) return null;
+    const orchestrationId = typeof payload.orchestrationId === "string"
+      ? payload.orchestrationId.trim()
+      : "";
+    const role = typeof payload.conversationRole === "string"
+      ? payload.conversationRole
+      : "legacy";
+    const openingRequestId = typeof payload.openingRequestId === "string"
+      ? payload.openingRequestId.trim()
+      : "";
+    // 同一任务编排的最新结果覆盖旧结果；parent 与 child 通过 role 分开保留。
+    if (!openingRequestId) return `${taskId}:${orchestrationId || "legacy"}:${role}`;
+    return `${taskId}:${orchestrationId || "legacy"}:${role}:${openingRequestId}`;
+  }
+
+  function handshakeResultKey(message) {
+    if (!isHandshakeResultMessage(message)) return null;
+    return handshakeResultKeyForPayload(message.payload);
+  }
+
+  function pruneHandshakeResultQueue(now = Date.now()) {
+    for (const [key, entry] of pendingHandshakeResults) {
+      if (entry.expiresAt <= now) pendingHandshakeResults.delete(key);
+    }
+  }
+
+  function scheduleHandshakeResultQueuePrune() {
+    if (handshakeResultQueueTimer !== null) {
+      window.clearTimeout(handshakeResultQueueTimer);
+      handshakeResultQueueTimer = null;
+    }
+    if (pendingHandshakeResults.size === 0) return;
+    const currentTime = Date.now();
+    const nextExpiry = Math.min(...[...pendingHandshakeResults.values()].map((entry) => entry.expiresAt));
+    const nextRetry = frameReady
+      ? Math.min(...[...pendingHandshakeResults.values()].map((entry) => entry.sentAt + HANDSHAKE_RESULT_RETRY_MS))
+      : Number.POSITIVE_INFINITY;
+    const nextWake = Math.min(nextExpiry, nextRetry);
+    handshakeResultQueueTimer = window.setTimeout(() => {
+      handshakeResultQueueTimer = null;
+      flushHandshakeResults();
+    }, Math.max(0, nextWake - currentTime));
+  }
+
+  function rememberHandshakeResult(message, sentFrame = null) {
+    const key = handshakeResultKey(message);
+    if (!key || destroyed) return;
+    pendingHandshakeResults.delete(key);
+    pendingHandshakeResults.set(key, {
+      message,
+      expiresAt: Date.now() + HANDSHAKE_RESULT_QUEUE_TTL_MS,
+      sentFrame,
+      sentAt: Date.now(),
+    });
+    while (pendingHandshakeResults.size > HANDSHAKE_RESULT_QUEUE_MAX) {
+      const oldestKey = pendingHandshakeResults.keys().next().value;
+      if (oldestKey === undefined) break;
+      pendingHandshakeResults.delete(oldestKey);
+    }
+    scheduleHandshakeResultQueuePrune();
+  }
+
+  function postHandshakeResultToFrame(message) {
+    const key = handshakeResultKey(message);
+    if (!key) return;
+    pruneHandshakeResultQueue();
+    if (postToFrame(message)) {
+      // 保留一段时间并记录当前 frame；若宿主随后重挂 iframe，可向新 document 重发。
+      rememberHandshakeResult(message, frame);
+      return;
+    }
+    rememberHandshakeResult(message, null);
+  }
+
+  function flushHandshakeResults() {
+    pruneHandshakeResultQueue();
+    if (!frame?.contentWindow || !frameOrigin || !frameReady) {
+      scheduleHandshakeResultQueuePrune();
+      return;
+    }
+    const currentTime = Date.now();
+    for (const [key, entry] of pendingHandshakeResults) {
+      if (entry.sentFrame === frame && currentTime - entry.sentAt < HANDSHAKE_RESULT_RETRY_MS) continue;
+      if (!postToFrame(entry.message)) break;
+      entry.sentFrame = frame;
+      entry.sentAt = currentTime;
+    }
+    scheduleHandshakeResultQueuePrune();
   }
 
   function dispatchHostMessage(message) {
@@ -1051,6 +1161,19 @@
 
   async function createThreadForTask(payload) {
     const taskId = typeof payload?.taskId === "string" ? payload.taskId.trim() : "";
+    const orchestrationId = typeof payload?.orchestrationId === "string"
+      ? payload.orchestrationId.trim()
+      : "";
+    const rawOpeningRequestId = payload?.openingRequestId;
+    const openingRequestId = typeof rawOpeningRequestId === "string"
+      ? rawOpeningRequestId.trim()
+      : "";
+    const conversationRole = payload?.conversationRole === "parent"
+      ? "parent"
+      : payload?.conversationRole === "child"
+        ? "child"
+        : "legacy";
+    const parentThreadId = normalizeThreadId(payload?.parentThreadId);
     const identifier = typeof payload?.identifier === "string" ? payload.identifier.trim() : "";
     const title = typeof payload?.title === "string" ? payload.title.trim() : "";
     const instruction = typeof payload?.instruction === "string" ? payload.instruction.trim() : "";
@@ -1062,14 +1185,56 @@
     const requestedProjectId = typeof payload?.codexProjectId === "string"
       ? payload.codexProjectId.trim()
       : "";
+    const handshakePayload = {
+      taskId,
+      ...(orchestrationId ? { orchestrationId } : {}),
+      ...(conversationRole !== "legacy" ? { conversationRole } : {}),
+      ...(openingRequestId ? { openingRequestId } : {}),
+    };
+    const postCreateError = (error, extra = {}) => {
+      if (!taskId) return;
+      postHandshakeResultToFrame({
+        type: "taskboard:thread-create-error",
+        payload: {
+          ...handshakePayload,
+          ...extra,
+          error,
+        },
+      });
+    };
     if (
       !taskId
       || !identifier
       || !title
       || !instruction
-      || pendingThreadCreation
-    ) return;
-    pendingThreadCreation = taskId;
+      || (rawOpeningRequestId !== undefined
+        && (!openingRequestId || openingRequestId.length > 128 || /[\u0000-\u001f\u007f]/.test(openingRequestId)))
+    ) {
+      postCreateError(hostText("创建对话请求缺少有效参数", "The conversation request is missing valid parameters"));
+      return;
+    }
+    if (conversationRole === "child" && !parentThreadId) {
+      postCreateError(hostText(
+        "任务会话缺少已绑定的主会话 thread",
+        "The worker session is missing its bound parent thread",
+      ));
+      return;
+    }
+    // 同一 renderer 仍只能串行创建 thread；第二个请求必须收到可关联的结构化错误。
+    if (pendingThreadCreation) {
+      postCreateError(hostText(
+        "已有对话创建请求正在处理，请稍后重试",
+        "Another conversation creation request is already in progress",
+      ), { busy: true });
+      return;
+    }
+    const pendingCreation = {
+      taskId,
+      orchestrationId,
+      conversationRole,
+      openingRequestId,
+    };
+    pendingThreadCreation = pendingCreation;
     try {
       const bridge = window.electronBridge;
       if (!bridge || typeof bridge.sendMessageFromView !== "function") {
@@ -1079,15 +1244,30 @@
         ));
       }
 
+      // 新 thread 的身份只在首个 turn 提交后由 Codex 产生；先记住当前 thread，避免把旧会话误认成 child。
+      const previousComposerRoot = Array.from(document.querySelectorAll(
+        '[data-codex-composer-root][data-composer-placement="thread"]',
+      )).find((candidate) => candidate.getClientRects().length > 0);
+      const previousThreadId = normalizeThreadId(
+        previousComposerRoot
+          ?.querySelector("[data-above-composer-conversation-id]")
+          ?.getAttribute("data-above-composer-conversation-id"),
+      );
+      let codexHostId = "local";
+      let resolvedProjectId = requestedProjectId;
+      let targetRoot;
       if (!projectless && codexProjectKind === "remote") {
-        const codexHostId = typeof payload?.codexHostId === "string"
+        codexHostId = typeof payload?.codexHostId === "string"
           ? payload.codexHostId.trim()
           : "";
         const codexProjectWorkspacePath = typeof payload?.codexProjectWorkspacePath === "string"
           ? payload.codexProjectWorkspacePath.trim()
           : "";
         await waitForRemoteProject(requestedProjectId, codexHostId, codexProjectWorkspacePath);
-      } else if (!projectless) {
+        targetRoot = codexProjectWorkspacePath;
+      } else if (projectless) {
+        targetRoot = "";
+      } else {
         const target = await resolveNativeProject(requestedProjectId, workspacePath);
         if (!target) {
           throw new Error(hostText(
@@ -1095,7 +1275,9 @@
             "The target project or worktree is not mapped in Codex",
           ));
         }
-        const { targetRoot } = target;
+        targetRoot = target.targetRoot;
+        // 以 Codex 原生项目列表实际匹配到的 ID 为准，避免仅按路径映射时丢失项目身份。
+        resolvedProjectId = target.projectId;
         bridge.sendMessageFromView({
           type: "electron-add-new-workspace-root-option",
           root: targetRoot,
@@ -1114,19 +1296,101 @@
           ...(projectless ? { project: null } : {}),
         },
       });
-      postToFrame({ type: "taskboard:thread-prepared", payload: { taskId } });
+      const started = await requestHostTaskConversationStart({
+        taskId,
+        orchestrationId,
+        openingRequestId: openingRequestId || undefined,
+        conversationRole: conversationRole === "legacy" ? undefined : conversationRole,
+        ...(parentThreadId ? { parentThreadId } : {}),
+        previousThreadId,
+        codexHostId,
+        codexProjectId: resolvedProjectId,
+        codexProjectKind,
+        projectless,
+        targetRoot,
+        instruction,
+        title,
+      });
+      const startedThreadId = normalizeThreadId(started?.threadId);
+      if (!startedThreadId) {
+        throw new Error(hostText(
+          "Codex 没有返回新任务会话 ID",
+          "Codex did not return the new task session ID",
+        ));
+      }
+      const visibleThreadComposer = Array.from(document.querySelectorAll(
+        '[data-codex-composer-root][data-composer-placement="thread"]',
+      )).find((candidate) => candidate.getClientRects().length > 0);
+      const visibleThreadId = normalizeThreadId(
+        visibleThreadComposer
+          ?.querySelector("[data-above-composer-conversation-id]")
+          ?.getAttribute("data-above-composer-conversation-id"),
+      );
+      if (visibleThreadId !== startedThreadId) {
+        if (codexProjectKind === "remote") {
+          // 远程 thread 没有可靠的本地 URL 形式；只在已校验的项目下通过 sidebar row 导航。
+          const row = await waitForRemoteThreadRow(startedThreadId, resolvedProjectId);
+          if (!row?.isConnected) {
+            throw new Error(hostText(
+              "目标 SSH 远程项目中找不到新任务会话",
+              "The new task session is not available in the target SSH remote project",
+            ));
+          }
+          row.click?.();
+        } else {
+          await dispatchHostMessage({
+            type: "navigate-to-route",
+            path: routeForThread(startedThreadId),
+          });
+        }
+      }
+      lastNativeThreadId = startedThreadId;
+      const readyPayload = {
+        taskId,
+        ...(orchestrationId ? { orchestrationId } : {}),
+        ...(openingRequestId ? { openingRequestId } : {}),
+        ...(conversationRole !== "legacy" ? { conversationRole } : {}),
+        ...(parentThreadId ? { parentThreadId } : {}),
+        threadId: started.threadId,
+        childThreadId: started.threadId,
+        identity: started.identity ?? null,
+      };
+      postHandshakeResultToFrame({
+        type: conversationRole === "parent"
+          ? "taskboard:parent-thread-ready"
+          : conversationRole === "child"
+            ? "taskboard:child-thread-ready"
+            : "taskboard:thread-prepared",
+        payload: readyPayload,
+      });
+      // 保留旧事件名，让尚未升级的 Taskboard 面板也能结束 loading 状态。
+      postToFrame({ type: "taskboard:thread-prepared", payload: readyPayload });
     } catch (error) {
-      postToFrame({
+      const createdThreadId = normalizeThreadId(error?.threadId);
+      if (createdThreadId && codexProjectKind !== "remote") {
+        await dispatchHostMessage({
+          type: "navigate-to-route",
+          path: routeForThread(createdThreadId),
+        });
+        lastNativeThreadId = createdThreadId;
+      }
+      postHandshakeResultToFrame({
         type: "taskboard:thread-create-error",
         payload: {
           taskId,
+          ...(orchestrationId ? { orchestrationId } : {}),
+          ...(openingRequestId ? { openingRequestId } : {}),
+          ...(conversationRole !== "legacy" ? { conversationRole } : {}),
           error: error instanceof Error
             ? error.message
             : hostText("无法创建 Codex 对话", "Could not create the Codex conversation"),
+          ...(typeof error?.threadId === "string" ? { threadId: error.threadId } : {}),
+          ...(error?.identity && typeof error.identity === "object" ? { identity: error.identity } : {}),
+          ...(error?.uncertain === true ? { uncertain: true } : {}),
         },
       });
     } finally {
-      pendingThreadCreation = null;
+      if (pendingThreadCreation === pendingCreation) pendingThreadCreation = null;
     }
   }
 
@@ -1261,6 +1525,10 @@
   function challengeFrameDocument(event) {
     if (!frame || event.currentTarget !== frame) return;
     frameReady = false;
+    // 同一个 iframe 重新载入文档时 DOM 对象不变，必须允许握手结果再次投递给新文档。
+    pendingHandshakeResults.forEach((entry) => {
+      entry.sentFrame = null;
+    });
     frameChallenge = crypto.randomUUID();
     if (active) showLoading();
     postFrameChallenge();
@@ -1290,6 +1558,13 @@
       frameReadyWaiters.clear();
       if (active) showFrame();
       postHostContext();
+      flushHandshakeResults();
+      return;
+    }
+    if (message.type === "taskboard:thread-handshake-ack") {
+      const key = handshakeResultKeyForPayload(message.payload);
+      if (key) pendingHandshakeResults.delete(key);
+      scheduleHandshakeResultQueuePrune();
       return;
     }
     if (message.type === "taskboard:drag-region") {
@@ -1583,6 +1858,38 @@
     return requestHost("load-frame", { frameName, frameCapability: capability });
   }
 
+  function requestHostTaskConversationStart({
+    taskId,
+    orchestrationId,
+    openingRequestId,
+    conversationRole,
+    parentThreadId,
+    previousThreadId,
+    codexHostId,
+    codexProjectId,
+    codexProjectKind,
+    projectless,
+    targetRoot,
+    instruction,
+    title,
+  }) {
+    return requestHost("start-task-conversation", {
+      taskId,
+      ...(orchestrationId ? { orchestrationId } : {}),
+      ...(openingRequestId ? { openingRequestId } : {}),
+      ...(conversationRole ? { conversationRole } : {}),
+      ...(parentThreadId ? { parentThreadId } : {}),
+      previousThreadId,
+      codexHostId,
+      codexProjectId,
+      codexProjectKind,
+      projectless,
+      targetRoot,
+      instruction,
+      title,
+    }, TASK_CONVERSATION_REQUEST_TIMEOUT_MS);
+  }
+
   function frameMatchesTaskboardUrl(taskboardUrl) {
     if (!frame || !frameTaskboardUrl) return false;
     try {
@@ -1608,7 +1915,9 @@
         ? new Error(response.error)
         : hostError("任务面板服务启动失败", "The Taskboard service failed to start");
       if (typeof response.threadId === "string") error.threadId = response.threadId;
+      if (response.identity && typeof response.identity === "object") error.identity = response.identity;
       if (response.uncertain === true) error.uncertain = true;
+      if (typeof response.openingRequestId === "string") error.openingRequestId = response.openingRequestId;
       pending.reject(error);
     }
   }
@@ -1852,6 +2161,11 @@
     });
     hostRequests.clear();
     pendingThreadCreation = null;
+    if (handshakeResultQueueTimer !== null) {
+      window.clearTimeout(handshakeResultQueueTimer);
+      handshakeResultQueueTimer = null;
+    }
+    pendingHandshakeResults.clear();
     document.removeEventListener("DOMContentLoaded", mount);
     document.removeEventListener("click", onDocumentClick, true);
     window.removeEventListener("message", onFrameMessage);

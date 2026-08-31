@@ -16,6 +16,139 @@ export type AssigneeTarget = "current-user" | "codex-agent";
 export type IssueRelationType = "parent" | "blocks" | "blocked_by" | "related";
 export type IssueRelationOrigin = "manual" | "mention";
 
+export const TASK_SESSION_STATES = [
+  "unbound",
+  "intent_draft",
+  "intent_ready",
+  "dispatched",
+  "executing",
+  "waiting_for_user",
+  "reporting",
+  "result_ready",
+  "reviewing",
+  "writeback_pending",
+  "synced",
+  "blocked",
+  "integrated",
+  "done",
+] as const;
+
+export type OrchestrationState = (typeof TASK_SESSION_STATES)[number];
+
+export interface TaskIntentRevision {
+  version: "task-intent.v1";
+  revision: number;
+  goal: string;
+  why: string;
+  scope: { in: string[]; out: string[] };
+  acceptanceCriteria: string[];
+  constraints: string[];
+  implementationHints: string[];
+  openQuestions: string[];
+  attachmentIds?: string[];
+  captureDigest: string | null;
+  createdAt: string;
+  [key: string]: unknown;
+}
+
+export interface TaskResultFile {
+  path: string;
+  kind: "added" | "modified" | "deleted";
+}
+
+export interface TaskVerificationEvidence {
+  command: string;
+  result: string;
+}
+
+export interface TaskResultRevision {
+  version: "task-result.v1";
+  outcome: "completed" | "blocked" | "needs_input";
+  summary: string;
+  rationale: string;
+  changedFiles: TaskResultFile[];
+  verification: TaskVerificationEvidence[];
+  risks?: string[];
+  blockers?: string[];
+  suggestedJiraUpdate?: { comment?: string; status?: string };
+  intentVersion: number;
+  resultRevision: number;
+  idempotencyKey: string;
+  createdAt: string;
+  [key: string]: unknown;
+}
+
+export interface TaskSessionMessage {
+  id: string;
+  orchestrationId: string;
+  direction: "parent_to_child" | "child_to_parent" | "internal";
+  type: string;
+  idempotencyKey: string | null;
+  state?: string | null;
+  payload: Record<string, unknown>;
+  deliveryState: "pending" | "sent" | "acknowledged" | "failed" | "cancelled";
+  sequence: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TaskSessionReview {
+  revision: number;
+  resultRevision: number;
+  decision: "approved" | "needs_rework" | "blocked";
+  feedback: string | null;
+  evidence: unknown;
+  createdAt: string;
+}
+
+export interface TaskSessionIntegration {
+  revision: number;
+  mode: "merge" | "cherry-pick";
+  commit: string | null;
+  conflict: boolean;
+  verification: unknown;
+  createdAt: string;
+}
+
+export interface TaskSessionWriteback {
+  revision: number;
+  comment: string | null;
+  fields: Record<string, unknown> | null;
+  status: string | null;
+  confirmed: boolean;
+  createdAt: string;
+}
+
+export interface TaskSessionOrchestration {
+  id: string;
+  taskId: string;
+  state: OrchestrationState;
+  parentThreadBinding: CodexThreadBinding | { threadId: string } | null;
+  childThreadBinding: CodexThreadBinding | { threadId: string } | null;
+  childWindow: Record<string, unknown> | null;
+  runtime: Record<string, unknown> | null;
+  worktree: Record<string, unknown> | null;
+  sourceSnapshot: Record<string, unknown> | null;
+  intentDigest: string | null;
+  intentVersion: number;
+  confirmedIntentVersion: number | null;
+  confirmedAt: string | null;
+  intent: TaskIntentRevision | null;
+  intentRevisions: TaskIntentRevision[];
+  currentResultRevision: number;
+  result: TaskResultRevision | null;
+  resultRevisions: TaskResultRevision[];
+  review: TaskSessionReview | null;
+  reviewRevisions: TaskSessionReview[];
+  integration: TaskSessionIntegration | null;
+  integrationRevisions: TaskSessionIntegration[];
+  writeback: TaskSessionWriteback | null;
+  writebackRevisions: TaskSessionWriteback[];
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ActorIdentity {
   type: ActorType;
   id: string;

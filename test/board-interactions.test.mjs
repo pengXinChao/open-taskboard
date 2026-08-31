@@ -7,6 +7,10 @@ const boardColumnSource = await readFile(new URL("../web/src/components/BoardCol
 const apiSource = await readFile(new URL("../web/src/api.ts", import.meta.url), "utf8");
 const styles = await readFile(new URL("../web/src/styles.css", import.meta.url), "utf8");
 const detailSource = await readFile(new URL("../web/src/components/TaskDetail.tsx", import.meta.url), "utf8");
+const orchestrationPanelSource = await readFile(
+  new URL("../web/src/components/TaskSessionOrchestrationPanel.tsx", import.meta.url),
+  "utf8",
+);
 const editorSource = await readFile(new URL("../web/src/components/TaskEditor.tsx", import.meta.url), "utf8");
 const labelPickerSource = await readFile(new URL("../web/src/components/LabelPicker.tsx", import.meta.url), "utf8");
 const contextMenuSource = await readFile(new URL("../web/src/components/TaskContextMenu.tsx", import.meta.url), "utf8");
@@ -130,8 +134,11 @@ test("common issue mutations enter a Linear-style undo queue", () => {
 });
 
 test("issues expose processing conversations without manual binding", () => {
-  assert.match(detailSource, /在新对话打开/);
-  assert.match(detailSource, /onOpenInThread\(currentTask\)/);
+  assert.match(detailSource, /<TaskSessionOrchestrationPanel/);
+  assert.match(detailSource, /onCreateParentTaskSession/);
+  assert.match(detailSource, /onDispatchTaskSession/);
+  assert.doesNotMatch(detailSource, /在新对话打开/);
+  assert.doesNotMatch(detailSource, /onOpenInThread\(currentTask\)/);
   assert.doesNotMatch(appSource, /detail-thread-button/);
   assert.doesNotMatch(detailSource, /输入对话 ID|解除 Codex 对话绑定|>绑定</);
   assert.doesNotMatch(editorSource, /对话 ID|linkedThreadId/);
@@ -151,6 +158,28 @@ test("issues expose processing conversations without manual binding", () => {
   assert.doesNotMatch(detailSource, /placeholder="绑定分支/);
   assert.doesNotMatch(contextMenuSource, /打开关联 Codex 对话/);
   assert.match(contextMenuSource, /onOpenInThread/);
+});
+
+test("dispatch waits for the child handshake and persistence before releasing its lock", () => {
+  assert.match(orchestrationPanelSource, /const pendingDispatchRef = useRef<PendingDispatch \| null>\(null\)/);
+  assert.match(orchestrationPanelSource, /pendingDispatch\.handled/);
+  assert.match(orchestrationPanelSource, /await persisted/);
+  assert.match(orchestrationPanelSource, /settleDispatch\(pendingDispatch\)/);
+  assert.match(appSource, /const pendingThreadOpeningsRef = useRef\(new Map<string, PendingThreadOpening>\(\)\)/);
+  assert.match(appSource, /const openingKey = session\?\.orchestrationId \?\? `task:\$\{task\.id\}`/);
+  assert.match(appSource, /pendingThreadOpeningsRef\.current\.has\(openingKey\)/);
+  assert.match(appSource, /特定握手[\s\S]*?dispatch API/);
+  assert.match(appSource, /onTaskSessionThreadSettled=\{settleTaskSessionThread\}/);
+});
+
+test("orchestration realtime events refresh only the open issue panel", () => {
+  assert.match(appSource, /"orchestration\.updated"/);
+  assert.match(appSource, /"orchestration\.message"/);
+  assert.match(appSource, /const eventTaskId = payload\.taskId \?\? payload\.orchestration\?\.taskId/);
+  assert.match(appSource, /orchestration: detailTaskId === eventTaskId/);
+  assert.match(appSource, /if \(refreshOrchestrationPending && detailTaskId\)/);
+  assert.match(appSource, /orchestrationRevision=\{orchestrationRevision\}/);
+  assert.match(orchestrationPanelSource, /保留用户尚未保存的意图\/报告草稿/);
 });
 
 test("comments upload and render their own attachments in the content flow", () => {

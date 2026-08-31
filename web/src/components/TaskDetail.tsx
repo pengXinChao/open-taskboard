@@ -42,8 +42,10 @@ import type {
   Task,
   TaskChangeActivity,
   TaskDraft,
+  TaskIntentRevision,
   TaskPriority,
   TaskRelationSummary,
+  TaskSessionOrchestration,
   TaskStatus,
 } from "../types";
 import {
@@ -66,7 +68,6 @@ import {
   EditIcon,
   LabelIcon,
   MoreIcon,
-  NewConversationIcon,
   PriorityIcon,
   ProjectIcon,
   RecurrenceIcon,
@@ -97,6 +98,7 @@ import { postEmbeddedHostMessage } from "../embeddedHost.mjs";
 import copyIdIcon from "../assets/figma-taskboard/copy-id.svg";
 import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
+import { TaskSessionOrchestrationPanel } from "./TaskSessionOrchestrationPanel";
 
 type TaskDetailError = string | readonly [string, string];
 
@@ -110,6 +112,7 @@ interface TaskDetailProps {
   developmentScanLoading: boolean;
   commentsRevision: number;
   attachmentsRevision: number;
+  orchestrationRevision: number;
   onCreateLabel: (label: string) => Promise<void>;
   onDeleteLabel: (label: string) => Promise<void>;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
@@ -128,9 +131,19 @@ interface TaskDetailProps {
   ) => Promise<RelationMutationResult>;
   onOpenThread: (binding: CodexThreadBinding) => void;
   onOpenLegacyLocalThread: (threadId: string) => void;
-  onOpenInThread: (task: Task) => void;
+  parentThreadBinding: CodexThreadBinding | { threadId: string } | null;
+  onCreateParentTaskSession: (
+    task: Task,
+    orchestration: TaskSessionOrchestration,
+  ) => Promise<string>;
+  onDispatchTaskSession: (
+    task: Task,
+    orchestration: TaskSessionOrchestration,
+    intent: TaskIntentRevision,
+  ) => Promise<string>;
+  onOpenChildThread: (binding: CodexThreadBinding | { threadId: string }) => void;
+  onTaskSessionThreadSettled: (orchestrationId: string, openingRequestId?: string) => void;
   onCopy: (text: string, announcement: string) => void;
-  openingThread: boolean;
   onError: (message: TaskDetailError | null) => void;
 }
 
@@ -379,6 +392,7 @@ export function TaskDetail({
   developmentScanLoading,
   commentsRevision,
   attachmentsRevision,
+  orchestrationRevision,
   onCreateLabel,
   onDeleteLabel,
   onUpdate,
@@ -387,9 +401,12 @@ export function TaskDetail({
   onRemoveRelation,
   onOpenThread,
   onOpenLegacyLocalThread,
-  onOpenInThread,
+  parentThreadBinding,
+  onCreateParentTaskSession,
+  onDispatchTaskSession,
+  onOpenChildThread,
+  onTaskSessionThreadSettled,
   onCopy,
-  openingThread,
   onError,
 }: TaskDetailProps) {
   const { language, locale, text } = useTaskboardI18n();
@@ -444,6 +461,9 @@ export function TaskDetail({
   const displayIdentifier = currentTask.externalKey ?? currentTask.identifier;
   const editingInlineImages = inlineMediaImages(editingSegments);
   const editingInlineFiles = inlineMediaFiles(editingSegments);
+  const taskSessionError = useCallback((error: unknown) => {
+    onError(messageFor(error));
+  }, [onError]);
 
   useEffect(() => {
     const taskChanged = currentTask.id !== task.id;
@@ -1573,17 +1593,6 @@ export function TaskDetail({
 
           <aside className="issue-properties" aria-label={text("议题属性", "Issue properties")}>
             <div className="detail-primary-actions">
-              <button
-                className="detail-open-thread-action"
-                type="button"
-                disabled={openingThread}
-                onClick={() => onOpenInThread(currentTask)}
-              >
-                <NewConversationIcon color="currentColor" />
-                <span>{openingThread
-                  ? text("正在打开…", "Opening…")
-                  : text("在新对话打开", "Open in new conversation")}</span>
-              </button>
               {currentTask.externalUrl && (
                 <a
                   className="detail-copy-action detail-external-action"
@@ -1629,6 +1638,16 @@ export function TaskDetail({
                 <span className="detail-copy-action-label">{text("复制链接", "Copy link")}</span>
               </button>
             </div>
+            <TaskSessionOrchestrationPanel
+              task={currentTask}
+              parentThreadBinding={parentThreadBinding}
+              orchestrationRevision={orchestrationRevision}
+              onCreateParent={onCreateParentTaskSession}
+              onDispatch={onDispatchTaskSession}
+              onOpenChild={onOpenChildThread}
+              onThreadSettled={onTaskSessionThreadSettled}
+              onError={taskSessionError}
+            />
             <h2>{text("属性", "Properties")}</h2>
             <div className="detail-property-row">
               <span className="detail-property-label">{text("状态", "Status")}</span>

@@ -133,6 +133,62 @@ test("a stale automation parser receives an immediate host error instead of timi
   }]);
 });
 
+test("task conversation requests preserve project identity through the host handshake", async () => {
+  const calls = [];
+  const responses = [];
+  const request = {
+    id: "thread-request-1",
+    action: "start-task-conversation",
+    taskId: "task-1",
+    previousThreadId: "parent-thread",
+    codexHostId: "local",
+    codexProjectId: "project-1",
+    codexProjectKind: "local",
+    projectless: false,
+    targetRoot: "/tmp/task-worktree",
+    instruction: "Run the confirmed task intent",
+    title: "TASK-1 · 执行",
+  };
+  const result = await handleHostBindingPayload({
+    payload: JSON.stringify(request),
+    executionContextId: 12,
+  }, {
+    isAuthorizedContext: () => true,
+    parseAutomationRequest: () => null,
+    ensure: async () => assert.fail("ensure must not run"),
+    runAutomation: async () => assert.fail("automation must not run"),
+    startConversation: async (parsed) => {
+      calls.push(parsed);
+      return {
+        threadId: "child-thread",
+        identity: {
+          threadId: "child-thread",
+          hostId: parsed.codexHostId,
+          projectId: parsed.codexProjectId,
+          workspacePath: parsed.targetRoot,
+        },
+      };
+    },
+    sendResponse: async (_executionContextId, response) => responses.push(response),
+  });
+
+  assert.deepEqual(result, { responded: true, accepted: true });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].codexProjectId, request.codexProjectId);
+  assert.equal(calls[0].codexProjectKind, request.codexProjectKind);
+  assert.deepEqual(responses, [{
+    id: request.id,
+    ok: true,
+    threadId: "child-thread",
+    identity: {
+      threadId: "child-thread",
+      hostId: "local",
+      projectId: "project-1",
+      workspacePath: "/tmp/task-worktree",
+    },
+  }]);
+});
+
 test("attach replaces an old runtime with the current source and restores an open page", async () => {
   const calls = [];
   const result = await reconcileInjectionRuntime({

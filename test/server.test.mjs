@@ -1694,6 +1694,25 @@ test("request boundaries reject unknown fields and invalid values", async () => 
   assert.equal(invalidWorktree.body.error.code, "INVALID_FIELD");
 });
 
+test("report requests require resultRevision at the HTTP boundary", async () => {
+  const baseUrl = await startServer();
+
+  const result = await request(baseUrl, "/api/orchestrations/missing-orchestration/reports", {
+    method: "POST",
+    body: {
+      parentThreadId: "parent-thread",
+      childThreadId: "child-thread",
+      intentVersion: 1,
+      idempotencyKey: "missing-orchestration:1",
+      payload: { summary: "done" },
+    },
+  });
+
+  assert.equal(result.response.status, 400);
+  assert.equal(result.body.error.code, "INVALID_FIELD");
+  assert.equal(result.body.error.message, "resultRevision is required for a report");
+});
+
 test("task changes from one LAN client are broadcast to another client", async () => {
   const baseUrl = await startServer(undefined, { host: "0.0.0.0" });
   const lanHeaders = {

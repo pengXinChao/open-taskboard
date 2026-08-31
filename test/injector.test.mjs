@@ -61,7 +61,7 @@ test("the CDP bridge accepts service ensure and native task conversation start a
   assert.match(source, /submitted = true/);
   assert.match(source, /if \(!submitted\) throw new Error/);
   assert.match(source, /const threadId = typeof started\.result\.value === "string"/);
-  assert.match(source, /threadId && threadId !== previousThreadId/);
+  assert.match(source, /threadId && threadId !== normalizedPreviousThreadId/);
   assert.match(source, /discoveredThreadId = threadId/);
   assert.match(source, /error\.threadId = discoveredThreadId/);
   assert.match(source, /function requestCodexAppServerViaCdp/);
@@ -72,10 +72,13 @@ test("the CDP bridge accepts service ensure and native task conversation start a
   assert.match(source, /"thread\/name\/set"/);
   assert.match(source, /result\.thread\.name === title/);
   assert.match(source, /const taskConversationOperations = new Map\(\)/);
-  assert.match(source, /taskConversationOperations\.get\(request\.taskId\)/);
+  assert.match(source, /function taskConversationOperationKey\(request\)/);
+  assert.match(source, /JSON\.stringify\(\[taskId, orchestrationId, conversationRole\]\)/);
+  assert.match(source, /const operationKey = taskConversationOperationKey\(request\)/);
+  assert.match(source, /taskConversationOperations\.get\(operationKey\)/);
   assert.match(source, /const taskConversationAppServerTimeoutMs = 30_000/);
   assert.doesNotMatch(source, /window\.postMessage\(\{ type: "rename-thread" \}/);
-  assert.match(source, /return \{ threadId, title \}/);
+  assert.match(source, /return \{ threadId, title, workspacePath: verifiedWorkspacePath \}/);
   assert.match(source, /Runtime\.bindingCalled/);
   assert.match(source, /Page\.createIsolatedWorld/);
   assert.match(source, /Runtime\.addBinding", \{\s*name: hostBindingName,\s*executionContextId:/);

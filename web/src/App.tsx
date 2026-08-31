@@ -91,6 +91,8 @@ import {
   PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX,
   projectBoardDisplaySettingsStorageEntries,
   refreshProjectBoardDisplaySettingsStorage,
+  clearPendingTaskSessionHandshake,
+  rememberPendingTaskSessionHandshake,
   taskboardStorage,
 } from "./storage";
 import {
@@ -139,6 +141,8 @@ import {
   type Task,
   type TaskboardMetadata,
   type TaskDraft,
+  type TaskIntentRevision,
+  type TaskSessionOrchestration,
   type TaskStatus,
 } from "./types";
 // The poller stays in ESM JavaScript so its lifecycle can be tested directly with node:test.
@@ -296,6 +300,16 @@ interface PendingAutomationRequest {
   timeoutId: number;
 }
 
+interface PendingThreadOpening {
+  taskId: string;
+  orchestrationId?: string;
+  conversationRole?: "parent" | "child";
+  openingRequestId: string;
+  timeoutId?: number;
+}
+
+const THREAD_OPENING_TIMEOUT_MS = 90_000;
+
 const DEFAULT_USER_ACTOR: ActorIdentity = {
   type: "user",
   id: "local-user",
@@ -376,6 +390,8 @@ const EVENT_NAMES = [
   "project.created",
   "project.labels.updated",
   "project.readme.updated",
+  "orchestration.updated",
+  "orchestration.message",
   "client-storage.updated",
 ] as const;
 
@@ -547,6 +563,32 @@ function isLocalTaskboardOrigin(origin: string): boolean {
   }
 }
 
+function hostThreadBinding(context: HostContext | null): CodexThreadBinding | { threadId: string } | null {
+  const threadId = context?.threadId?.trim();
+  if (!threadId) return null;
+  const project = context?.projects?.find((candidate) => candidate.id === context.projectId);
+  const codexProjectId = context?.projectId ?? project?.id;
+  const workspacePath = context?.workspacePath ?? project?.workspacePath;
+  const codexProjectKind = project?.projectKind;
+  const codexHostId = project?.hostId;
+  if (
+    codexProjectId
+    && workspacePath
+    && (codexProjectKind === "local" || codexProjectKind === "remote")
+    && codexHostId
+  ) {
+    return {
+      threadId,
+      codexProjectId,
+      codexProjectKind,
+      codexHostId,
+      workspacePath,
+    };
+  }
+  // 宿主有时先上报 threadId、稍后才补齐项目元数据；短绑定可由服务端再解析。
+  return { threadId };
+}
+
 function sortTasks(tasks: Task[]): Task[] {
   return [...tasks].sort(
     (left, right) => left.sortOrder - right.sortOrder || left.createdAt.localeCompare(right.createdAt),
@@ -580,6 +622,7 @@ interface LocalRealtimeSyncProps {
   setCommentsRevision: Dispatch<SetStateAction<number>>;
   setAttachmentsRevision: Dispatch<SetStateAction<number>>;
   setReadmeRevision: Dispatch<SetStateAction<number>>;
+  setOrchestrationRevision: Dispatch<SetStateAction<number>>;
 }
 
 function LocalRealtimeSync({
@@ -592,36 +635,54 @@ function LocalRealtimeSync({
   setCommentsRevision,
   setAttachmentsRevision,
   setReadmeRevision,
+  setOrchestrationRevision,
 }: LocalRealtimeSyncProps) {
   useEffect(() => {
     const source = new EventSource(resolveTaskboardUrl("/api/events"));
     let refreshTimer: number | undefined;
     let refreshProjectsPending = false;
     let refreshTasksPending = false;
+    let refreshOrchestrationPending = false;
 
-    const scheduleRefresh = (options: { projects?: boolean; tasks?: boolean }) => {
+    const scheduleRefresh = (options: {
+      projects?: boolean;
+      tasks?: boolean;
+      orchestration?: boolean;
+    }) => {
       refreshProjectsPending ||= options.projects === true;
       refreshTasksPending ||= options.tasks === true;
+      refreshOrchestrationPending ||= options.orchestration === true;
       window.clearTimeout(refreshTimer);
       refreshTimer = window.setTimeout(() => {
         if (refreshProjectsPending) void refreshProjectList();
         if (refreshTasksPending && selectedProjectId) {
           void refreshTasks(selectedProjectId, { quiet: true });
         }
+        if (refreshOrchestrationPending && detailTaskId) {
+          setOrchestrationRevision((current) => current + 1);
+        }
         refreshProjectsPending = false;
         refreshTasksPending = false;
+        refreshOrchestrationPending = false;
       }, 120);
     };
 
     const handleEvent = (event: Event) => {
       const message = event as MessageEvent<string>;
-      let payload: { projectId?: string; taskId?: string; project?: Project; key?: string } = {};
+      let payload: {
+        projectId?: string;
+        taskId?: string;
+        project?: Project;
+        key?: string;
+        orchestration?: { taskId?: string };
+      } = {};
       try {
         payload = JSON.parse(message.data) as {
           projectId?: string;
           taskId?: string;
           project?: Project;
           key?: string;
+          orchestration?: { taskId?: string };
         };
       } catch {
         // A malformed event should not interrupt later updates.
@@ -631,6 +692,22 @@ function LocalRealtimeSync({
         && payload.key?.startsWith(PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX)
       ) {
         void refreshProjectBoardDisplaySettings();
+        return;
+      }
+      if (
+        event.type === "orchestration.updated"
+        || event.type === "orchestration.message"
+      ) {
+        const eventTaskId = payload.taskId ?? payload.orchestration?.taskId;
+        if (eventTaskId) {
+          // 编排阶段会同步推动任务状态（例如 todo -> in_progress）；同时刷新详情和看板，
+          // 避免列表在下一次定时轮询前显示旧状态。
+          scheduleRefresh({
+            orchestration: detailTaskId === eventTaskId,
+            tasks: true,
+            projects: true,
+          });
+        }
         return;
       }
       const eventProjectId = payload.projectId ?? payload.project?.id;
@@ -683,6 +760,7 @@ function LocalRealtimeSync({
       if (detailTaskId) {
         setCommentsRevision((current) => current + 1);
         setAttachmentsRevision((current) => current + 1);
+        setOrchestrationRevision((current) => current + 1);
       }
     };
     source.onerror = () => setConnection("reconnecting");
@@ -702,6 +780,7 @@ function LocalRealtimeSync({
     setCommentsRevision,
     setConnection,
     setReadmeRevision,
+    setOrchestrationRevision,
   ]);
 
   return null;
@@ -797,6 +876,7 @@ export function App() {
   const [commentsRevision, setCommentsRevision] = useState(0);
   const [attachmentsRevision, setAttachmentsRevision] = useState(0);
   const [readmeRevision, setReadmeRevision] = useState(0);
+  const [orchestrationRevision, setOrchestrationRevision] = useState(0);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
   const [draggedTaskHeight, setDraggedTaskHeight] = useState(0);
@@ -804,7 +884,6 @@ export function App() {
   const [movingTaskId, setMovingTaskId] = useState<string | null>(null);
   const [settlingTaskId, setSettlingTaskId] = useState<string | null>(null);
   const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
-  const [openingThreadTaskId, setOpeningThreadTaskId] = useState<string | null>(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState(
     () => taskboardStorage.getItem(FIRST_USE_COMPLETE_KEY) === null,
   );
@@ -839,6 +918,8 @@ export function App() {
   const undoSequenceRef = useRef(0);
   const undoStackRef = useRef<UndoOperation[]>([]);
   const undoInFlightRef = useRef(false);
+  // 新 thread 的创建跨越宿主握手和编排 API 写入；用编排键保证同一编排内去重。
+  const pendingThreadOpeningsRef = useRef(new Map<string, PendingThreadOpening>());
   const dragRegionRef = useRef<HTMLDivElement>(null);
   const issueListRef = useRef<HTMLDivElement>(null);
   const boardColumnScrollRefs = useRef<Partial<Record<TaskStatus, HTMLDivElement | null>>>({});
@@ -867,6 +948,66 @@ export function App() {
   const loadedAutomationProjectIdsRef = useRef(new Set<string>());
   const queuedAutomationSavesRef = useRef(new Map<string, QueuedProjectAutomationSave>());
   const projectAutomationsRef = useRef(projectAutomations);
+
+  const markThreadOpening = useCallback((key: string, pending: PendingThreadOpening) => {
+    const entry: PendingThreadOpening = { ...pending, timeoutId: undefined };
+    entry.timeoutId = window.setTimeout(() => {
+      // 旧计时器不能删除同一 key 的新一代请求。
+      if (pendingThreadOpeningsRef.current.get(key) !== entry) return;
+      pendingThreadOpeningsRef.current.delete(key);
+      clearPendingTaskSessionHandshake({
+        taskId: entry.taskId,
+        orchestrationId: entry.orchestrationId,
+        conversationRole: entry.conversationRole,
+        openingRequestId: entry.openingRequestId,
+      });
+      setActionError(textRef.current(
+        "Codex 创建对话没有响应，请稍后重试。",
+        "Codex did not respond while creating the conversation. Try again.",
+      ));
+    }, THREAD_OPENING_TIMEOUT_MS);
+    pendingThreadOpeningsRef.current.set(key, entry);
+  }, []);
+
+  const releaseThreadOpening = useCallback((
+    orchestrationId?: string,
+    taskId?: string,
+    openingRequestId?: string,
+  ) => {
+    const pending = pendingThreadOpeningsRef.current;
+    let key: string | undefined;
+    const hasOrchestrationId = orchestrationId !== undefined;
+    const hasTaskId = taskId !== undefined;
+    const hasRequestId = openingRequestId !== undefined;
+    if (hasOrchestrationId || hasTaskId || hasRequestId) {
+      key = [...pending.entries()].find(([, value]) => (
+        (!hasOrchestrationId || value.orchestrationId === orchestrationId)
+        && (!hasTaskId || value.taskId === taskId)
+        && (!hasRequestId || value.openingRequestId === openingRequestId)
+      ))?.[0];
+    } else if (pending.size === 1) {
+      key = pending.keys().next().value;
+    }
+    if (key === undefined) return;
+    const entry = pending.get(key);
+    if (entry?.timeoutId !== undefined) window.clearTimeout(entry.timeoutId);
+    pending.delete(key);
+    if (entry) {
+      clearPendingTaskSessionHandshake({
+        taskId: entry.taskId,
+        orchestrationId: entry.orchestrationId,
+        conversationRole: entry.conversationRole,
+        openingRequestId: openingRequestId ?? entry.openingRequestId,
+      });
+    }
+  }, []);
+
+  useEffect(() => () => {
+    for (const entry of pendingThreadOpeningsRef.current.values()) {
+      if (entry.timeoutId !== undefined) window.clearTimeout(entry.timeoutId);
+    }
+    pendingThreadOpeningsRef.current.clear();
+  }, []);
 
   useEffect(() => {
     document.documentElement.lang = locale;
@@ -990,6 +1131,10 @@ export function App() {
     ...DEFAULT_USER_ACTOR,
     name: text("本地用户", "Local user"),
   };
+  const currentParentThreadBinding = useMemo(
+    () => hostThreadBinding(hostContext),
+    [hostContext],
+  );
   const selectedDeviceWorkspacePath = selectedProjectId === GLOBAL_PROJECT_ID || isAllProjects
     ? undefined
     : deviceWorkspacePaths[selectedProjectId];
@@ -1765,14 +1910,50 @@ export function App() {
         return;
       }
 
+      if (message.type === "taskboard:child-thread-ready" && message.payload) {
+        // child 身份由注入层在 thread/read 校验后回传；面板完成 dispatch 持久化后再释放锁。
+        return;
+      }
+
+      if (message.type === "taskboard:parent-thread-ready" && message.payload) {
+        // parent 身份同样只接受宿主握手结果；面板完成绑定持久化后再释放锁。
+        return;
+      }
+
       if (message.type === "taskboard:thread-prepared" && message.payload) {
-        setOpeningThreadTaskId(null);
+        const payload = message.payload as {
+          taskId?: unknown;
+          orchestrationId?: unknown;
+          conversationRole?: unknown;
+          openingRequestId?: unknown;
+        };
+        // 注入层会为新编排同时发送兼容的 thread-prepared；不能在特定握手后提前解锁，
+        // 否则 dispatch API 尚未写入时可再次创建 child。
+        if (
+          typeof payload.orchestrationId === "string"
+          || payload.conversationRole === "child"
+          || payload.conversationRole === "parent"
+        ) return;
+        releaseThreadOpening(
+          undefined,
+          typeof payload.taskId === "string" ? payload.taskId : undefined,
+          typeof payload.openingRequestId === "string" ? payload.openingRequestId : undefined,
+        );
         return;
       }
 
       if (message.type === "taskboard:thread-create-error" && message.payload) {
-        const payload = message.payload as { error?: unknown };
-        setOpeningThreadTaskId(null);
+        const payload = message.payload as {
+          error?: unknown;
+          taskId?: unknown;
+          orchestrationId?: unknown;
+          openingRequestId?: unknown;
+        };
+        releaseThreadOpening(
+          typeof payload.orchestrationId === "string" ? payload.orchestrationId : undefined,
+          typeof payload.taskId === "string" ? payload.taskId : undefined,
+          typeof payload.openingRequestId === "string" ? payload.openingRequestId : undefined,
+        );
         setActionError(typeof payload.error === "string"
           ? payload.error
           : textRef.current("无法在 Codex 中打开新对话。", "Could not open a new conversation in Codex."));
@@ -1811,7 +1992,7 @@ export function App() {
       }
       pendingAutomationRequestsRef.current.clear();
     };
-  }, [embedded, host]);
+  }, [embedded, host, releaseThreadOpening]);
 
   useEffect(() => {
     if (host !== "workbuddy") return;
@@ -2298,11 +2479,7 @@ export function App() {
     ) as Record<TaskStatus, Task[]>;
   }, [filteredTasks]);
 
-  const mainBoardItems = boardDisplaySettings.mainStatuses.filter(
-    (status) => status !== "blocked"
-      || !hasLoadedTasks
-      || tasks.some((task) => task.status === "blocked"),
-  );
+  const mainBoardItems = boardDisplaySettings.mainStatuses;
   const mainColumnCount = Math.max(mainBoardItems.length, 1);
   const mainBoardMinWidth = (mainColumnCount * 300) + ((mainColumnCount - 1) * 24);
   const mainBoardMaxWidth = (mainColumnCount * 400) + ((mainColumnCount - 1) * 24);
@@ -2944,7 +3121,23 @@ export function App() {
     };
   }
 
-  function openThread(binding: CodexThreadBinding) {
+  function openThread(binding: CodexThreadBinding | { threadId: string }) {
+    if (!("codexProjectKind" in binding)) {
+      const inferred = hostThreadBinding(hostContext);
+      if (inferred && "codexProjectKind" in inferred && inferred.threadId === binding.threadId) {
+        openThread(inferred);
+        return;
+      }
+      if (embedded && window.parent !== window) {
+        postEmbeddedHostMessage({
+          type: "taskboard:open-thread",
+          payload: binding,
+        });
+        return;
+      }
+      window.location.assign(`codex://threads/${encodeURIComponent(binding.threadId.trim())}`);
+      return;
+    }
     const remoteProject = binding.codexProjectKind === "remote"
       ? hostContext?.projects?.find((project) => (
           project.id === binding.codexProjectId
@@ -3037,7 +3230,15 @@ export function App() {
     return liveProject ? baseIdentity : null;
   }
 
-  async function openTaskInThread(task: Task) {
+  async function openTaskInThread(
+    task: Task,
+    session?: {
+      orchestrationId: string;
+      parentThreadBinding: CodexThreadBinding | { threadId: string } | null;
+      intent?: TaskIntentRevision;
+      conversationRole?: "parent" | "child";
+    },
+  ): Promise<boolean | string> {
     const standalone = !embedded || window.parent === window;
     const projectless = task.projectId === GLOBAL_PROJECT_ID;
     const taskboardProject = projects.find((project) => project.id === task.projectId);
@@ -3054,7 +3255,7 @@ export function App() {
         "已保存的 SSH 远程项目或主机当前不可用。",
         "The saved SSH remote project or host is not available.",
       ));
-      return;
+      return false;
     }
     if (!standalone && codexProjectContext?.codexProjectKind === "remote") {
       const identity = remoteIdentityForTask(task, codexProjectContext);
@@ -3068,7 +3269,7 @@ export function App() {
             "已保存的 SSH 远程项目或主机当前不可用。",
             "The saved SSH remote project or host is not available.",
           ));
-        return;
+        return false;
       }
       codexProjectContext = identity;
     }
@@ -3079,11 +3280,52 @@ export function App() {
         : codexProjectContext?.workspacePath
           ?? deviceWorkspacePaths[task.projectId]
           ?? taskboardProject?.workspacePath;
-    const embeddedInstruction = text(
-      `[$manage-taskboard](${manageTaskboardSkillPath}) 议题 ID：${task.identifier}`,
-      `[$manage-taskboard](${manageTaskboardSkillPath}) Issue ID: ${task.identifier}`,
-    );
+    const conversationRole = session?.conversationRole
+      ?? (session ? "child" : null);
+    const openingKey = session?.orchestrationId ?? `task:${task.id}`;
+    const openingRequestId = standalone ? undefined : window.crypto.randomUUID();
+    const embeddedInstruction = conversationRole === "parent"
+      ? [
+          text(
+            `你是议题 ${task.identifier} 的主会话。请使用 [$manage-taskboard](${manageTaskboardSkillPath}) 读取 Jira 上下文，提炼并确认 task-intent.v1；不要直接替任务会话修改工作区。`,
+            `You are the main session for issue ${task.identifier}. Use [$manage-taskboard](${manageTaskboardSkillPath}) to read Jira context and produce/confirm task-intent.v1; do not modify the workspace on behalf of the worker session.`,
+          ),
+        ].join("\n")
+      : conversationRole === "child"
+        ? [
+            text(
+              "你是任务执行会话，只根据确认后的 task-intent.v1 完成工作，不要重新读取或写回 Jira。",
+              "You are a worker session. Follow the confirmed task-intent.v1; do not reread or write back to Jira.",
+            ),
+            session?.intent ? `task-intent.v1: ${JSON.stringify(session.intent)}` : "",
+          ].filter(Boolean).join("\n")
+        : text(
+          `[$manage-taskboard](${manageTaskboardSkillPath}) 议题 ID：${task.identifier}`,
+          `[$manage-taskboard](${manageTaskboardSkillPath}) Issue ID: ${task.identifier}`,
+        );
 
+    // 在首次异步扫描前占住 orchestration keyed reservation，避免快速重复点击并行进入扫描。
+    if (!standalone) {
+      if (pendingThreadOpeningsRef.current.has(openingKey)) return false;
+      markThreadOpening(openingKey, {
+        taskId: task.id,
+        ...(session?.orchestrationId ? { orchestrationId: session.orchestrationId } : {}),
+        ...(conversationRole ? { conversationRole } : {}),
+        openingRequestId: openingRequestId!,
+      });
+      if (session && conversationRole && openingRequestId) {
+        // 在宿主导航前落下 tab-local 描述；iframe 重挂后可用它校验迟到的 handshake。
+        rememberPendingTaskSessionHandshake({
+          taskId: task.id,
+          orchestrationId: session.orchestrationId,
+          conversationRole,
+          openingRequestId,
+          expiresAt: Date.now() + THREAD_OPENING_TIMEOUT_MS,
+        });
+      }
+    }
+
+    // 编排 child 必须锁定已验证的 worktree；回退项目根会让执行会话越界。
     if (
       !projectless
       && task.developmentContext?.type === "worktree"
@@ -3097,7 +3339,17 @@ export function App() {
         const worktreeExists = developmentScan.contexts.some((context) => (
           context.type === "worktree" && context.path === expectedWorktreePath
         ));
-        if (!worktreeExists) workspacePath = developmentScan.workspacePath ?? baseWorkspacePath;
+        if (!worktreeExists) {
+          if (conversationRole === "child") {
+            releaseThreadOpening(session?.orchestrationId, task.id, openingRequestId);
+            setActionError(text(
+              "目标 worktree 不存在或未映射，无法启动任务会话。",
+              "The target worktree does not exist or is not mapped; the worker session cannot start.",
+            ));
+            return false;
+          }
+          workspacePath = developmentScan.workspacePath ?? baseWorkspacePath;
+        }
       } else {
         try {
           const scan = await listDevelopmentContexts(
@@ -3110,53 +3362,158 @@ export function App() {
           const worktreeExists = scan.contexts.some((context) => (
             context.type === "worktree" && context.path === expectedWorktreePath
           ));
-          if (!worktreeExists) workspacePath = scan.workspacePath ?? baseWorkspacePath;
+          if (!worktreeExists) {
+            if (conversationRole === "child") {
+              releaseThreadOpening(session?.orchestrationId, task.id, openingRequestId);
+              setActionError(text(
+                "目标 worktree 不存在或未映射，无法启动任务会话。",
+                "The target worktree does not exist or is not mapped; the worker session cannot start.",
+              ));
+              return false;
+            }
+            workspacePath = scan.workspacePath ?? baseWorkspacePath;
+          }
         } catch (error) {
+          releaseThreadOpening(session?.orchestrationId, task.id, openingRequestId);
           setActionError(errorMessage(error));
-          return;
+          return false;
         }
       }
     }
 
     if (codexProjectContext?.codexProjectKind === "remote" && !codexProjectContext.workspacePath) {
+      releaseThreadOpening(session?.orchestrationId, task.id, openingRequestId);
       setActionError(text(
         "SSH 远程项目缺少精确工作目录映射。",
         "The SSH remote project is missing its exact workspace mapping.",
       ));
-      return;
+      return false;
     }
-    if (openingThreadTaskId) return;
     if (standalone) {
       if (codexProjectContext?.codexProjectKind === "remote") {
         setActionError(text(
           "请在 Codex App 中打开该 SSH 远程项目的新对话。",
           "Open the new SSH remote project conversation in the Codex app.",
         ));
-        return;
+        return false;
       }
       const deepLink = new URL("codex://threads/new");
       if (workspacePath) deepLink.searchParams.set("path", workspacePath);
       deepLink.searchParams.set("prompt", embeddedInstruction);
       window.location.assign(deepLink.toString());
-      return;
+      return true;
     }
-    setOpeningThreadTaskId(task.id);
     setActionError(null);
-    postEmbeddedHostMessage({
-      type: "taskboard:create-thread",
-      payload: {
-        taskId: task.id,
-        identifier: task.identifier,
-        title: task.title,
-        instruction: embeddedInstruction,
-        projectless,
-        codexProjectId: codexProjectContext?.codexProjectId,
-        codexProjectKind: codexProjectContext?.codexProjectKind ?? "local",
-        codexHostId: codexProjectContext?.codexHostId ?? "local",
-        codexProjectWorkspacePath: codexProjectContext?.workspacePath,
-        workspacePath,
-      },
+    try {
+      postEmbeddedHostMessage({
+        type: "taskboard:create-thread",
+        payload: {
+          taskId: task.id,
+          ...(openingRequestId ? { openingRequestId } : {}),
+          identifier: task.identifier,
+          title: conversationRole === "parent"
+            ? `${task.identifier} · 主会话`
+            : conversationRole === "child"
+              ? `${task.identifier} · 执行`
+              : task.title,
+          instruction: embeddedInstruction,
+          projectless,
+          codexProjectId: codexProjectContext?.codexProjectId,
+          codexProjectKind: codexProjectContext?.codexProjectKind ?? "local",
+          codexHostId: codexProjectContext?.codexHostId ?? "local",
+          codexProjectWorkspacePath: codexProjectContext?.workspacePath,
+          workspacePath,
+          ...(session ? {
+            orchestrationId: session.orchestrationId,
+            parentThreadId: session.parentThreadBinding?.threadId,
+            ...(session.intent ? { intentVersion: session.intent.revision } : {}),
+            ...(conversationRole ? { conversationRole } : {}),
+          } : {}),
+        },
+      });
+    } catch (error) {
+      releaseThreadOpening(session?.orchestrationId, task.id, openingRequestId);
+      setActionError(errorMessage(error));
+      return false;
+    }
+    return openingRequestId ?? true;
+  }
+
+  async function dispatchTaskSessionFromPanel(
+    task: Task,
+    orchestration: TaskSessionOrchestration,
+    intent: TaskIntentRevision,
+  ): Promise<string> {
+    const parentBinding = orchestration.parentThreadBinding ?? currentParentThreadBinding;
+    if (!parentBinding?.threadId) {
+      const message = text(
+        "请先在 Codex 主会话中打开该任务，再派发任务会话。",
+        "Open this issue in a Codex main session before dispatching a worker session.",
+      );
+      setActionError(message);
+      throw new Error(message);
+    }
+    const started = await openTaskInThread(task, {
+      orchestrationId: orchestration.id,
+      parentThreadBinding: parentBinding,
+      intent,
+      conversationRole: "child",
     });
+    if (!started) {
+      throw new Error(text(
+        "任务会话创建请求未发起，请处理当前错误后重试。",
+        "The worker session request was not started. Resolve the current error and try again.",
+      ));
+    }
+    if (typeof started !== "string") {
+      throw new Error(text(
+        "宿主没有返回可关联的创建请求 ID，请重试。",
+        "The host did not return a correlatable creation request ID. Try again.",
+      ));
+    }
+    return started;
+  }
+
+  const settleTaskSessionThread = useCallback((orchestrationId: string, openingRequestId?: string) => {
+    releaseThreadOpening(orchestrationId, undefined, openingRequestId);
+  }, [releaseThreadOpening]);
+
+  async function createParentTaskSessionFromPanel(
+    task: Task,
+    orchestration: TaskSessionOrchestration,
+  ): Promise<string> {
+    if (currentParentThreadBinding?.threadId) {
+      throw new Error(text(
+        "主会话已经绑定到该任务。",
+        "A main session is already bound to this task.",
+      ));
+    }
+    if (!embedded || window.parent === window) {
+      const message = text(
+        "请在 Codex 主窗口中发起任务会话，以便自动绑定主会话。",
+        "Start the task session from a Codex window so the main session can be bound automatically.",
+      );
+      setActionError(message);
+      throw new Error(message);
+    }
+    const started = await openTaskInThread(task, {
+      orchestrationId: orchestration.id,
+      parentThreadBinding: null,
+      conversationRole: "parent",
+    });
+    if (!started) {
+      throw new Error(text(
+        "主会话创建请求未发起，请处理当前错误后重试。",
+        "The main session request was not started. Resolve the current error and try again.",
+      ));
+    }
+    if (typeof started !== "string") {
+      throw new Error(text(
+        "宿主没有返回可关联的创建请求 ID，请重试。",
+        "The host did not return a correlatable creation request ID. Try again.",
+      ));
+    }
+    return started;
   }
 
   function changeProject(projectId: string) {
@@ -3381,6 +3738,7 @@ export function App() {
           setCommentsRevision={setCommentsRevision}
           setAttachmentsRevision={setAttachmentsRevision}
           setReadmeRevision={setReadmeRevision}
+          setOrchestrationRevision={setOrchestrationRevision}
         />
       )}
       <main className="workspace">
@@ -3748,6 +4106,7 @@ export function App() {
             developmentScanLoading={developmentScanLoading}
             commentsRevision={commentsRevision}
             attachmentsRevision={attachmentsRevision}
+            orchestrationRevision={orchestrationRevision}
             onCreateLabel={persistProjectLabel}
             onDeleteLabel={removeProjectLabel}
             onUpdate={(current, changes) => updateTaskProperties(current, changes)}
@@ -3760,9 +4119,12 @@ export function App() {
             )}
             onOpenThread={openThread}
             onOpenLegacyLocalThread={openLegacyLocalThread}
-            onOpenInThread={openTaskInThread}
+            parentThreadBinding={currentParentThreadBinding ?? detailTask.threadBinding}
+            onCreateParentTaskSession={createParentTaskSessionFromPanel}
+            onDispatchTaskSession={dispatchTaskSessionFromPanel}
+            onOpenChildThread={openThread}
+            onTaskSessionThreadSettled={settleTaskSessionThread}
             onCopy={(text, message) => void copyText(text, message)}
-            openingThread={openingThreadTaskId === detailTask.id}
             onError={setActionError}
           />
         ) : boardView !== "readme"

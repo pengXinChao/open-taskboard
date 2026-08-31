@@ -27,6 +27,13 @@ import type {
   ProjectSummary,
   Task,
   TaskChangeActivity,
+  TaskIntentRevision,
+  TaskResultRevision,
+  TaskSessionIntegration,
+  TaskSessionMessage,
+  TaskSessionOrchestration,
+  TaskSessionReview,
+  TaskSessionWriteback,
   TaskboardMetadata,
   TaskDraft,
   TaskStatus,
@@ -579,6 +586,191 @@ export async function getTask(taskId: string, signal?: AbortSignal): Promise<Tas
     { signal },
   );
   return data.task;
+}
+
+export interface TaskSessionView {
+  orchestration: TaskSessionOrchestration;
+  intent: TaskIntentRevision | null;
+  intentRevisions: TaskIntentRevision[];
+  result: TaskResultRevision | null;
+  results: TaskResultRevision[];
+  messages: TaskSessionMessage[];
+  timeline: TaskSessionMessage[];
+}
+
+/**
+ * 编排 API 在握手阶段允许只携带 threadId；宿主确认身份后再补齐项目字段。
+ */
+export type TaskSessionThreadBinding = CodexThreadBinding | { threadId: string };
+
+export async function getTaskSessionOrchestration(
+  orchestrationId: string,
+  signal?: AbortSignal,
+): Promise<TaskSessionView> {
+  return request<TaskSessionView>(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}`,
+    { signal },
+  );
+}
+
+export async function getTaskSessionForTask(
+  taskId: string,
+  signal?: AbortSignal,
+): Promise<TaskSessionView> {
+  return request<TaskSessionView>(
+    `/api/tasks/${encodeURIComponent(taskId)}/orchestrations`,
+    { signal },
+  );
+}
+
+export async function createTaskSessionOrchestration(
+  taskId: string,
+  input: {
+    parentThreadBinding?: TaskSessionThreadBinding | null;
+    intent?: Partial<TaskIntentRevision>;
+  } = {},
+): Promise<TaskSessionView> {
+  const data = await request<TaskSessionView>(
+    `/api/tasks/${encodeURIComponent(taskId)}/orchestrations`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+  return data;
+}
+
+export async function saveTaskSessionIntent(
+  orchestrationId: string,
+  input: {
+    intent: Partial<TaskIntentRevision>;
+    sourceSnapshot?: Record<string, unknown> | null;
+    captureDigest?: string | null;
+    revision?: number;
+    parentThreadId?: string;
+  },
+): Promise<TaskSessionView> {
+  return request<TaskSessionView>(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/intent`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+export async function confirmTaskSessionIntent(
+  orchestrationId: string,
+  input: {
+    intentVersion: number;
+    captureDigest?: string | null;
+    allowOpenQuestions?: boolean;
+    parentThreadId?: string;
+  },
+): Promise<TaskSessionView> {
+  return request<TaskSessionView>(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/intent/confirm`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+export async function dispatchTaskSession(
+  orchestrationId: string,
+  input: {
+    intentVersion: number;
+    parentThreadId?: string;
+    childThreadBinding?: TaskSessionThreadBinding | null;
+    childThreadId?: string;
+    identity?: Record<string, unknown> | null;
+    childWindow?: Record<string, unknown> | null;
+    runtime?: Record<string, unknown> | null;
+    worktree?: Record<string, unknown> | null;
+    state?: string;
+  },
+): Promise<TaskSessionView> {
+  return request<TaskSessionView>(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/dispatch`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+export async function reportTaskSessionResult(
+  orchestrationId: string,
+  input: {
+    parentThreadId?: string;
+    childThreadId?: string;
+    intentVersion: number;
+    resultRevision: number;
+    idempotencyKey: string;
+    payload: TaskResultRevision;
+  },
+): Promise<{
+  orchestration: TaskSessionOrchestration;
+  result: TaskResultRevision;
+  message: TaskSessionMessage;
+  duplicate?: boolean;
+}> {
+  return request(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/reports`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+export async function acknowledgeTaskSessionReport(
+  orchestrationId: string,
+  resultRevision: number,
+  input: { parentThreadId?: string; childThreadId?: string; acknowledgedAt?: string } = {},
+): Promise<{ orchestration: TaskSessionOrchestration; result: TaskResultRevision; message: TaskSessionMessage; ack: TaskSessionMessage }> {
+  return request(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/reports/${resultRevision}/ack`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+export async function getTaskSessionTimeline(
+  orchestrationId: string,
+  after = 0,
+  signal?: AbortSignal,
+): Promise<{ orchestrationId: string; messages: TaskSessionMessage[]; nextSequence: number }> {
+  const query = new URLSearchParams({ after: String(after) });
+  return request(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/timeline?${query}`,
+    { signal },
+  );
+}
+
+export async function reviewTaskSession(
+  orchestrationId: string,
+  input: { decision: TaskSessionReview["decision"]; resultRevision?: number; feedback?: string; parentThreadId?: string },
+): Promise<{ orchestration: TaskSessionOrchestration; review: TaskSessionReview; message: TaskSessionMessage }> {
+  return request(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/review`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+export async function integrateTaskSession(
+  orchestrationId: string,
+  input: { mode?: TaskSessionIntegration["mode"]; commit?: string; conflict?: boolean; parentThreadId?: string } = {},
+): Promise<{ orchestration: TaskSessionOrchestration; integration: TaskSessionIntegration; message: TaskSessionMessage }> {
+  return request(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/integrate`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+export async function saveTaskSessionWriteback(
+  orchestrationId: string,
+  input: { comment?: string | null; fields?: Record<string, unknown> | null; status?: string | null; confirmed?: boolean; parentThreadId?: string } = {},
+): Promise<{ orchestration: TaskSessionOrchestration; writeback: TaskSessionWriteback; message: TaskSessionMessage; applied?: boolean; note?: string }> {
+  return request(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/jira-writeback`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+export async function completeTaskSession(
+  orchestrationId: string,
+  input: { confirmed: true; parentThreadId?: string },
+): Promise<{ orchestration: TaskSessionOrchestration; message: TaskSessionMessage | null; duplicate?: boolean }> {
+  return request(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/complete`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
 }
 
 export function listArchivedTasks(projectId?: string, signal?: AbortSignal): Promise<Task[]> {

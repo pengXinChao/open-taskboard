@@ -78,6 +78,12 @@ const CONTENT_TYPES = new Map([
   [".woff2", "font/woff2"],
 ]);
 
+function isTaskSessionRoute(pathname) {
+  return pathname === "/api/orchestrations"
+    || pathname.startsWith("/api/orchestrations/")
+    || /^\/api\/tasks\/[^/]+\/orchestrations(?:\/|$)/.test(pathname);
+}
+
 function sendJson(response, status, value, headers = {}) {
   const body = JSON.stringify(value);
   response.writeHead(status, {
@@ -567,6 +573,450 @@ function parseThreadBinding(value) {
     throw new ApiError(400, "INVALID_FIELD", "Thread project identity is invalid");
   }
   return { threadId, codexProjectId, codexProjectKind, codexHostId, workspacePath };
+}
+
+function parseTaskSessionObject(value, name, { nullable = true } = {}) {
+  if (value === undefined) return undefined;
+  if (value === null) {
+    if (nullable) return null;
+    throw new ApiError(400, "INVALID_FIELD", `'${name}' must be an object`);
+  }
+  assertPlainObject(value);
+  return value;
+}
+
+function parseTaskSessionBinding(value, name) {
+  if (value === undefined || value === null) return value;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    // P0 adapter 使用短字段名回传身份，这里统一成 Taskboard 的持久化 binding 形状。
+    value = {
+      ...value,
+      ...(value.codexProjectId === undefined && value.projectId !== undefined
+        ? { codexProjectId: value.projectId }
+        : {}),
+      ...(value.codexProjectKind === undefined && value.projectKind !== undefined
+        ? { codexProjectKind: value.projectKind }
+        : {}),
+      ...(value.codexHostId === undefined && value.hostId !== undefined
+        ? { codexHostId: value.hostId }
+        : {}),
+    };
+    delete value.projectId;
+    delete value.projectKind;
+    delete value.hostId;
+    delete value.targetId;
+    delete value.windowId;
+    delete value.targetUrl;
+    delete value.targetTitle;
+    delete value.window;
+    // projectless 任务没有 Codex project/workspace 身份；adapter 会以 null 回传这些字段，
+    // 这里将它们视为“仅 thread 身份”，并把原始 projectless 证据留给 childWindow。
+    if (
+      value.codexProjectId === null
+      && value.codexProjectKind === null
+      && value.workspacePath === null
+    ) {
+      delete value.codexProjectId;
+      delete value.codexProjectKind;
+      delete value.codexHostId;
+      delete value.workspacePath;
+    }
+  }
+  try {
+    return parseThreadBinding(value);
+  } catch (error) {
+    if (error instanceof ApiError && error.message.includes("threadBinding")) {
+      throw new ApiError(error.status, error.code, error.message.replaceAll("threadBinding", name));
+    }
+    throw error;
+  }
+}
+
+function parseTaskSessionChildWindow(body) {
+  const identity = body.identity && typeof body.identity === "object" && !Array.isArray(body.identity)
+    ? body.identity
+    : null;
+  const suppliedWindow = body.childWindow ?? body.window ?? identity?.window;
+  const identityMetadata = identity
+    ? Object.fromEntries([
+      ["targetId", identity.targetId],
+      ["windowId", identity.windowId],
+      ["targetUrl", identity.targetUrl],
+      ["targetTitle", identity.targetTitle],
+      ["projectId", identity.projectId],
+      ["projectKind", identity.projectKind],
+      ["hostId", identity.hostId],
+      ["workspacePath", identity.workspacePath],
+    ].filter(([, value]) => value !== undefined))
+    : {};
+  if (identity && identity.projectId === null && identity.projectKind === null && identity.workspacePath === null) {
+    identityMetadata.projectless = true;
+  }
+  if (suppliedWindow === undefined && Object.keys(identityMetadata).length === 0) return undefined;
+  if (suppliedWindow !== undefined && suppliedWindow !== null) assertPlainObject(suppliedWindow);
+  return {
+    ...identityMetadata,
+    ...(suppliedWindow ?? {}),
+  };
+}
+
+function parseTaskSessionCreate(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "id",
+    "threadId",
+    "parentThreadId",
+    "threadBinding",
+    "parentThreadBinding",
+    "parentBinding",
+    "sourceSnapshot",
+    "intentSnapshot",
+    "intentDigest",
+    "intent",
+    "state",
+    "runtime",
+    "worktree",
+  ]));
+  const parentValue = body.parentThreadBinding ?? body.parentBinding ?? body.threadBinding;
+  let parentThreadBinding = parseTaskSessionBinding(parentValue, "parentThreadBinding");
+  const parentThreadId = body.parentThreadId ?? body.threadId;
+  if (parentThreadId !== undefined) {
+    const parsedThreadId = parseThreadId(parentThreadId);
+    if (parentThreadBinding && parentThreadBinding.threadId !== parsedThreadId) {
+      throw new ApiError(400, "INVALID_FIELD", "parentThreadId does not match parentThreadBinding.threadId");
+    }
+    parentThreadBinding ??= { threadId: parsedThreadId };
+  }
+  return {
+    id: body.id === undefined ? undefined : stringField(body.id, "id", { required: true, maxLength: 128 }),
+    parentThreadBinding,
+    sourceSnapshot: parseTaskSessionObject(body.sourceSnapshot ?? body.intentSnapshot, "sourceSnapshot"),
+    intentDigest: stringField(body.intentDigest, "intentDigest", { maxLength: 128 }),
+    intent: parseTaskSessionObject(body.intent, "intent", { nullable: false }),
+    state: body.state,
+    runtime: parseTaskSessionObject(body.runtime, "runtime"),
+    worktree: parseTaskSessionObject(body.worktree, "worktree"),
+  };
+}
+
+function parseTaskSessionIntent(body) {
+  assertPlainObject(body);
+  let intent;
+  if (body.intent !== undefined) {
+    assertAllowedKeys(body, new Set([
+      "intent",
+      "sourceSnapshot",
+      "captureDigest",
+      "intentDigest",
+      "revision",
+      "intentVersion",
+      "version",
+      "parentThreadId",
+      "parentThreadBinding",
+      "parentBinding",
+      "threadBinding",
+    ]));
+    intent = body.intent;
+  } else {
+    assertPlainObject(body);
+    intent = { ...body };
+    for (const key of [
+      "sourceSnapshot",
+      "captureDigest",
+      "intentDigest",
+      "revision",
+      "intentVersion",
+      "version",
+      "parentThreadId",
+      "parentThreadBinding",
+      "parentBinding",
+      "threadBinding",
+    ]) {
+      delete intent[key];
+    }
+  }
+  if (!intent || typeof intent !== "object" || Array.isArray(intent)) {
+    throw new ApiError(400, "INVALID_FIELD", "Intent must be an object");
+  }
+  const parentValue = body.parentThreadBinding ?? body.parentBinding ?? body.threadBinding;
+  let parentThreadBinding = parseTaskSessionBinding(parentValue, "parentThreadBinding");
+  const parentThreadId = parseThreadId(body.parentThreadId);
+  if (parentThreadId !== undefined) {
+    if (parentThreadBinding && parentThreadBinding.threadId !== parentThreadId) {
+      throw new ApiError(400, "INVALID_FIELD", "parentThreadId does not match parentThreadBinding.threadId");
+    }
+    parentThreadBinding ??= { threadId: parentThreadId };
+  }
+  return {
+    intent,
+    sourceSnapshot: parseTaskSessionObject(body.sourceSnapshot, "sourceSnapshot"),
+    captureDigest: stringField(body.captureDigest ?? body.intentDigest, "captureDigest", { maxLength: 128 }),
+    revision: body.revision ?? body.intentVersion,
+    parentThreadId,
+    parentThreadBinding,
+  };
+}
+
+function parseTaskSessionConfirm(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "intentVersion",
+    "revision",
+    "captureDigest",
+    "intentDigest",
+    "allowOpenQuestions",
+    "parentThreadId",
+    "parentThreadBinding",
+    "parentBinding",
+    "threadBinding",
+  ]));
+  const intentVersion = body.intentVersion ?? body.revision;
+  if (intentVersion !== undefined && (!Number.isSafeInteger(intentVersion) || intentVersion < 1)) {
+    throw new ApiError(400, "INVALID_FIELD", "intentVersion must be a positive integer");
+  }
+  if (body.allowOpenQuestions !== undefined && typeof body.allowOpenQuestions !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "allowOpenQuestions must be a boolean");
+  }
+  const parentValue = body.parentThreadBinding ?? body.parentBinding ?? body.threadBinding;
+  let parentThreadBinding = parseTaskSessionBinding(parentValue, "parentThreadBinding");
+  const parentThreadId = parseThreadId(body.parentThreadId);
+  if (parentThreadId !== undefined) {
+    if (parentThreadBinding && parentThreadBinding.threadId !== parentThreadId) {
+      throw new ApiError(400, "INVALID_FIELD", "parentThreadId does not match parentThreadBinding.threadId");
+    }
+    parentThreadBinding ??= { threadId: parentThreadId };
+  }
+  return {
+    intentVersion,
+    captureDigest: stringField(body.captureDigest ?? body.intentDigest, "captureDigest", { maxLength: 128 }),
+    allowOpenQuestions: body.allowOpenQuestions,
+    parentThreadId,
+    parentThreadBinding,
+  };
+}
+
+function parseTaskSessionDispatch(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "intentVersion",
+    "parentThreadId",
+    "childThread",
+    "childThreadBinding",
+    "identity",
+    "childThreadId",
+    "childWindow",
+    "window",
+    "runtime",
+    "worktree",
+    "state",
+  ]));
+  const childValue = body.childThreadBinding ?? body.childThread ?? body.identity;
+  let childThread = parseTaskSessionBinding(childValue, "childThreadBinding");
+  if (body.childThreadId !== undefined) {
+    const childThreadId = parseThreadId(body.childThreadId);
+    if (childThread && childThread.threadId !== childThreadId) {
+      throw new ApiError(400, "INVALID_FIELD", "childThreadId does not match childThread.threadId");
+    }
+    childThread ??= { threadId: childThreadId };
+  }
+  const intentVersion = body.intentVersion;
+  if (intentVersion !== undefined && (!Number.isSafeInteger(intentVersion) || intentVersion < 1)) {
+    throw new ApiError(400, "INVALID_FIELD", "intentVersion must be a positive integer");
+  }
+  return {
+    intentVersion,
+    parentThreadId: parseThreadId(body.parentThreadId),
+    childThreadBinding: childThread,
+    childWindow: parseTaskSessionChildWindow(body),
+    runtime: parseTaskSessionObject(body.runtime, "runtime"),
+    worktree: parseTaskSessionObject(body.worktree, "worktree"),
+    state: body.state,
+  };
+}
+
+function parseTaskSessionMessage(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "direction",
+    "type",
+    "idempotencyKey",
+    "payload",
+    "deliveryState",
+    "state",
+    "parentThreadId",
+    "childThreadId",
+    "intentVersion",
+  ]));
+  const direction = body.direction;
+  if (direction !== undefined && !["parent_to_child", "child_to_parent", "internal"].includes(direction)) {
+    throw new ApiError(400, "INVALID_FIELD", "direction is invalid");
+  }
+  const deliveryState = body.deliveryState;
+  if (deliveryState !== undefined && !["pending", "sent", "acknowledged", "failed", "cancelled"].includes(deliveryState)) {
+    throw new ApiError(400, "INVALID_FIELD", "deliveryState is invalid");
+  }
+  // 保留字段是否显式提供，服务端才能对幂等重试区分“省略默认值”和“明确冲突值”。
+  const type = body.type === undefined ? undefined : stringField(body.type, "type", { required: true, maxLength: 128 });
+  const idempotencyKey = stringField(body.idempotencyKey, "idempotencyKey", { maxLength: 512 });
+  const parentThreadId = parseThreadId(body.parentThreadId);
+  const childThreadId = body.childThreadId === undefined ? undefined : stringField(body.childThreadId, "childThreadId", { required: true, maxLength: 256 });
+  const intentVersion = body.intentVersion;
+  if (intentVersion !== undefined && (!Number.isSafeInteger(intentVersion) || intentVersion < 1)) {
+    throw new ApiError(400, "INVALID_FIELD", "intentVersion must be a positive integer");
+  }
+  return {
+    direction,
+    type,
+    idempotencyKey,
+    payload: parseTaskSessionObject(body.payload ?? {}, "payload", { nullable: false }),
+    deliveryState,
+    state: body.state,
+    parentThreadId,
+    childThreadId,
+    intentVersion,
+  };
+}
+
+function parseTaskSessionReport(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "parentThreadId",
+    "childThreadId",
+    "intentVersion",
+    "resultRevision",
+    "idempotencyKey",
+    "payload",
+    "result",
+    "report",
+    "deliveryState",
+  ]));
+  const resultRevision = body.resultRevision;
+  if (resultRevision === undefined) {
+    throw new ApiError(400, "INVALID_FIELD", "resultRevision is required for a report");
+  }
+  if (!Number.isSafeInteger(resultRevision) || resultRevision < 1) {
+    throw new ApiError(400, "INVALID_FIELD", "resultRevision must be a positive integer");
+  }
+  const intentVersion = body.intentVersion;
+  if (intentVersion !== undefined && (!Number.isSafeInteger(intentVersion) || intentVersion < 1)) {
+    throw new ApiError(400, "INVALID_FIELD", "intentVersion must be a positive integer");
+  }
+  const deliveryState = body.deliveryState;
+  if (deliveryState !== undefined && !["pending", "sent"].includes(deliveryState)) {
+    throw new ApiError(400, "INVALID_FIELD", "Report deliveryState must be pending or sent");
+  }
+  return {
+    parentThreadId: parseThreadId(body.parentThreadId),
+    childThreadId: body.childThreadId === undefined ? undefined : stringField(body.childThreadId, "childThreadId", { required: true, maxLength: 256 }),
+    intentVersion,
+    resultRevision,
+    idempotencyKey: stringField(body.idempotencyKey, "idempotencyKey", { maxLength: 512 }),
+    payload: body.payload ?? body.result ?? body.report,
+    deliveryState,
+  };
+}
+
+function parseTaskSessionAck(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["parentThreadId", "childThreadId", "acknowledgedAt"]));
+  return {
+    parentThreadId: parseThreadId(body.parentThreadId),
+    childThreadId: body.childThreadId === undefined ? undefined : stringField(body.childThreadId, "childThreadId", { required: true, maxLength: 256 }),
+    acknowledgedAt: stringField(body.acknowledgedAt, "acknowledgedAt", { maxLength: 64 }),
+  };
+}
+
+function parseTaskSessionReview(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "decision",
+    "status",
+    "resultRevision",
+    "feedback",
+    "reason",
+    "evidence",
+    "parentThreadId",
+  ]));
+  const decision = body.decision ?? body.status;
+  if (!["approved", "needs_rework", "blocked"].includes(decision)) {
+    throw new ApiError(400, "INVALID_FIELD", "decision must be approved, needs_rework, or blocked");
+  }
+  if (body.resultRevision !== undefined && (!Number.isSafeInteger(body.resultRevision) || body.resultRevision < 1)) {
+    throw new ApiError(400, "INVALID_FIELD", "resultRevision must be a positive integer");
+  }
+  return {
+    decision,
+    resultRevision: body.resultRevision,
+    feedback: body.feedback ?? body.reason,
+    evidence: parseTaskSessionObject(body.evidence, "evidence"),
+    parentThreadId: parseThreadId(body.parentThreadId),
+  };
+}
+
+function parseTaskSessionIntegration(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "mode",
+    "commit",
+    "commitSha",
+    "conflict",
+    "verification",
+    "parentThreadId",
+  ]));
+  const mode = body.mode ?? "merge";
+  if (!["merge", "cherry-pick"].includes(mode)) {
+    throw new ApiError(400, "INVALID_FIELD", "mode must be merge or cherry-pick");
+  }
+  if (body.conflict !== undefined && typeof body.conflict !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "conflict must be a boolean");
+  }
+  return {
+    mode,
+    commit: stringField(body.commit ?? body.commitSha, "commit", { maxLength: 256 }),
+    conflict: body.conflict,
+    verification: parseTaskSessionObject(body.verification, "verification"),
+    parentThreadId: parseThreadId(body.parentThreadId),
+  };
+}
+
+function parseTaskSessionWriteback(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "comment",
+    "fields",
+    "status",
+    "confirmed",
+    "parentThreadId",
+  ]));
+  if (body.comment !== undefined && body.comment !== null && typeof body.comment !== "string") {
+    throw new ApiError(400, "INVALID_FIELD", "comment must be a string or null");
+  }
+  if (body.confirmed !== undefined && typeof body.confirmed !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "confirmed must be a boolean");
+  }
+  return {
+    comment: body.comment ?? null,
+    fields: parseTaskSessionObject(body.fields, "fields"),
+    status: stringField(body.status, "status", { maxLength: 128 }),
+    confirmed: body.confirmed === true,
+    parentThreadId: parseThreadId(body.parentThreadId),
+  };
+}
+
+function parseTaskSessionComplete(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["confirmed", "complete", "parentThreadId"]));
+  if (body.confirmed !== undefined && typeof body.confirmed !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "confirmed must be a boolean");
+  }
+  if (body.complete !== undefined && typeof body.complete !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "complete must be a boolean");
+  }
+  return {
+    confirmed: body.confirmed,
+    complete: body.complete,
+    parentThreadId: parseThreadId(body.parentThreadId),
+  };
 }
 
 function requestHeader(request, name) {
@@ -1812,6 +2262,32 @@ export function createTaskboardServer(options = {}) {
     const threadBinding = currentHostThreadBinding(input.threadId);
     return threadBinding ? { ...input, threadBinding } : input;
   }
+
+  function orchestrationView(id, after = 0) {
+    const orchestration = database.getTaskSessionOrchestration(id);
+    if (!orchestration) return null;
+    const messages = database.listTaskSessionMessages(id, after);
+    return {
+      orchestration,
+      intent: orchestration.intent,
+      intentRevisions: orchestration.intentRevisions,
+      result: orchestration.result,
+      results: orchestration.resultRevisions,
+      messages,
+      timeline: messages,
+    };
+  }
+
+  function emitOrchestrationUpdate(id, message = null) {
+    const orchestration = database.getTaskSessionOrchestration(id);
+    if (!orchestration) return;
+    events.emit("orchestration.updated", { orchestration });
+    if (message) events.emit("orchestration.message", {
+      orchestrationId: id,
+      message,
+      taskId: orchestration.taskId,
+    });
+  }
   const cloudProxy = createCloudProxy({
     configStore: cloudConfig,
     fetch: options.remoteFetch ?? globalThis.fetch,
@@ -2650,6 +3126,13 @@ export function createTaskboardServer(options = {}) {
         currentCloudConfig = await cloudConfig.read();
         if (currentCloudConfig.remoteUrl) {
           assertLoopbackRequest(request);
+          if (isTaskSessionRoute(pathname)) {
+            throw new ApiError(
+              409,
+              "ORCHESTRATION_LOCAL_ONLY",
+              "Task session orchestration currently requires the device-local Taskboard",
+            );
+          }
           if (!isLocalCompanionRoute(pathname)) {
             return sendFetchResponse(
               response,
@@ -2657,6 +3140,212 @@ export function createTaskboardServer(options = {}) {
             );
           }
         }
+      }
+
+      const taskSessionCreateRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/orchestrations$/);
+      if (taskSessionCreateRoute) {
+        if (request.method !== "GET" && request.method !== "POST") return methodNotAllowed(response, ["GET", "POST"]);
+        assertNoQuery(url.searchParams, `${request.method} /api/tasks/:id/orchestrations`);
+        const taskId = decodeRouteSegment(taskSessionCreateRoute[1], "Task id");
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (request.method === "GET") {
+          const existing = database.getActiveTaskSessionOrchestration(task.id);
+          if (!existing) throw new ApiError(404, "ORCHESTRATION_NOT_FOUND", `Task '${taskId}' has no active orchestration`);
+          return sendJson(response, 200, orchestrationView(existing.id));
+        }
+        const body = parseTaskSessionCreate(await readJson(request));
+        let parentThreadBinding = body.parentThreadBinding;
+        if (!parentThreadBinding && task.threadBinding) parentThreadBinding = task.threadBinding;
+        if (!parentThreadBinding) {
+          const headerThreadId = requestHeader(request, "x-codex-thread-id");
+          if (headerThreadId) parentThreadBinding = { threadId: parseThreadId(headerThreadId) };
+        }
+        if (parentThreadBinding?.threadId) {
+          parentThreadBinding = currentHostThreadBinding(parentThreadBinding.threadId)
+            ?? parentThreadBinding;
+        }
+        const existing = database.getActiveTaskSessionOrchestration(task.id);
+        const orchestration = database.createTaskSessionOrchestration(task.id, {
+          ...body,
+          parentThreadBinding,
+        });
+        emitOrchestrationUpdate(orchestration.id);
+        return sendJson(response, existing ? 200 : 201, orchestrationView(orchestration.id));
+      }
+
+      const taskSessionTimelineRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/timeline$/);
+      if (taskSessionTimelineRoute) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        const id = decodeRouteSegment(taskSessionTimelineRoute[1], "Orchestration id");
+        const after = parseAfterCursor(url.searchParams, "GET /api/orchestrations/:id/timeline");
+        const orchestration = database.getTaskSessionOrchestration(id);
+        if (!orchestration) throw new ApiError(404, "ORCHESTRATION_NOT_FOUND", `Orchestration '${id}' does not exist`);
+        const messages = database.listTaskSessionMessages(id, after?.revision ?? 0);
+        const nextSequence = messages.length > 0
+          ? messages.at(-1).sequence
+          : after?.revision ?? 0;
+        return sendJson(response, 200, {
+          orchestrationId: id,
+          messages,
+          timeline: messages,
+          events: messages,
+          nextSequence,
+        });
+      }
+
+      const taskSessionReportAckRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/reports\/([^/]+)\/ack$/);
+      if (taskSessionReportAckRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/reports/:revision/ack");
+        const id = decodeRouteSegment(taskSessionReportAckRoute[1], "Orchestration id");
+        const revisionText = decodeRouteSegment(taskSessionReportAckRoute[2], "Result revision");
+        if (!/^\d+$/.test(revisionText) || !Number.isSafeInteger(Number(revisionText))) {
+          throw new ApiError(400, "INVALID_PATH", "Result revision is invalid");
+        }
+        const ack = parseTaskSessionAck(await readJson(request));
+        const result = database.acknowledgeTaskSessionReport(id, Number(revisionText), ack);
+        emitOrchestrationUpdate(id, result.ack);
+        return sendJson(response, 200, {
+          orchestration: result.orchestration,
+          result: result.result,
+          message: result.message,
+          ack: result.ack,
+        });
+      }
+
+      const taskSessionIntentConfirmRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/intent\/confirm$/);
+      if (taskSessionIntentConfirmRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/intent/confirm");
+        const id = decodeRouteSegment(taskSessionIntentConfirmRoute[1], "Orchestration id");
+        const orchestration = database.confirmTaskSessionIntent(
+          id,
+          parseTaskSessionConfirm(await readJson(request)),
+        );
+        emitOrchestrationUpdate(id);
+        return sendJson(response, 200, orchestrationView(id));
+      }
+
+      const taskSessionIntentRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/intent$/);
+      if (taskSessionIntentRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/intent");
+        const id = decodeRouteSegment(taskSessionIntentRoute[1], "Orchestration id");
+        const orchestration = database.saveTaskSessionIntent(
+          id,
+          parseTaskSessionIntent(await readJson(request)),
+        );
+        emitOrchestrationUpdate(id);
+        return sendJson(response, 200, orchestrationView(id));
+      }
+
+      const taskSessionDispatchRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/dispatch$/);
+      if (taskSessionDispatchRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/dispatch");
+        const id = decodeRouteSegment(taskSessionDispatchRoute[1], "Orchestration id");
+        const orchestration = database.dispatchTaskSessionOrchestration(
+          id,
+          parseTaskSessionDispatch(await readJson(request)),
+        );
+        emitOrchestrationUpdate(id);
+        return sendJson(response, 202, orchestrationView(id));
+      }
+
+      const taskSessionMessageRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/messages$/);
+      if (taskSessionMessageRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/messages");
+        const id = decodeRouteSegment(taskSessionMessageRoute[1], "Orchestration id");
+        const message = database.appendTaskSessionMessage(
+          id,
+          parseTaskSessionMessage(await readJson(request)),
+        );
+        emitOrchestrationUpdate(id, message);
+        return sendJson(response, 201, {
+          orchestration: database.getTaskSessionOrchestration(id),
+          message,
+        });
+      }
+
+      const taskSessionReportRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/reports$/);
+      if (taskSessionReportRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/reports");
+        const id = decodeRouteSegment(taskSessionReportRoute[1], "Orchestration id");
+        const report = database.createTaskSessionReport(
+          id,
+          parseTaskSessionReport(await readJson(request)),
+        );
+        emitOrchestrationUpdate(id, report.message);
+        return sendJson(response, report.duplicate ? 200 : 202, report);
+      }
+
+      const taskSessionReviewRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/review$/);
+      if (taskSessionReviewRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/review");
+        const id = decodeRouteSegment(taskSessionReviewRoute[1], "Orchestration id");
+        const review = database.saveTaskSessionReview(
+          id,
+          parseTaskSessionReview(await readJson(request)),
+        );
+        emitOrchestrationUpdate(id, review.message);
+        return sendJson(response, 200, review);
+      }
+
+      const taskSessionIntegrationRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/integrate$/);
+      if (taskSessionIntegrationRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/integrate");
+        const id = decodeRouteSegment(taskSessionIntegrationRoute[1], "Orchestration id");
+        const integration = database.saveTaskSessionIntegration(
+          id,
+          parseTaskSessionIntegration(await readJson(request)),
+        );
+        emitOrchestrationUpdate(id, integration.message);
+        return sendJson(response, 200, integration);
+      }
+
+      const taskSessionWritebackRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/jira-writeback$/);
+      if (taskSessionWritebackRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/jira-writeback");
+        const id = decodeRouteSegment(taskSessionWritebackRoute[1], "Orchestration id");
+        const writeback = database.saveTaskSessionWriteback(
+          id,
+          parseTaskSessionWriteback(await readJson(request)),
+        );
+        emitOrchestrationUpdate(id, writeback.message);
+        return sendJson(response, 200, {
+          ...writeback,
+          applied: false,
+          note: "Jira writeback is persisted as a preview; remote application is not enabled in P1",
+        });
+      }
+
+      const taskSessionCompleteRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)\/complete$/);
+      if (taskSessionCompleteRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/complete");
+        const id = decodeRouteSegment(taskSessionCompleteRoute[1], "Orchestration id");
+        const completed = database.completeTaskSessionOrchestration(
+          id,
+          parseTaskSessionComplete(await readJson(request)),
+        );
+        emitOrchestrationUpdate(id, completed.message);
+        return sendJson(response, 200, completed);
+      }
+
+      const taskSessionRoute = pathname.match(/^\/api\/orchestrations\/([^/]+)$/);
+      if (taskSessionRoute) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/orchestrations/:id");
+        const id = decodeRouteSegment(taskSessionRoute[1], "Orchestration id");
+        const view = orchestrationView(id);
+        if (!view) throw new ApiError(404, "ORCHESTRATION_NOT_FOUND", `Orchestration '${id}' does not exist`);
+        return sendJson(response, 200, view);
       }
 
       if (pathname === "/api/projects") {

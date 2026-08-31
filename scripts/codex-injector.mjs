@@ -1995,11 +1995,22 @@ async function startTaskConversationViaCdp(cdp, executionContextId, request) {
   const {
     codexHostId,
     instruction,
+    conversationRole,
+    parentThreadId,
     previousThreadId,
     projectless,
     targetRoot,
     title,
   } = request;
+  const normalizeThreadId = (value) => String(value ?? "").trim().replace(/^(?:local|cloud):/i, "");
+  const normalizedPreviousThreadId = normalizeThreadId(previousThreadId);
+  const normalizedParentThreadId = normalizeThreadId(parentThreadId);
+  if (
+    conversationRole === "child"
+    && (!normalizedParentThreadId || normalizedParentThreadId !== normalizedPreviousThreadId)
+  ) {
+    throw new Error("The worker session parent thread does not match the current Codex thread");
+  }
   const normalizeWorkspaceRoot = (value) => {
     const root = String(value || "").trim();
     if (!root) return "";
@@ -2013,6 +2024,8 @@ async function startTaskConversationViaCdp(cdp, executionContextId, request) {
   const normalizedTargetRoot = normalizeWorkspaceRoot(targetRoot);
   const deadline = Date.now() + 8_000;
   let submitted = false;
+  // 只把 thread/read 实际返回的 cwd 写入 identity，避免请求参数未经宿主确认就成为 worktree 证据。
+  let verifiedWorkspacePath = "";
   while (Date.now() < deadline) {
     const prepared = await cdp.send("Runtime.evaluate", {
       expression: `(() => {
@@ -2080,7 +2093,7 @@ async function startTaskConversationViaCdp(cdp, executionContextId, request) {
         returnByValue: true,
       });
       const threadId = typeof started.result.value === "string" ? started.result.value : "";
-      if (threadId && threadId !== previousThreadId) {
+      if (threadId && threadId !== normalizedPreviousThreadId) {
         discoveredThreadId = threadId;
         const readyDeadline = Date.now() + 10_000;
         let ready = false;
@@ -2101,6 +2114,9 @@ async function startTaskConversationViaCdp(cdp, executionContextId, request) {
                 || normalizeWorkspaceRoot(result.thread.cwd) === normalizedTargetRoot
               )
             ) {
+              verifiedWorkspacePath = typeof result.thread.cwd === "string"
+                ? result.thread.cwd
+                : "";
               ready = true;
               break;
             }
@@ -2150,7 +2166,7 @@ async function startTaskConversationViaCdp(cdp, executionContextId, request) {
               10_000,
             );
             if (result?.thread?.id === threadId && result.thread.name === title) {
-              return { threadId, title };
+              return { threadId, title, workspacePath: verifiedWorkspacePath };
             }
           } catch {}
           await new Promise((resolve) => setTimeout(resolve, 80));
@@ -2169,8 +2185,22 @@ async function startTaskConversationViaCdp(cdp, executionContextId, request) {
   }
 }
 
+function taskConversationOperationKey(request) {
+  const taskId = String(request?.taskId ?? "");
+  const orchestrationId = typeof request?.orchestrationId === "string"
+    ? request.orchestrationId.trim()
+    : "";
+  const conversationRole = request?.conversationRole === "parent" || request?.conversationRole === "child"
+    ? request.conversationRole
+    : "";
+  // 旧版调用没有编排字段，保留原 taskId key；新调用按编排和会话角色隔离并发操作。
+  if (!orchestrationId && !conversationRole) return taskId;
+  return JSON.stringify([taskId, orchestrationId, conversationRole]);
+}
+
 function getOrStartTaskConversation(cdp, executionContextId, request) {
-  const existing = taskConversationOperations.get(request.taskId);
+  const operationKey = taskConversationOperationKey(request);
+  const existing = taskConversationOperations.get(operationKey);
   if (existing) return existing.promise;
 
   const operation = { promise: null };
@@ -2178,10 +2208,10 @@ function getOrStartTaskConversation(cdp, executionContextId, request) {
     startTaskConversationViaCdp(cdp, executionContextId, request)
   ));
   operation.promise = promise;
-  taskConversationOperations.set(request.taskId, operation);
+  taskConversationOperations.set(operationKey, operation);
   const clearSettledOperation = () => {
-    if (taskConversationOperations.get(request.taskId) === operation) {
-      taskConversationOperations.delete(request.taskId);
+    if (taskConversationOperations.get(operationKey) === operation) {
+      taskConversationOperations.delete(operationKey);
     }
   };
   const retainCreatedOrUncertainFailure = (error) => {
@@ -2202,6 +2232,34 @@ function getOrStartTaskConversation(cdp, executionContextId, request) {
   return promise;
 }
 
+function taskConversationIdentity(request, result, targetIdentity = {}) {
+  const threadId = typeof result?.threadId === "string" ? result.threadId : "";
+  const targetId = typeof targetIdentity.targetId === "string"
+    ? targetIdentity.targetId
+    : null;
+  return {
+    threadId,
+    hostId: request.codexHostId,
+    projectId: request.projectless ? null : request.codexProjectId || null,
+    projectKind: request.projectless ? null : request.codexProjectKind || "local",
+    workspacePath: request.projectless
+      ? null
+      : result?.workspacePath || null,
+    // 当前宿主没有创建独立 BrowserWindow 的 API；targetId 只用于定位和后续恢复审计。
+    targetId,
+    windowId: targetId,
+    targetUrl: typeof targetIdentity.targetUrl === "string" ? targetIdentity.targetUrl : null,
+    targetTitle: typeof targetIdentity.targetTitle === "string" ? targetIdentity.targetTitle : null,
+    window: {
+      mode: "current-renderer",
+      kind: "renderer-target",
+      targetId,
+      independent: false,
+      reopen: "thread-route",
+    },
+  };
+}
+
 async function sendHostResponse(cdp, executionContextId, response) {
   await cdp.send("Runtime.evaluate", {
     expression: `window.postMessage({
@@ -2220,6 +2278,7 @@ function installTaskboardHostBinding(
   startupToken,
   onCodexAppServerNotification,
   onCodexAppServerReady,
+  targetIdentity,
 ) {
   let activeContextId = null;
   let installInFlight = null;
@@ -2274,7 +2333,15 @@ function installTaskboardHostBinding(
         })()
       ),
       startConversation: (request) => (
-        getOrStartTaskConversation(cdp, undefined, request)
+        getOrStartTaskConversation(cdp, undefined, request).then((result) => ({
+          ...result,
+          identity: taskConversationIdentity(request, result, targetIdentity),
+        }), (error) => {
+          if (error && typeof error === "object" && typeof error.threadId === "string") {
+            error.identity = taskConversationIdentity(request, error, targetIdentity);
+          }
+          throw error;
+        })
       ),
       sendResponse: (executionContextId, response) => (
         sendHostResponse(cdp, executionContextId, response)
@@ -2462,6 +2529,11 @@ async function injectTarget(
         startupToken,
         onCodexAppServerNotification,
         onCodexAppServerReady,
+        {
+          targetId: target.id,
+          targetUrl: target.url,
+          targetTitle: target.title,
+        },
       )
     : null;
   cdp.hostBridge = hostBridge;

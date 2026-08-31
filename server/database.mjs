@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -7,6 +7,63 @@ import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
+
+// 编排状态由 Taskboard 持久化，避免宿主窗口状态短暂变化时丢失业务阶段。
+export const TASK_SESSION_STATES = Object.freeze([
+  "unbound",
+  "intent_draft",
+  "intent_ready",
+  "dispatched",
+  "executing",
+  "waiting_for_user",
+  "reporting",
+  "result_ready",
+  "reviewing",
+  "writeback_pending",
+  "synced",
+  "blocked",
+  "integrated",
+  "done",
+]);
+const TASK_SESSION_LIFECYCLE_STATES = new Set([
+  "dispatched",
+  "executing",
+  "waiting_for_user",
+  "reporting",
+]);
+const TASK_SESSION_DISPATCH_STATES = new Set([
+  "dispatched",
+  "executing",
+  "waiting_for_user",
+]);
+const TASK_SESSION_INTENT_STATES = new Set([
+  "unbound",
+  "intent_draft",
+  "intent_ready",
+]);
+const TASK_SESSION_STATE_TRANSITIONS = Object.freeze({
+  unbound: new Set(["intent_draft"]),
+  intent_draft: new Set(["intent_ready"]),
+  intent_ready: new Set(["dispatched"]),
+  dispatched: new Set(["dispatched", "executing", "waiting_for_user"]),
+  executing: new Set(["executing", "waiting_for_user", "reporting"]),
+  waiting_for_user: new Set(["waiting_for_user", "executing", "reporting"]),
+  // 收到结果报告后由主会话自动进入检查阶段；检查结论仍通过 review API 写入。
+  reporting: new Set(["reporting", "reviewing"]),
+  result_ready: new Set(["result_ready", "executing", "reviewing"]),
+  reviewing: new Set(["reviewing", "writeback_pending", "executing", "blocked"]),
+  writeback_pending: new Set(["writeback_pending", "integrated", "synced", "blocked"]),
+  integrated: new Set(["integrated", "writeback_pending", "synced", "blocked", "done"]),
+  synced: new Set(["synced", "integrated", "writeback_pending", "blocked", "done"]),
+  blocked: new Set(["blocked", "executing", "integrated"]),
+  done: new Set(),
+});
+const TASK_SESSION_STATUS_ACTOR = Object.freeze({
+  type: "agent",
+  id: "task-session",
+  name: "Task session",
+  avatarUrl: null,
+});
 
 export class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -465,6 +522,294 @@ function aiChatEventFromRow(row) {
   };
 }
 
+function parseTaskSessionJson(value, fallback = null) {
+  if (value === null || value === undefined) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function taskSessionArray(value) {
+  const parsed = parseTaskSessionJson(value, []);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function taskSessionRevisionArray(value) {
+  const parsed = parseTaskSessionJson(value, []);
+  if (Array.isArray(parsed)) return parsed;
+  return parsed && typeof parsed === "object" ? [parsed] : [];
+}
+
+function taskSessionOrchestrationFromRow(row) {
+  const intentRevisions = taskSessionArray(row.intent_json);
+  const resultRevisions = taskSessionArray(row.result_json);
+  const currentIntent = intentRevisions.at(-1) ?? null;
+  const currentResult = resultRevisions.at(-1) ?? null;
+  const reviewValue = parseTaskSessionJson(row.review_json);
+  const writebackValue = parseTaskSessionJson(row.writeback_json);
+  const integrationValue = parseTaskSessionJson(row.integration_json);
+  const reviewRevisions = Array.isArray(reviewValue)
+    ? reviewValue
+    : reviewValue ? [reviewValue] : [];
+  const writebackRevisions = Array.isArray(writebackValue)
+    ? writebackValue
+    : writebackValue ? [writebackValue] : [];
+  const integrationRevisions = Array.isArray(integrationValue)
+    ? integrationValue
+    : integrationValue ? [integrationValue] : [];
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    state: row.state,
+    parentThreadBinding: parseTaskSessionJson(row.parent_thread_json),
+    childThreadBinding: parseTaskSessionJson(row.child_thread_json),
+    childWindow: parseTaskSessionJson(row.child_window_json),
+    runtime: parseTaskSessionJson(row.runtime_json),
+    worktree: parseTaskSessionJson(row.worktree_json),
+    sourceSnapshot: parseTaskSessionJson(row.source_snapshot_json),
+    intentDigest: row.intent_digest,
+    intentVersion: currentIntent?.revision ?? 0,
+    confirmedIntentVersion: row.confirmed_intent_version ?? null,
+    confirmedAt: row.confirmed_at ?? null,
+    intent: currentIntent,
+    intentRevisions,
+    currentResultRevision: row.current_result_revision,
+    result: currentResult,
+    resultRevisions,
+    review: reviewRevisions.at(-1) ?? null,
+    reviewRevisions,
+    writeback: writebackRevisions.at(-1) ?? null,
+    writebackRevisions,
+    integration: integrationRevisions.at(-1) ?? null,
+    integrationRevisions,
+    version: row.version,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function taskSessionMessageFromRow(row) {
+  return {
+    id: row.id,
+    orchestrationId: row.orchestration_id,
+    direction: row.direction,
+    type: row.type,
+    idempotencyKey: row.idempotency_key,
+    state: row.state ?? null,
+    payload: parseTaskSessionJson(row.payload_json, {}),
+    deliveryState: row.delivery_state,
+    sequence: row.sequence,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function taskSessionDigest(value) {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function taskSessionSourceProjection(snapshot, { stripWorkflowFields = true } = {}) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return snapshot;
+  const projection = { ...snapshot, fetchedAt: null };
+  if (projection.task && typeof projection.task === "object" && !Array.isArray(projection.task)) {
+    // 编排会自动推动本地任务状态并递增版本；这些字段不是 Jira 来源变化，不能让自身流程把意图判旧。
+    projection.task = { ...projection.task };
+    if (stripWorkflowFields) {
+      delete projection.task.status;
+      delete projection.task.version;
+      delete projection.task.updatedAt;
+    }
+  }
+  return projection;
+}
+
+function taskSessionSourceDigest(snapshot) {
+  return taskSessionDigest(taskSessionSourceProjection(snapshot));
+}
+
+// 旧版本 digest 包含本地 workflow 字段；保留旧投影只用于校验已持久化的快照。
+function taskSessionLegacySourceDigest(snapshot) {
+  return taskSessionDigest(taskSessionSourceProjection(snapshot, { stripWorkflowFields: false }));
+}
+
+function taskSessionSourceDigestMatches(orchestration, source) {
+  if (!orchestration.intentDigest || !source) return false;
+  if (source.digest === orchestration.intentDigest) return true;
+  if (!orchestration.sourceSnapshot) return false;
+  // 旧记录以捕获时的 volatile 字段计算 digest；稳定投影一致时允许继续使用该记录。
+  return taskSessionLegacySourceDigest(orchestration.sourceSnapshot) === orchestration.intentDigest
+    && taskSessionSourceDigest(orchestration.sourceSnapshot) === source.digest;
+}
+
+function taskSessionPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function taskSessionSourceDigestCandidates(snapshot) {
+  try {
+    return new Set([
+      taskSessionSourceDigest(snapshot),
+      taskSessionLegacySourceDigest(snapshot),
+    ]);
+  } catch {
+    throw new ApiError(400, "INVALID_FIELD", "sourceSnapshot cannot be serialized");
+  }
+}
+
+// 保存来源快照时同时校验摘要和当前本地 Jira 投影；旧记录的 digest 仍允许读取和续接。
+function taskSessionValidatedSourceCapture(snapshot, suppliedDigest, currentSource) {
+  if (!taskSessionPlainObject(snapshot)) {
+    throw new ApiError(400, "INVALID_FIELD", "sourceSnapshot must be an object");
+  }
+  const candidates = taskSessionSourceDigestCandidates(snapshot);
+  const stableDigest = [...candidates][0];
+  let captureDigest = stableDigest;
+  if (suppliedDigest !== undefined && suppliedDigest !== null) {
+    if (typeof suppliedDigest !== "string" || suppliedDigest.trim().length === 0) {
+      throw new ApiError(400, "INVALID_FIELD", "captureDigest must be a non-empty string");
+    }
+    captureDigest = suppliedDigest.trim();
+    if (!candidates.has(captureDigest)) {
+      throw new ApiError(
+        400,
+        "INVALID_FIELD",
+        "captureDigest does not match sourceSnapshot",
+      );
+    }
+  }
+  if (currentSource && stableDigest !== currentSource.digest) {
+    throw new ApiError(
+      409,
+      "INTENT_STALE",
+      "The Jira source snapshot changed; refresh and confirm the intent again",
+      {
+        intentDigest: captureDigest,
+        currentDigest: currentSource.digest,
+      },
+    );
+  }
+  return { snapshot, digest: captureDigest, stableDigest };
+}
+
+function taskSessionValidatedCurrentCapture(currentSource, suppliedDigest) {
+  if (!currentSource?.snapshot) {
+    throw new ApiError(409, "INTENT_STALE", "The Jira source snapshot is unavailable");
+  }
+  return taskSessionValidatedSourceCapture(currentSource.snapshot, suppliedDigest, currentSource);
+}
+
+function taskSessionPayloadMatches(existing, incoming) {
+  if (!existing || typeof existing !== "object" || !incoming || typeof incoming !== "object") return false;
+  // 结果落库时会补齐 envelope 字段；重试时用同一 envelope 重建候选值，再比较完整 payload，避免子集重试被当成幂等成功。
+  const candidate = {
+    ...incoming,
+    version: incoming.version ?? existing.version ?? "task-result.v1",
+    intentVersion: existing.intentVersion,
+    resultRevision: existing.resultRevision,
+    idempotencyKey: existing.idempotencyKey,
+    createdAt: existing.createdAt,
+  };
+  return taskSessionJsonEqual(existing, candidate);
+}
+
+function taskSessionJsonEqual(left, right) {
+  if (Object.is(left, right)) return true;
+  if (left === null || right === null || typeof left !== typeof right) return false;
+  if (typeof left !== "object") return false;
+  if (Array.isArray(left) !== Array.isArray(right)) return false;
+  if (Array.isArray(left)) {
+    return left.length === right.length && left.every((value, index) => taskSessionJsonEqual(value, right[index]));
+  }
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every((key) => (
+    Object.hasOwn(right, key) && taskSessionJsonEqual(left[key], right[key])
+  ));
+}
+
+// 幂等重试必须复用同一消息 envelope；省略字段按原有默认值兼容，显式冲突则拒绝。
+function taskSessionMessageIdempotencyMatches(existingRow, input) {
+  const existing = taskSessionMessageFromRow(existingRow);
+  if (input.direction !== undefined && input.direction !== existing.direction) return false;
+  if (input.type !== undefined && input.type !== existing.type) return false;
+  if (input.deliveryState !== undefined && input.deliveryState !== existing.deliveryState) return false;
+  // 顶层 state 不在 payload 中时也必须参与幂等比较，否则同一 key 的重试
+  // 可以悄悄携带另一条 lifecycle 状态并复用旧消息。
+  if (input.state !== undefined && input.state !== existing.state) return false;
+  return taskSessionJsonEqual(existing.payload, input.payload ?? {});
+}
+
+function taskSessionJsonThreadId(value) {
+  const parsed = parseTaskSessionJson(value);
+  return parsed && typeof parsed.threadId === "string" ? parsed.threadId : null;
+}
+
+const TASK_SESSION_BINDING_IDENTITY_FIELDS = Object.freeze([
+  "codexProjectId",
+  "codexProjectKind",
+  "codexHostId",
+  "workspacePath",
+]);
+
+function taskSessionBindingIdentityConflicts(stored, incoming) {
+  if (!stored || typeof stored !== "object" || !incoming || typeof incoming !== "object") return [];
+  return TASK_SESSION_BINDING_IDENTITY_FIELDS.filter((field) => (
+    Object.hasOwn(stored, field)
+    && stored[field] !== undefined
+    && Object.hasOwn(incoming, field)
+    && incoming[field] !== undefined
+    && stored[field] !== incoming[field]
+  ));
+}
+
+function taskSessionBindingWithMissingIdentity(stored, incoming) {
+  if (!incoming || typeof incoming !== "object") return stored;
+  if (!stored || typeof stored !== "object") return { ...incoming };
+  const merged = { ...stored };
+  for (const field of TASK_SESSION_BINDING_IDENTITY_FIELDS) {
+    if (
+      (!Object.hasOwn(merged, field) || merged[field] === undefined)
+      && Object.hasOwn(incoming, field)
+      && incoming[field] !== undefined
+    ) {
+      merged[field] = incoming[field];
+    }
+  }
+  return merged;
+}
+
+function taskSessionObjectConflicts(stored, incoming) {
+  if (incoming === undefined || incoming === null || stored === undefined || stored === null) return [];
+  if (
+    typeof stored !== "object"
+    || Array.isArray(stored)
+    || typeof incoming !== "object"
+    || Array.isArray(incoming)
+  ) {
+    return JSON.stringify(stored) === JSON.stringify(incoming) ? [] : ["$"];
+  }
+  return Object.keys(incoming).filter((key) => (
+    Object.hasOwn(stored, key)
+    && JSON.stringify(stored[key]) !== JSON.stringify(incoming[key])
+  ));
+}
+
+function taskSessionObjectWithMissingFields(stored, incoming) {
+  if (incoming === undefined) return stored;
+  if (stored === undefined || stored === null) return incoming;
+  if (incoming === null) return stored;
+  if (
+    typeof stored !== "object"
+    || Array.isArray(stored)
+    || typeof incoming !== "object"
+    || Array.isArray(incoming)
+  ) return stored;
+  return { ...stored, ...Object.fromEntries(Object.entries(incoming).filter(([key]) => !Object.hasOwn(stored, key))) };
+}
+
 function projectPrefix(project) {
   const idPrefix = project.id.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 12) || "TASK";
   const existingPrefix = project.first_identifier?.replace(/-\d+$/, "");
@@ -702,7 +1047,80 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS ai_chat_events_thread_created
         ON ai_chat_events(thread_id, created_at, id);
 
+      CREATE TABLE IF NOT EXISTS task_session_orchestrations (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        state TEXT NOT NULL CHECK (state IN (
+          'unbound', 'intent_draft', 'intent_ready', 'dispatched', 'executing',
+          'waiting_for_user', 'reporting', 'result_ready', 'reviewing',
+          'writeback_pending', 'synced', 'blocked', 'integrated', 'done'
+        )),
+        parent_thread_json TEXT,
+        child_thread_json TEXT,
+        child_window_json TEXT,
+        runtime_json TEXT,
+        worktree_json TEXT,
+        intent_json TEXT NOT NULL DEFAULT '[]',
+        source_snapshot_json TEXT,
+        intent_digest TEXT,
+        current_result_revision INTEGER NOT NULL DEFAULT 0 CHECK (current_result_revision >= 0),
+        result_json TEXT NOT NULL DEFAULT '[]',
+        review_json TEXT,
+        writeback_json TEXT,
+        integration_json TEXT,
+        confirmed_intent_version INTEGER,
+        confirmed_at TEXT,
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS task_session_orchestrations_one_active
+        ON task_session_orchestrations(task_id)
+        WHERE state != 'done';
+
+      CREATE INDEX IF NOT EXISTS task_session_orchestrations_task_updated
+        ON task_session_orchestrations(task_id, updated_at DESC, id);
+
+      CREATE TABLE IF NOT EXISTS task_session_messages (
+        id TEXT PRIMARY KEY,
+        orchestration_id TEXT NOT NULL REFERENCES task_session_orchestrations(id) ON DELETE CASCADE,
+        direction TEXT NOT NULL CHECK (direction IN ('parent_to_child', 'child_to_parent', 'internal')),
+        type TEXT NOT NULL,
+        idempotency_key TEXT,
+        state TEXT,
+        payload_json TEXT NOT NULL,
+        delivery_state TEXT NOT NULL CHECK (
+          delivery_state IN ('pending', 'sent', 'acknowledged', 'failed', 'cancelled')
+        ),
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS task_session_messages_orchestration_sequence
+        ON task_session_messages(orchestration_id, sequence);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS task_session_messages_idempotency
+        ON task_session_messages(orchestration_id, idempotency_key)
+        WHERE idempotency_key IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS task_session_messages_orchestration_created
+        ON task_session_messages(orchestration_id, sequence, created_at);
+
     `);
+
+    const orchestrationColumns = this.database.prepare("PRAGMA table_info(task_session_orchestrations)").all();
+    if (!orchestrationColumns.some((column) => column.name === "integration_json")) {
+      this.database.exec("ALTER TABLE task_session_orchestrations ADD COLUMN integration_json TEXT");
+    }
+
+    // 旧版本没有保存消息顶层 lifecycle state；nullable 列让旧记录可继续读取，
+    // 同时为显式状态的幂等重试保留不可歧义的 envelope 证据。
+    const taskSessionMessageColumns = this.database.prepare("PRAGMA table_info(task_session_messages)").all();
+    if (!taskSessionMessageColumns.some((column) => column.name === "state")) {
+      this.database.exec("ALTER TABLE task_session_messages ADD COLUMN state TEXT");
+    }
 
     const projectColumns = this.database.prepare("PRAGMA table_info(projects)").all();
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
@@ -2083,6 +2501,1874 @@ export class TaskboardDatabase {
       this.database.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  // 编排记录是主子会话关系的持久主键，窗口关闭后仍可据此恢复。
+  getTaskSessionOrchestration(id) {
+    const row = this.database.prepare(`
+      SELECT * FROM task_session_orchestrations WHERE id = ?
+    `).get(id);
+    return row ? taskSessionOrchestrationFromRow(row) : null;
+  }
+
+  // 读取任务当前唯一可继续的编排；done 记录保留作审计但不阻塞新编排。
+  getActiveTaskSessionOrchestration(taskId) {
+    const row = this.database.prepare(`
+      SELECT * FROM task_session_orchestrations
+      WHERE task_id = ? AND state != 'done'
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 1
+    `).get(taskId);
+    return row ? taskSessionOrchestrationFromRow(row) : null;
+  }
+
+  // 返回本地已同步的任务、评论和附件快照；digest 不包含抓取时间，便于稳定比较。
+  getTaskSessionSourceSnapshot(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) {
+      throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+    }
+    const sourceRow = this.database.prepare(`
+      SELECT jira_remote_status_id FROM tasks WHERE id = ?
+    `).get(task.id);
+    const comments = this.listComments(task.id).map((comment) => ({
+      id: comment.id,
+      body: comment.body,
+      authorId: comment.authorId,
+      authorName: comment.authorName,
+      version: comment.version,
+      createdAt: comment.createdAt,
+      updatedAt: comment.updatedAt,
+      attachmentIds: comment.attachments.map((attachment) => attachment.id),
+    }));
+    const attachments = this.listAttachments(task.id).map((attachment) => ({
+      id: attachment.id,
+      filename: attachment.filename,
+      contentType: attachment.contentType,
+      size: attachment.size,
+      commentId: attachment.commentId,
+      createdAt: attachment.createdAt,
+    }));
+    const snapshot = {
+      originId: task.externalOrigin,
+      issueKey: task.externalKey ?? task.identifier,
+      taskId: task.id,
+      fetchedAt: now(),
+      task: {
+        identifier: task.identifier,
+        title: task.title,
+        description: task.description,
+        status: task.status,
+        priority: task.priority,
+        labels: task.labels,
+        version: task.version,
+        updatedAt: task.updatedAt,
+        jiraRemoteStatusId: sourceRow?.jira_remote_status_id ?? null,
+      },
+      comments,
+      attachments,
+    };
+    return { snapshot, digest: taskSessionSourceDigest(snapshot) };
+  }
+
+  // 创建或复用任务的 active 编排，并在同一事务中记录初始快照事件。
+  createTaskSessionOrchestration(taskId, input = {}) {
+    const task = this.#requireTask(taskId);
+    const timestamp = input.createdAt ?? now();
+    const suppliedSourceSnapshot = input.sourceSnapshot;
+    const suppliedCaptureDigest = input.intentDigest ?? input.captureDigest;
+    const sourceAtStart = this.getTaskSessionSourceSnapshot(task.id);
+    const source = suppliedSourceSnapshot === undefined || suppliedSourceSnapshot === null
+      ? taskSessionValidatedCurrentCapture(sourceAtStart, suppliedCaptureDigest)
+      : taskSessionValidatedSourceCapture(
+        suppliedSourceSnapshot,
+        suppliedCaptureDigest,
+        sourceAtStart,
+      );
+    const parentBinding = input.parentThreadBinding ?? input.parentBinding ?? null;
+    const state = input.state
+      ?? (parentBinding ? "intent_draft" : "unbound");
+    this.#assertTaskSessionState(state);
+    if (!(state === "unbound" || state === "intent_draft")) {
+      throw new ApiError(
+        409,
+        "INVALID_STATE_TRANSITION",
+        "A new orchestration must start unbound or with an intent draft",
+        { state },
+      );
+    }
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.database.prepare(`
+        SELECT * FROM task_session_orchestrations
+        WHERE task_id = ? AND state != 'done'
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+      `).get(task.id);
+      if (existing) {
+        if (
+          existing.parent_thread_json
+          && parentBinding?.threadId
+          && taskSessionJsonThreadId(existing.parent_thread_json) !== parentBinding.threadId
+        ) {
+          throw new ApiError(
+            409,
+            "PARENT_THREAD_MISMATCH",
+            "This task orchestration is already bound to a different parent thread",
+            { parentThreadId: taskSessionJsonThreadId(existing.parent_thread_json) },
+          );
+        }
+        if (
+          existing.parent_thread_json
+          && parentBinding?.threadId
+          && taskSessionJsonThreadId(existing.parent_thread_json) === parentBinding.threadId
+        ) {
+          // 同一 thread 的重试可只带 ID；完整身份只补齐存量缺失字段，已存在字段仍按冲突校验。
+          const existingOrchestration = taskSessionOrchestrationFromRow(existing);
+          this.#assertTaskSessionBinding(
+            existingOrchestration,
+            { parentThreadBinding: parentBinding },
+          );
+          const mergedParentBinding = taskSessionBindingWithMissingIdentity(
+            existingOrchestration.parentThreadBinding,
+            parentBinding,
+          );
+          const parentBindingEnriched = JSON.stringify(mergedParentBinding)
+            !== JSON.stringify(existingOrchestration.parentThreadBinding);
+          if (parentBindingEnriched) {
+            const updatedAt = input.updatedAt ?? timestamp;
+            this.database.prepare(`
+              UPDATE task_session_orchestrations
+              SET parent_thread_json = ?, version = version + 1, updated_at = ?
+              WHERE id = ?
+            `).run(JSON.stringify(mergedParentBinding), updatedAt, existing.id);
+            this.#appendTaskSessionMessageInTransaction({
+              id: existing.id,
+              direction: "internal",
+              type: "parent_bound",
+              idempotencyKey: `parent-bound:${existing.id}:${existing.version + 1}`,
+              payload: {
+                parentThreadBinding: mergedParentBinding,
+                state: existing.state,
+              },
+              deliveryState: "acknowledged",
+              createdAt: timestamp,
+            });
+            this.database.exec("COMMIT");
+            return this.getTaskSessionOrchestration(existing.id);
+          }
+        }
+        // 首次请求可能先落下 unbound 记录，等宿主完成主 thread handshake 后再补绑；
+        // 绑定与状态变更必须和 parent_bound 审计事件处于同一事务，避免留下半条关系。
+        if (!existing.parent_thread_json && parentBinding) {
+          const parentConflict = this.database.prepare(`
+            SELECT id FROM task_session_orchestrations
+            WHERE state != 'done'
+              AND json_extract(parent_thread_json, '$.threadId') = ?
+              AND id != ?
+            LIMIT 1
+          `).get(parentBinding.threadId, existing.id);
+          if (parentConflict) {
+            throw new ApiError(
+              409,
+              "PARENT_THREAD_ALREADY_BOUND",
+              "A parent thread can only manage one active task orchestration",
+              { orchestrationId: parentConflict.id },
+            );
+          }
+          const existingIntent = taskSessionArray(existing.intent_json);
+          const nextState = existing.state === "unbound" && existingIntent.length > 0
+            ? "intent_draft"
+            : existing.state;
+          const updatedAt = input.updatedAt ?? timestamp;
+          this.database.prepare(`
+            UPDATE task_session_orchestrations
+            SET state = ?, parent_thread_json = ?, version = version + 1, updated_at = ?
+            WHERE id = ?
+          `).run(nextState, JSON.stringify(parentBinding), updatedAt, existing.id);
+          this.#appendTaskSessionMessageInTransaction({
+            id: existing.id,
+            direction: "internal",
+            type: "parent_bound",
+            idempotencyKey: `parent-bound:${existing.id}:${existing.version + 1}`,
+            payload: { parentThreadBinding: parentBinding, state: nextState },
+            deliveryState: "acknowledged",
+            createdAt: timestamp,
+          });
+          this.database.exec("COMMIT");
+          return this.getTaskSessionOrchestration(existing.id);
+        }
+        this.database.exec("COMMIT");
+        return taskSessionOrchestrationFromRow(existing);
+      }
+      if (parentBinding?.threadId) {
+        const parentConflict = this.database.prepare(`
+          SELECT id FROM task_session_orchestrations
+          WHERE state != 'done'
+            AND json_extract(parent_thread_json, '$.threadId') = ?
+          LIMIT 1
+        `).get(parentBinding.threadId);
+        if (parentConflict) {
+          throw new ApiError(
+            409,
+            "PARENT_THREAD_ALREADY_BOUND",
+            "A parent thread can only manage one active task orchestration",
+            { orchestrationId: parentConflict.id },
+          );
+        }
+      }
+      // 创建前的快照可能在等待事务期间变化；只把锁内重新验证过的投影写入 active 记录。
+      const sourceAtCommit = this.getTaskSessionSourceSnapshot(task.id);
+      const committedSource = suppliedSourceSnapshot === undefined || suppliedSourceSnapshot === null
+        ? taskSessionValidatedCurrentCapture(sourceAtCommit, suppliedCaptureDigest)
+        : taskSessionValidatedSourceCapture(
+          suppliedSourceSnapshot,
+          suppliedCaptureDigest,
+          sourceAtCommit,
+        );
+      const intent = input.intent
+        ? this.#taskSessionIntentRevision(input.intent, 1, committedSource.digest, timestamp)
+        : null;
+      const id = input.id ?? randomUUID();
+      this.database.prepare(`
+        INSERT INTO task_session_orchestrations (
+          id, task_id, state, parent_thread_json, child_thread_json, child_window_json,
+          runtime_json, worktree_json, intent_json, source_snapshot_json, intent_digest,
+          current_result_revision, result_json, review_json, writeback_json,
+          confirmed_intent_version, confirmed_at, version, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, 0, '[]', NULL, NULL, NULL, NULL, 1, ?, ?)
+      `).run(
+        id,
+        task.id,
+        state,
+        parentBinding ? JSON.stringify(parentBinding) : null,
+        input.runtime === undefined ? null : JSON.stringify(input.runtime),
+        input.worktree === undefined ? null : JSON.stringify(input.worktree),
+        intent ? JSON.stringify([intent]) : "[]",
+        JSON.stringify(committedSource.snapshot),
+        committedSource.digest,
+        timestamp,
+        input.updatedAt ?? timestamp,
+      );
+      this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: "internal",
+        type: "orchestration_created",
+        idempotencyKey: `orchestration:${id}`,
+        payload: {
+          state,
+          parentThreadBinding: parentBinding,
+          intentVersion: intent?.revision ?? 0,
+          captureDigest: committedSource.digest,
+        },
+        deliveryState: "acknowledged",
+        createdAt: timestamp,
+      });
+      if (intent) {
+        this.#appendTaskSessionMessageInTransaction({
+          id,
+          direction: "internal",
+          type: "snapshot_captured",
+          idempotencyKey: `snapshot:${id}:${committedSource.digest}`,
+          payload: { captureDigest: committedSource.digest, fetchedAt: committedSource.snapshot.fetchedAt },
+          deliveryState: "acknowledged",
+          createdAt: timestamp,
+        });
+      }
+      this.database.exec("COMMIT");
+      return this.getTaskSessionOrchestration(id);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      if (
+        String(error?.message).includes("task_session_orchestrations_one_active")
+        || /UNIQUE constraint failed: task_session_orchestrations\.task_id/.test(String(error?.message))
+      ) {
+        const active = this.getActiveTaskSessionOrchestration(task.id);
+        if (!active) throw error;
+        if (parentBinding?.threadId && active.parentThreadBinding?.threadId) {
+          if (active.parentThreadBinding.threadId !== parentBinding.threadId) {
+            throw new ApiError(
+              409,
+              "PARENT_THREAD_MISMATCH",
+              "This task orchestration is already bound to a different parent thread",
+              { parentThreadId: active.parentThreadBinding.threadId },
+            );
+          }
+          // 唯一索引冲突后的重试重新走 active 分支，才能补齐竞争请求遗漏的
+          // project/host/workspace 身份；父 thread 不一致时不能借此覆盖已有关系。
+          this.#assertTaskSessionBinding(active, { parentThreadBinding: parentBinding });
+          return this.createTaskSessionOrchestration(task.id, input);
+        } else if (parentBinding?.threadId && !active.parentThreadBinding) {
+          // 竞争请求可能先提交 unbound 记录；重新走 active 分支以原子补绑 parent。
+          return this.createTaskSessionOrchestration(task.id, input);
+        }
+        return active;
+      }
+      throw error;
+    }
+  }
+
+  // 保存新的不可变意图版本；旧版本仍保留，便于结果与来源快照审计。
+  saveTaskSessionIntent(id, input = {}) {
+    const current = this.#requireTaskSessionOrchestration(id);
+    this.#assertTaskSessionMutable(current);
+    // 已绑定编排只能由对应主会话修改；尚未完成 handshake 的 unbound 记录保留无参兼容。
+    this.#assertTaskSessionBinding(current, input, {
+      requireParent: Boolean(current.parentThreadBinding?.threadId),
+    });
+    if (!TASK_SESSION_INTENT_STATES.has(current.state)) {
+      throw new ApiError(
+        409,
+        "INVALID_STATE_TRANSITION",
+        "An intent can only be saved before the task session is dispatched",
+        { state: current.state },
+      );
+    }
+    const timestamp = input.createdAt ?? now();
+    const suppliedSourceSnapshot = input.sourceSnapshot;
+    const hasSuppliedSourceSnapshot = suppliedSourceSnapshot !== undefined && suppliedSourceSnapshot !== null;
+    const suppliedCaptureDigest = input.captureDigest ?? input.intentDigest;
+    // 尽早拒绝明显格式错误；事务内还会基于锁内读取再次校验摘要和来源新鲜度。
+    if (hasSuppliedSourceSnapshot && !taskSessionPlainObject(suppliedSourceSnapshot)) {
+      throw new ApiError(400, "INVALID_FIELD", "sourceSnapshot must be an object");
+    }
+    if (
+      suppliedCaptureDigest !== undefined
+      && suppliedCaptureDigest !== null
+      && (typeof suppliedCaptureDigest !== "string" || suppliedCaptureDigest.trim().length === 0)
+    ) {
+      throw new ApiError(400, "INVALID_FIELD", "captureDigest must be a non-empty string");
+    }
+    const revisions = current.intentRevisions;
+    const requestedRevision = input.revision ?? input.intentVersion;
+    const nextRevision = revisions.length + 1;
+    if (requestedRevision !== undefined && requestedRevision !== nextRevision) {
+      throw new ApiError(
+        409,
+        "INTENT_VERSION_CONFLICT",
+        "Intent revisions must be appended in order",
+        { expectedVersion: nextRevision, actualVersion: requestedRevision },
+      );
+    }
+    const intentInput = input.intent ?? input;
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#requireTaskSessionRow(id);
+      const storedRevisions = taskSessionArray(row.intent_json);
+      const rowOrchestration = taskSessionOrchestrationFromRow(row);
+      this.#assertTaskSessionBinding(rowOrchestration, input, {
+        requireParent: Boolean(rowOrchestration.parentThreadBinding?.threadId),
+      });
+      if (!TASK_SESSION_INTENT_STATES.has(row.state)) {
+        throw new ApiError(
+          409,
+          "INVALID_STATE_TRANSITION",
+          "An intent can only be saved before the task session is dispatched",
+          { state: row.state },
+        );
+      }
+      if (row.version !== current.version) {
+        throw new ApiError(
+          409,
+          "VERSION_CONFLICT",
+          "Orchestration changed by another client",
+          { expectedVersion: current.version, actualVersion: row.version },
+        );
+      }
+      if (storedRevisions.length + 1 !== nextRevision) {
+        throw new ApiError(
+          409,
+          "VERSION_CONFLICT",
+          "Orchestration changed by another client",
+          { expectedVersion: current.version, actualVersion: row.version },
+        );
+      }
+      // 在同一写锁内重新抓取来源，避免快照校验与意图落库之间出现 TOCTOU 窗口。
+      const currentSource = this.getTaskSessionSourceSnapshot(row.task_id);
+      const capturedSource = hasSuppliedSourceSnapshot
+        ? taskSessionValidatedSourceCapture(
+          suppliedSourceSnapshot,
+          suppliedCaptureDigest,
+          currentSource,
+        )
+        : taskSessionValidatedCurrentCapture(currentSource, suppliedCaptureDigest);
+      const revision = this.#taskSessionIntentRevision(
+        intentInput,
+        nextRevision,
+        capturedSource.digest,
+        timestamp,
+      );
+      storedRevisions.push(revision);
+      const updatedAt = input.updatedAt ?? timestamp;
+      this.database.prepare(`
+        UPDATE task_session_orchestrations
+        SET state = 'intent_draft', intent_json = ?, source_snapshot_json = ?, intent_digest = ?,
+            confirmed_intent_version = NULL, confirmed_at = NULL,
+            version = version + 1, updated_at = ?
+        WHERE id = ?
+      `).run(
+        JSON.stringify(storedRevisions),
+        JSON.stringify(capturedSource.snapshot),
+        capturedSource.digest,
+        updatedAt,
+        id,
+      );
+      this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: "parent_to_child",
+        type: "intent_revision",
+        idempotencyKey: `intent:${id}:${nextRevision}`,
+        payload: { intentVersion: nextRevision, captureDigest: capturedSource.digest, intent: revision },
+        deliveryState: "acknowledged",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return this.getTaskSessionOrchestration(id);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 在重新比较本地快照后确认意图，防止基于过期 Jira 内容派发任务。
+  confirmTaskSessionIntent(id, input = {}) {
+    const current = this.#requireTaskSessionOrchestration(id);
+    this.#assertTaskSessionMutable(current);
+    // 确认是主会话权限动作；仅未绑定的握手记录允许暂时省略 caller identity。
+    this.#assertTaskSessionBinding(current, input, {
+      requireParent: Boolean(current.parentThreadBinding?.threadId),
+    });
+    if (!(current.state === "unbound" || current.state === "intent_draft" || current.state === "intent_ready")) {
+      throw new ApiError(
+        409,
+        "INVALID_STATE_TRANSITION",
+        "Only an unbound or draft intent can be confirmed",
+        { state: current.state },
+      );
+    }
+    const expectedRevision = input.intentVersion ?? input.revision ?? current.intentVersion;
+    if (current.intentVersion < 1 || !current.intent) {
+      throw new ApiError(409, "INTENT_NOT_READY", "Save an intent before confirming it");
+    }
+    if (expectedRevision !== current.intentVersion) {
+      throw new ApiError(
+        409,
+        "INTENT_VERSION_CONFLICT",
+        "The requested intent revision is not current",
+        { expectedVersion: current.intentVersion, actualVersion: expectedRevision },
+      );
+    }
+    const source = this.getTaskSessionSourceSnapshot(current.taskId);
+    const expectedDigest = input.captureDigest ?? input.intentDigest ?? current.intentDigest;
+    if (!expectedDigest || expectedDigest !== current.intentDigest || !taskSessionSourceDigestMatches(current, source)) {
+      throw new ApiError(
+        409,
+        "INTENT_STALE",
+        "The Jira source snapshot changed; refresh and confirm the intent again",
+        {
+          intentDigest: current.intentDigest,
+          currentDigest: source.digest,
+          intentVersion: current.intentVersion,
+        },
+      );
+    }
+    const openQuestions = Array.isArray(current.intent?.openQuestions)
+      ? current.intent.openQuestions.filter((question) => String(question).trim())
+      : [];
+    // 未解决的问题必须回到主会话处理；任何调用参数都不能跳过意图确认边界。
+    if (openQuestions.length > 0) {
+      throw new ApiError(
+        409,
+        "INTENT_OPEN_QUESTIONS",
+        "Resolve open questions before dispatching the task session",
+        { openQuestions },
+      );
+    }
+
+    const timestamp = input.confirmedAt ?? now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#requireTaskSessionRow(id);
+      const rowOrchestration = taskSessionOrchestrationFromRow(row);
+      this.#assertTaskSessionBinding(rowOrchestration, input, {
+        requireParent: Boolean(rowOrchestration.parentThreadBinding?.threadId),
+      });
+      if (row.state === "done") {
+        throw new ApiError(409, "ORCHESTRATION_COMPLETED", "Completed orchestrations are immutable");
+      }
+      if (!(row.state === "unbound" || row.state === "intent_draft" || row.state === "intent_ready")) {
+        throw new ApiError(
+          409,
+          "INVALID_STATE_TRANSITION",
+          "Only an unbound or draft intent can be confirmed",
+          { state: row.state },
+        );
+      }
+      if (row.version !== current.version) {
+        throw new ApiError(
+          409,
+          "VERSION_CONFLICT",
+          "Orchestration changed by another client",
+          { expectedVersion: current.version, actualVersion: row.version },
+        );
+      }
+      // 锁内再次读取 Jira 投影，防止来源在预检查后变更再被确认。
+      const lockedSource = this.getTaskSessionSourceSnapshot(row.task_id);
+      if (!expectedDigest || expectedDigest !== row.intent_digest || !taskSessionSourceDigestMatches(rowOrchestration, lockedSource)) {
+        throw new ApiError(
+          409,
+          "INTENT_STALE",
+          "The Jira source snapshot changed; refresh and confirm the intent again",
+          {
+            intentDigest: row.intent_digest,
+            currentDigest: lockedSource.digest,
+            intentVersion: rowOrchestration.intentVersion,
+          },
+        );
+      }
+      // 即使确认消息已存在，也必须先通过来源新鲜度校验，避免过期重试被幂等短路放行。
+      const confirmationKey = `intent-confirmed:${id}:${expectedRevision}`;
+      const existingConfirmation = this.database.prepare(`
+        SELECT * FROM task_session_messages
+        WHERE orchestration_id = ? AND idempotency_key = ?
+      `).get(id, confirmationKey);
+      if (existingConfirmation) {
+        this.database.exec("COMMIT");
+        return taskSessionOrchestrationFromRow(row);
+      }
+      this.database.prepare(`
+        UPDATE task_session_orchestrations
+        SET state = 'intent_ready', confirmed_intent_version = ?, confirmed_at = ?,
+            version = version + 1, updated_at = ?
+        WHERE id = ?
+      `).run(expectedRevision, timestamp, timestamp, id);
+      this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: "internal",
+        type: "intent_confirmed",
+        idempotencyKey: confirmationKey,
+        payload: { intentVersion: expectedRevision, captureDigest: expectedDigest },
+        deliveryState: "acknowledged",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return this.getTaskSessionOrchestration(id);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 保存宿主回传的 child/window/runtime binding；未回传 child 时保留 dispatched 握手状态。
+  dispatchTaskSessionOrchestration(id, input = {}) {
+    const current = this.#requireTaskSessionOrchestration(id);
+    this.#assertTaskSessionMutable(current);
+    // 派发请求里的 childThreadBinding 是待写入的新绑定，不应被当成调用者身份校验。
+    this.#assertTaskSessionBinding(current, {
+      parentThreadId: input.parentThreadId,
+      parentThreadBinding: input.parentThreadBinding ?? input.parentBinding,
+    }, { requireParent: true });
+    if (!(current.state === "intent_ready" || TASK_SESSION_DISPATCH_STATES.has(current.state))) {
+      throw new ApiError(
+        409,
+        "ORCHESTRATION_NOT_READY",
+        "The orchestration intent is not ready for dispatch",
+        { state: current.state },
+      );
+    }
+    if (current.confirmedIntentVersion !== current.intentVersion) {
+      throw new ApiError(409, "INTENT_NOT_CONFIRMED", "Confirm the current intent before dispatching");
+    }
+    // 派发是执行会话实际读取意图的边界；来源变化后不得让旧确认通过重试继续执行。
+    this.#assertTaskSessionSourceCurrent(current);
+    if (input.intentVersion !== undefined && input.intentVersion !== current.intentVersion) {
+      throw new ApiError(
+        409,
+        "INTENT_VERSION_CONFLICT",
+        "The requested intent revision is not current",
+        { expectedVersion: current.intentVersion, actualVersion: input.intentVersion },
+      );
+    }
+    const childBinding = input.childThreadBinding
+      ?? input.childThread
+      ?? (input.childThreadId ? { threadId: input.childThreadId } : null);
+    const existingChild = current.childThreadBinding;
+    if (
+      existingChild?.threadId
+      && childBinding?.threadId
+      && existingChild.threadId !== childBinding.threadId
+    ) {
+      throw new ApiError(
+        409,
+        "CHILD_THREAD_ALREADY_BOUND",
+        "This orchestration already has a different child thread",
+        { childThreadId: existingChild.threadId },
+      );
+    }
+    if (childBinding?.threadId === existingChild?.threadId) {
+      // 重试可只带 child ID；若同时带完整身份，不能切换到另一个项目或工作目录。
+      this.#assertTaskSessionBinding(current, { childThreadBinding: childBinding });
+    }
+    const child = childBinding ?? existingChild;
+    const childWindow = input.childWindow === undefined ? current.childWindow : input.childWindow;
+    const runtime = input.runtime === undefined ? current.runtime : input.runtime;
+    const worktree = input.worktree === undefined ? current.worktree : input.worktree;
+    const state = input.state ?? (current.state === "intent_ready" ? "dispatched" : current.state);
+    this.#assertTaskSessionState(state);
+    if (!TASK_SESSION_DISPATCH_STATES.has(state)) {
+      throw new ApiError(
+        409,
+        "INVALID_STATE_TRANSITION",
+        "Dispatch can only set an execution lifecycle state",
+        { state },
+      );
+    }
+    this.#assertTaskSessionStateTransition(current.state, state);
+    const timestamp = input.updatedAt ?? now();
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#requireTaskSessionRow(id);
+      if (row.state === "done") {
+        throw new ApiError(409, "ORCHESTRATION_COMPLETED", "Completed orchestrations are immutable");
+      }
+      if (!(row.state === "intent_ready" || TASK_SESSION_DISPATCH_STATES.has(row.state))) {
+        throw new ApiError(
+          409,
+          "ORCHESTRATION_NOT_READY",
+          "The orchestration intent is not ready for dispatch",
+          { state: row.state },
+        );
+      }
+      if (row.confirmed_intent_version !== current.confirmedIntentVersion) {
+        throw new ApiError(409, "VERSION_CONFLICT", "Orchestration changed by another client");
+      }
+      this.#assertTaskSessionStateTransition(row.state, state);
+      const rowOrchestration = taskSessionOrchestrationFromRow(row);
+      // 事务锁内再次读取来源，覆盖预检查与写入之间的 TOCTOU 窗口；必须早于
+      // dispatch 幂等短路，否则旧请求仍可能返回成功。
+      this.#assertTaskSessionSourceCurrent(rowOrchestration);
+      this.#assertTaskSessionBinding(rowOrchestration, {
+        parentThreadId: input.parentThreadId,
+        parentThreadBinding: input.parentThreadBinding ?? input.parentBinding,
+        // 首次 dispatch 允许写入尚未绑定的 child；已有 child 才需要校验重试身份。
+        childThreadBinding: rowOrchestration.childThreadBinding ? child : undefined,
+      });
+      if (child?.threadId) {
+        // 一个 child thread 只能归属一个 active 编排，否则它可以跨任务伪造结果回传。
+        const childConflict = this.database.prepare(`
+          SELECT id FROM task_session_orchestrations
+          WHERE state != 'done'
+            AND id != ?
+            AND json_extract(child_thread_json, '$.threadId') = ?
+          LIMIT 1
+        `).get(id, child.threadId);
+        if (childConflict) {
+          throw new ApiError(
+            409,
+            "CHILD_THREAD_ALREADY_BOUND",
+            "This child thread is already bound to another active orchestration",
+            { orchestrationId: childConflict.id },
+          );
+        }
+      }
+      const dispatchKey = `dispatch:${id}:${current.intentVersion}:${child?.threadId ?? "pending"}`;
+      const existingDispatch = this.database.prepare(`
+        SELECT * FROM task_session_messages
+        WHERE orchestration_id = ? AND idempotency_key = ?
+      `).get(id, dispatchKey);
+      if (existingDispatch) {
+        const storedChild = rowOrchestration.childThreadBinding;
+        const childIdentityConflicts = taskSessionBindingIdentityConflicts(storedChild, child);
+        if (childIdentityConflicts.length > 0) {
+          throw new ApiError(
+            409,
+            "CHILD_THREAD_MISMATCH",
+            "The child thread identity is not bound to this orchestration",
+            { mismatchedFields: childIdentityConflicts },
+          );
+        }
+        const mergedChild = taskSessionBindingWithMissingIdentity(storedChild, child);
+        const metadata = [
+          ["childWindow", rowOrchestration.childWindow, input.childWindow],
+          ["runtime", rowOrchestration.runtime, input.runtime],
+          ["worktree", rowOrchestration.worktree, input.worktree],
+        ];
+        const metadataConflicts = metadata.flatMap(([field, stored, incoming]) => (
+          taskSessionObjectConflicts(stored, incoming).map((key) => `${field}.${key}`)
+        ));
+        if (metadataConflicts.length > 0) {
+          throw new ApiError(
+            409,
+            "DISPATCH_IDEMPOTENCY_CONFLICT",
+            "The dispatch key is already associated with different binding metadata",
+            { mismatchedFields: metadataConflicts },
+          );
+        }
+        const mergedChildWindow = taskSessionObjectWithMissingFields(
+          rowOrchestration.childWindow,
+          input.childWindow,
+        );
+        const mergedRuntime = taskSessionObjectWithMissingFields(rowOrchestration.runtime, input.runtime);
+        const mergedWorktree = taskSessionObjectWithMissingFields(rowOrchestration.worktree, input.worktree);
+        const hasEnrichment = JSON.stringify(mergedChild) !== JSON.stringify(storedChild)
+          || JSON.stringify(mergedChildWindow) !== JSON.stringify(rowOrchestration.childWindow)
+          || JSON.stringify(mergedRuntime) !== JSON.stringify(rowOrchestration.runtime)
+          || JSON.stringify(mergedWorktree) !== JSON.stringify(rowOrchestration.worktree);
+        if (!hasEnrichment) {
+          this.database.exec("COMMIT");
+          return rowOrchestration;
+        }
+
+        // 首次握手可能只带 thread ID；收到宿主完整身份后追加一条审计消息并补齐空字段。
+        const enrichmentPayload = {
+          intentVersion: current.intentVersion,
+          childThreadBinding: mergedChild,
+          childWindow: mergedChildWindow,
+          runtime: mergedRuntime,
+          worktree: mergedWorktree,
+          handshakePending: !mergedChild,
+        };
+        const enrichmentKey = `${dispatchKey}:enriched:${taskSessionDigest(enrichmentPayload)}`;
+        const existingEnrichment = this.database.prepare(`
+          SELECT * FROM task_session_messages
+          WHERE orchestration_id = ? AND idempotency_key = ?
+        `).get(id, enrichmentKey);
+        if (existingEnrichment) {
+          this.database.exec("COMMIT");
+          return rowOrchestration;
+        }
+        this.database.prepare(`
+          UPDATE task_session_orchestrations
+          SET child_thread_json = ?, child_window_json = ?, runtime_json = ?,
+              worktree_json = ?, version = version + 1, updated_at = ?
+          WHERE id = ?
+        `).run(
+          mergedChild ? JSON.stringify(mergedChild) : null,
+          mergedChildWindow === null || mergedChildWindow === undefined ? null : JSON.stringify(mergedChildWindow),
+          mergedRuntime === null || mergedRuntime === undefined ? null : JSON.stringify(mergedRuntime),
+          mergedWorktree === null || mergedWorktree === undefined ? null : JSON.stringify(mergedWorktree),
+          timestamp,
+          id,
+        );
+        this.#appendTaskSessionMessageInTransaction({
+          id,
+          direction: "parent_to_child",
+          type: "child_binding_enriched",
+          idempotencyKey: enrichmentKey,
+          payload: enrichmentPayload,
+          deliveryState: mergedChild ? "sent" : "pending",
+          createdAt: timestamp,
+        });
+        this.database.exec("COMMIT");
+        return this.getTaskSessionOrchestration(id);
+      }
+      this.database.prepare(`
+        UPDATE task_session_orchestrations
+        SET state = ?, child_thread_json = ?, child_window_json = ?, runtime_json = ?,
+            worktree_json = ?, version = version + 1, updated_at = ?
+        WHERE id = ?
+      `).run(
+        state,
+        child ? JSON.stringify(child) : row.child_thread_json,
+        childWindow === null ? null : JSON.stringify(childWindow),
+        runtime === null ? null : JSON.stringify(runtime),
+        worktree === null ? null : JSON.stringify(worktree),
+        timestamp,
+        id,
+      );
+      // 即使 child thread 尚未完成首个 turn，任务也已经进入执行编排；状态不能
+      // 依赖宿主握手是否及时返回。
+      this.#syncTaskSessionTaskStatus(
+        current.taskId,
+        "in_progress",
+        timestamp,
+        "task_session_dispatched",
+        new Set(["backlog", "todo"]),
+      );
+      this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: "parent_to_child",
+        type: "child_dispatched",
+        idempotencyKey: dispatchKey,
+        payload: {
+          intentVersion: current.intentVersion,
+          childThreadBinding: child,
+          childWindow,
+          runtime,
+          worktree,
+          handshakePending: !child,
+        },
+        deliveryState: child ? "sent" : "pending",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return this.getTaskSessionOrchestration(id);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 追加主子通信消息并分配编排内单调序列；重复幂等键只返回原消息。
+  appendTaskSessionMessage(id, input = {}) {
+    const current = this.#requireTaskSessionOrchestration(id);
+    this.#assertTaskSessionMutable(current);
+    const direction = input.direction ?? "internal";
+    this.#assertTaskSessionBinding(current, input, {
+      requireParent: direction === "parent_to_child",
+      requireChild: direction === "child_to_parent",
+    });
+    if (direction !== "internal" && input.intentVersion !== current.intentVersion) {
+      throw new ApiError(
+        409,
+        "INTENT_VERSION_CONFLICT",
+        "The message intent version is not current",
+        { expectedVersion: current.intentVersion, actualVersion: input.intentVersion },
+      );
+    }
+    if (direction === "internal" && input.intentVersion !== undefined && input.intentVersion !== current.intentVersion) {
+      throw new ApiError(
+        409,
+        "INTENT_VERSION_CONFLICT",
+        "The message intent version is not current",
+        { expectedVersion: current.intentVersion, actualVersion: input.intentVersion },
+      );
+    }
+    const nextState = input.state ?? input.payload?.state;
+    if (nextState !== undefined && nextState !== null) {
+      this.#assertTaskSessionState(nextState);
+      if (nextState === "done") {
+        throw new ApiError(
+          409,
+          "EXPLICIT_COMPLETION_REQUIRED",
+          "Only the explicit completion endpoint can move an orchestration to done",
+        );
+      }
+      if (!TASK_SESSION_LIFECYCLE_STATES.has(nextState)) {
+        throw new ApiError(
+          409,
+          "INVALID_STATE_TRANSITION",
+          "Generic messages may only update execution lifecycle state",
+          { state: nextState },
+        );
+      }
+      if (direction === "internal") {
+        const hasParentIdentity = input.parentThreadId !== undefined;
+        const hasChildIdentity = input.childThreadId !== undefined;
+        if (!hasParentIdentity && !hasChildIdentity) {
+          throw new ApiError(
+            403,
+            "INTERNAL_ACTOR_REQUIRED",
+            "A lifecycle message must identify its parent or child thread",
+          );
+        }
+        this.#assertTaskSessionBinding(current, input, {
+          requireParent: hasParentIdentity,
+          requireChild: hasChildIdentity,
+        });
+      }
+    }
+    const timestamp = input.createdAt ?? now();
+    const idempotencyKey = input.idempotencyKey ?? null;
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#requireTaskSessionRow(id);
+      if (row.state === "done") {
+        throw new ApiError(409, "ORCHESTRATION_COMPLETED", "Completed orchestrations are immutable");
+      }
+      const rowOrchestration = taskSessionOrchestrationFromRow(row);
+      this.#assertTaskSessionBinding(rowOrchestration, input, {
+        requireParent: direction === "parent_to_child",
+        requireChild: direction === "child_to_parent",
+      });
+      if (direction !== "internal" && input.intentVersion !== rowOrchestration.intentVersion) {
+        throw new ApiError(
+          409,
+          "INTENT_VERSION_CONFLICT",
+          "The message intent version is not current",
+          { expectedVersion: rowOrchestration.intentVersion, actualVersion: input.intentVersion },
+        );
+      }
+      if (direction === "internal" && input.intentVersion !== undefined && input.intentVersion !== rowOrchestration.intentVersion) {
+        throw new ApiError(
+          409,
+          "INTENT_VERSION_CONFLICT",
+          "The message intent version is not current",
+          { expectedVersion: rowOrchestration.intentVersion, actualVersion: input.intentVersion },
+        );
+      }
+      if (idempotencyKey) {
+        const existing = this.database.prepare(`
+          SELECT * FROM task_session_messages
+          WHERE orchestration_id = ? AND idempotency_key = ?
+        `).get(id, idempotencyKey);
+        if (existing) {
+          if (!taskSessionMessageIdempotencyMatches(existing, input)) {
+            throw new ApiError(
+              409,
+              "IDEMPOTENCY_CONFLICT",
+              "The idempotency key is already associated with a different message",
+            );
+          }
+          this.database.exec("COMMIT");
+          return taskSessionMessageFromRow(existing);
+        }
+      }
+      // 历史消息重试先按 envelope 幂等短路；只有首次写入才重新执行当前状态迁移。
+      if (nextState !== undefined && nextState !== null) {
+        this.#assertTaskSessionLifecycleMessageAction(rowOrchestration, direction, input, nextState);
+        this.#assertTaskSessionStateTransition(row.state, nextState);
+        if (direction === "internal") {
+          const hasParentIdentity = input.parentThreadId !== undefined;
+          const hasChildIdentity = input.childThreadId !== undefined;
+          if (!hasParentIdentity && !hasChildIdentity) {
+            throw new ApiError(
+              403,
+              "INTERNAL_ACTOR_REQUIRED",
+              "A lifecycle message must identify its parent or child thread",
+            );
+          }
+          this.#assertTaskSessionBinding(rowOrchestration, input, {
+            requireParent: hasParentIdentity,
+            requireChild: hasChildIdentity,
+          });
+        }
+      }
+      const message = this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: input.direction ?? "internal",
+        type: input.type ?? "message",
+        idempotencyKey,
+        payload: input.payload ?? {},
+        state: input.state ?? null,
+        deliveryState: input.deliveryState ?? "pending",
+        createdAt: timestamp,
+      });
+      if (nextState && nextState !== row.state) {
+        this.database.prepare(`
+          UPDATE task_session_orchestrations SET state = ?, version = version + 1, updated_at = ? WHERE id = ?
+        `).run(nextState, timestamp, id);
+      }
+      this.database.exec("COMMIT");
+      return message;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 保存不可变结果版本并以 orchestrationId:resultRevision 作为投递幂等键。
+  createTaskSessionReport(id, input = {}) {
+    const current = this.#requireTaskSessionOrchestration(id);
+    this.#assertTaskSessionMutable(current);
+    this.#assertTaskSessionBinding(current, input, { requireParent: true, requireChild: true });
+    const intentVersion = input.intentVersion ?? current.confirmedIntentVersion ?? current.intentVersion;
+    if (intentVersion !== current.intentVersion) {
+      throw new ApiError(
+        409,
+        "INTENT_VERSION_CONFLICT",
+        "The report was created from a stale intent revision",
+        { expectedVersion: current.intentVersion, actualVersion: intentVersion },
+      );
+    }
+    if (current.confirmedIntentVersion !== current.intentVersion) {
+      throw new ApiError(409, "INTENT_NOT_CONFIRMED", "The intent is not confirmed");
+    }
+    // 报告必须对应仍然有效的 Jira 快照；重试也不能绕过来源检查。
+    this.#assertTaskSessionSourceCurrent(current);
+    const payload = input.payload ?? input.result ?? input.report;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new ApiError(400, "INVALID_FIELD", "Report payload must be an object");
+    }
+    const requestedRevision = input.resultRevision;
+    if (requestedRevision === undefined) {
+      throw new ApiError(400, "INVALID_FIELD", "resultRevision is required for a report");
+    }
+    const nextRevision = requestedRevision;
+    if (!Number.isSafeInteger(nextRevision) || nextRevision < 1) {
+      throw new ApiError(400, "INVALID_FIELD", "resultRevision must be a positive integer");
+    }
+    if (requestedRevision > current.currentResultRevision + 1) {
+      throw new ApiError(
+        409,
+        "RESULT_REVISION_CONFLICT",
+        "Result revisions must be appended in order",
+        { expectedRevision: current.currentResultRevision + 1, actualRevision: requestedRevision },
+      );
+    }
+    if (input.idempotencyKey === undefined) {
+      throw new ApiError(400, "INVALID_IDEMPOTENCY_KEY", "Report idempotencyKey is required");
+    }
+    const idempotencyKey = input.idempotencyKey;
+    if (idempotencyKey !== `${id}:${nextRevision}`) {
+      throw new ApiError(400, "INVALID_IDEMPOTENCY_KEY", "Report idempotencyKey must be orchestrationId:resultRevision");
+    }
+    const timestamp = input.createdAt ?? now();
+    const result = {
+      ...payload,
+      version: payload.version ?? "task-result.v1",
+      intentVersion,
+      resultRevision: nextRevision,
+      idempotencyKey,
+      createdAt: timestamp,
+    };
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#requireTaskSessionRow(id);
+      const rowOrchestration = taskSessionOrchestrationFromRow(row);
+      // 锁内复核必须放在 existingMessage 幂等分支之前，避免旧报告被当成成功重试。
+      this.#assertTaskSessionSourceCurrent(rowOrchestration);
+      this.#assertTaskSessionBinding(rowOrchestration, input, { requireParent: true, requireChild: true });
+      if (
+        rowOrchestration.intentVersion !== intentVersion
+        || rowOrchestration.confirmedIntentVersion !== rowOrchestration.intentVersion
+      ) {
+        throw new ApiError(409, "INTENT_VERSION_CONFLICT", "The report intent is no longer current");
+      }
+      const existingMessage = this.database.prepare(`
+        SELECT * FROM task_session_messages
+        WHERE orchestration_id = ? AND idempotency_key = ?
+      `).get(id, idempotencyKey);
+      if (existingMessage) {
+        const existingOrchestration = taskSessionOrchestrationFromRow(row);
+        const existingResult = existingOrchestration.resultRevisions.find(
+          (candidate) => candidate.resultRevision === nextRevision,
+        ) ?? existingOrchestration.result;
+        if (!taskSessionPayloadMatches(existingResult, payload)) {
+          throw new ApiError(
+            409,
+            "IDEMPOTENCY_CONFLICT",
+            "The report idempotency key is already associated with a different result",
+          );
+        }
+        this.database.exec("COMMIT");
+        return {
+          orchestration: existingOrchestration,
+          result: existingResult,
+          message: taskSessionMessageFromRow(existingMessage),
+          duplicate: true,
+        };
+      }
+      if (!TASK_SESSION_LIFECYCLE_STATES.has(row.state)) {
+        throw new ApiError(
+          409,
+          "ORCHESTRATION_NOT_READY",
+          "The task session is not accepting a new result report",
+          { state: row.state },
+        );
+      }
+      const results = taskSessionArray(row.result_json);
+      const expectedRevision = Number(row.current_result_revision) + 1;
+      if (nextRevision !== expectedRevision) {
+        throw new ApiError(
+          409,
+          "RESULT_REVISION_CONFLICT",
+          "Result revisions must be appended in order",
+          { expectedRevision, actualRevision: nextRevision },
+        );
+      }
+      results.push(result);
+      this.database.prepare(`
+        UPDATE task_session_orchestrations
+        SET state = 'reporting', result_json = ?, current_result_revision = ?,
+            version = version + 1, updated_at = ?
+        WHERE id = ?
+      `).run(JSON.stringify(results), nextRevision, timestamp, id);
+      this.#syncTaskSessionTaskStatus(
+        current.taskId,
+        "in_review",
+        timestamp,
+        "task_session_reported",
+        new Set(["backlog", "todo", "in_progress"]),
+      );
+      const message = this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: "child_to_parent",
+        type: "result",
+        idempotencyKey,
+        payload: result,
+        deliveryState: input.deliveryState ?? "sent",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return {
+        orchestration: this.getTaskSessionOrchestration(id),
+        result,
+        message,
+        duplicate: false,
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 主会话确认收到指定结果版本；ack 本身也写入时间线，且可安全重复调用。
+  acknowledgeTaskSessionReport(id, revision, input = {}) {
+    const current = this.#requireTaskSessionOrchestration(id);
+    this.#assertTaskSessionMutable(current);
+    this.#assertTaskSessionBinding(current, input, { requireParent: true });
+    // 主会话只接收当前 Jira 来源上的结果；过期报告不能通过 ACK 进入检查。
+    this.#assertTaskSessionSourceCurrent(current);
+    if (!Number.isSafeInteger(revision) || revision < 1) {
+      throw new ApiError(400, "INVALID_PATH", "Result revision is invalid");
+    }
+    const key = `${id}:${revision}`;
+    const timestamp = input.acknowledgedAt ?? now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#requireTaskSessionRow(id);
+      const rowOrchestration = taskSessionOrchestrationFromRow(row);
+      // 与报告创建一致，锁内检查必须先于 ACK 幂等短路。
+      this.#assertTaskSessionSourceCurrent(rowOrchestration);
+      this.#assertTaskSessionBinding(rowOrchestration, input, { requireParent: true });
+      const resultRevisions = taskSessionArray(row.result_json);
+      const result = resultRevisions.find((candidate) => candidate.resultRevision === revision);
+      if (!result) {
+        throw new ApiError(404, "RESULT_NOT_FOUND", `Result revision '${revision}' does not exist`);
+      }
+      if (Number(row.current_result_revision) !== revision) {
+        throw new ApiError(
+          409,
+          "RESULT_NOT_CURRENT",
+          "Only the current result revision can be acknowledged",
+          { currentRevision: Number(row.current_result_revision), actualRevision: revision },
+        );
+      }
+      const messageRow = this.database.prepare(`
+        SELECT * FROM task_session_messages
+        WHERE orchestration_id = ? AND idempotency_key = ?
+      `).get(id, key);
+      if (!messageRow) {
+        throw new ApiError(404, "REPORT_NOT_FOUND", `Report '${key}' does not exist`);
+      }
+      const existingAck = this.database.prepare(`
+        SELECT * FROM task_session_messages
+        WHERE orchestration_id = ? AND idempotency_key = ?
+      `).get(id, `${key}:ack`);
+      if (existingAck) {
+        const ackMessage = taskSessionMessageFromRow(existingAck);
+        if (
+          ackMessage.direction !== "parent_to_child"
+          || ackMessage.type !== "report_ack"
+          || ackMessage.deliveryState !== "acknowledged"
+          || ackMessage.payload?.resultRevision !== revision
+        ) {
+          throw new ApiError(
+            409,
+            "IDEMPOTENCY_CONFLICT",
+            "The report acknowledgement key is associated with a different message",
+          );
+        }
+        this.database.exec("COMMIT");
+        return {
+          orchestration: taskSessionOrchestrationFromRow(row),
+          result,
+          message: taskSessionMessageFromRow(messageRow),
+          ack: ackMessage,
+          duplicate: true,
+        };
+      }
+      if (row.state !== "reporting") {
+        throw new ApiError(
+          409,
+          "ORCHESTRATION_NOT_READY",
+          "The result report is not awaiting acknowledgement",
+          { state: row.state },
+        );
+      }
+      if (messageRow.type !== "result") {
+        throw new ApiError(409, "REPORT_NOT_FOUND", `Message '${key}' is not a result report`);
+      }
+      this.database.prepare(`
+        UPDATE task_session_messages SET delivery_state = 'acknowledged', updated_at = ?
+        WHERE id = ?
+      `).run(timestamp, messageRow.id);
+      this.#assertTaskSessionStateTransition(row.state, "reviewing");
+      this.database.prepare(`
+        UPDATE task_session_orchestrations
+        SET state = 'reviewing', version = version + 1, updated_at = ?
+        WHERE id = ?
+      `).run(timestamp, id);
+      this.#syncTaskSessionTaskStatus(
+        current.taskId,
+        "in_review",
+        timestamp,
+        "task_session_report_acknowledged",
+        new Set(["backlog", "todo", "in_progress"]),
+      );
+      const ack = this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: "parent_to_child",
+        type: "report_ack",
+        idempotencyKey: `${key}:ack`,
+        payload: { resultRevision: revision, receivedAt: timestamp },
+        deliveryState: "acknowledged",
+        createdAt: timestamp,
+      });
+      const reviewStarted = this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: "internal",
+        type: "review_started",
+        idempotencyKey: `${key}:review-started`,
+        payload: { resultRevision: revision, startedAt: timestamp },
+        deliveryState: "acknowledged",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return {
+        orchestration: this.getTaskSessionOrchestration(id),
+        result,
+        message: taskSessionMessageFromRow(
+          this.database.prepare("SELECT * FROM task_session_messages WHERE id = ?").get(messageRow.id),
+        ),
+        ack,
+        reviewStarted,
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 按编排内 sequence 增量读取时间线，支持 Taskboard 刷新后的断点恢复。
+  listTaskSessionMessages(id, after = 0) {
+    this.#requireTaskSessionOrchestration(id);
+    return this.database.prepare(`
+      SELECT * FROM task_session_messages
+      WHERE orchestration_id = ? AND sequence > ?
+      ORDER BY sequence
+    `).all(id, after).map(taskSessionMessageFromRow);
+  }
+
+  // 保存主会话的检查结论；结论绑定到具体结果版本，不覆盖历史判断。
+  saveTaskSessionReview(id, input = {}) {
+    const current = this.#requireTaskSessionOrchestration(id);
+    this.#assertTaskSessionMutable(current);
+    this.#assertTaskSessionBinding(current, input, { requireParent: true });
+    if (!(current.state === "result_ready" || current.state === "reviewing")) {
+      throw new ApiError(
+        409,
+        "ORCHESTRATION_NOT_READY",
+        "Result review requires an acknowledged result",
+        { state: current.state },
+      );
+    }
+    const decision = input.decision ?? input.status;
+    if (!["approved", "needs_rework", "blocked"].includes(decision)) {
+      throw new ApiError(400, "INVALID_FIELD", "Review decision must be approved, needs_rework, or blocked");
+    }
+    const resultRevision = input.resultRevision ?? current.currentResultRevision;
+    if (
+      !Number.isSafeInteger(resultRevision)
+      || resultRevision < 1
+      || resultRevision !== current.currentResultRevision
+      || !current.resultRevisions.some((result) => result.resultRevision === resultRevision)
+    ) {
+      throw new ApiError(
+        409,
+        "RESULT_NOT_READY",
+        "Review requires the current result revision",
+        { currentRevision: current.currentResultRevision, actualRevision: resultRevision },
+      );
+    }
+    this.#assertTaskSessionSourceCurrent(current);
+    const timestamp = input.createdAt ?? now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#requireTaskSessionRow(id);
+      const rowOrchestration = taskSessionOrchestrationFromRow(row);
+      this.#assertTaskSessionBinding(rowOrchestration, input, { requireParent: true });
+      if (row.state === "done") {
+        throw new ApiError(409, "ORCHESTRATION_COMPLETED", "Completed orchestrations are immutable");
+      }
+      if (!(row.state === "result_ready" || row.state === "reviewing")) {
+        throw new ApiError(
+          409,
+          "ORCHESTRATION_NOT_READY",
+          "Result review requires an acknowledged result",
+          { state: row.state },
+        );
+      }
+      if (Number(row.current_result_revision) !== resultRevision) {
+        throw new ApiError(
+          409,
+          "RESULT_NOT_CURRENT",
+          "Review must target the current result revision",
+          { currentRevision: Number(row.current_result_revision), actualRevision: resultRevision },
+        );
+      }
+      // 结果检查也必须基于锁内的最新 Jira 投影，避免预检查后发生 TOCTOU。
+      this.#assertTaskSessionSourceCurrent(rowOrchestration);
+      const resultMessage = this.database.prepare(`
+        SELECT * FROM task_session_messages
+        WHERE orchestration_id = ? AND idempotency_key = ? AND type = 'result'
+      `).get(id, `${id}:${resultRevision}`);
+      if (!resultMessage || resultMessage.delivery_state !== "acknowledged") {
+        throw new ApiError(
+          409,
+          "RESULT_NOT_READY",
+          "Review requires the current result report to be acknowledged",
+        );
+      }
+      const revisions = taskSessionRevisionArray(row.review_json);
+      const review = {
+        revision: revisions.length + 1,
+        resultRevision,
+        decision,
+        feedback: input.feedback ?? input.reason ?? null,
+        evidence: input.evidence ?? null,
+        createdAt: timestamp,
+      };
+      revisions.push(review);
+      const nextState = decision === "approved"
+        ? "writeback_pending"
+        : decision === "needs_rework" ? "executing" : "blocked";
+      this.database.prepare(`
+        UPDATE task_session_orchestrations
+        SET state = ?, review_json = ?, version = version + 1, updated_at = ?
+        WHERE id = ?
+      `).run(nextState, JSON.stringify(revisions), timestamp, id);
+      if (decision === "needs_rework") {
+        // 返工是显式主会话动作；任务状态同步回 in_progress，避免面板继续显示
+        // in_review 而执行会话已经重新开始。
+        this.#syncTaskSessionTaskStatus(
+          current.taskId,
+          "in_progress",
+          timestamp,
+          "task_session_rework_requested",
+          new Set(["in_review", "blocked"]),
+        );
+      }
+      const message = this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: "parent_to_child",
+        type: "review_decision",
+        idempotencyKey: `review:${id}:${review.revision}`,
+        payload: review,
+        deliveryState: "acknowledged",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return { orchestration: this.getTaskSessionOrchestration(id), review, message };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 记录用户选择的本地集成证据；实际 merge/cherry-pick 由后续 host 能力负责。
+  saveTaskSessionIntegration(id, input = {}) {
+    const current = this.#requireTaskSessionOrchestration(id);
+    this.#assertTaskSessionMutable(current);
+    this.#assertTaskSessionBinding(current, input, { requireParent: true });
+    if (
+      current.review?.decision !== "approved"
+      || current.review.resultRevision !== current.currentResultRevision
+    ) {
+      throw new ApiError(409, "REVIEW_NOT_APPROVED", "Integration requires an approved review");
+    }
+    const canRetryConflict = current.state === "blocked" && current.integration?.conflict === true;
+    if (!(current.state === "writeback_pending" || current.state === "integrated" || current.state === "synced" || canRetryConflict)) {
+      throw new ApiError(
+        409,
+        "ORCHESTRATION_NOT_READY",
+        "Integration requires an approved result awaiting integration",
+        { state: current.state },
+      );
+    }
+    const mode = input.mode ?? "merge";
+    if (!["merge", "cherry-pick"].includes(mode)) {
+      throw new ApiError(400, "INVALID_FIELD", "Integration mode must be merge or cherry-pick");
+    }
+    const timestamp = input.createdAt ?? now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#requireTaskSessionRow(id);
+      const rowOrchestration = taskSessionOrchestrationFromRow(row);
+      this.#assertTaskSessionBinding(rowOrchestration, input, { requireParent: true });
+      if (row.state === "done") {
+        throw new ApiError(409, "ORCHESTRATION_COMPLETED", "Completed orchestrations are immutable");
+      }
+      const rowIntegrations = taskSessionRevisionArray(row.integration_json);
+      const canRetryRowConflict = row.state === "blocked" && rowIntegrations.at(-1)?.conflict === true;
+      if (!(row.state === "writeback_pending" || row.state === "integrated" || row.state === "synced" || canRetryRowConflict)) {
+        throw new ApiError(
+          409,
+          "ORCHESTRATION_NOT_READY",
+          "Integration requires an approved result awaiting integration",
+          { state: row.state },
+        );
+      }
+      const rowReviews = taskSessionRevisionArray(row.review_json);
+      const rowReview = rowReviews.at(-1);
+      if (
+        rowReview?.decision !== "approved"
+        || rowReview.resultRevision !== Number(row.current_result_revision)
+      ) {
+        throw new ApiError(409, "REVIEW_NOT_APPROVED", "Integration requires an approved current result");
+      }
+      // Jira 来源在检查通过后仍可能变化；集成前重新确认快照，避免把过期结论带入主工作区。
+      this.#assertTaskSessionSourceCurrent(taskSessionOrchestrationFromRow(row));
+      const revisions = taskSessionRevisionArray(row.integration_json);
+      const integration = {
+        revision: revisions.length + 1,
+        mode,
+        commit: input.commit ?? input.commitSha ?? null,
+        conflict: input.conflict === true,
+        verification: input.verification ?? null,
+        createdAt: timestamp,
+      };
+      revisions.push(integration);
+      const nextState = integration.conflict ? "blocked" : "integrated";
+      this.#assertTaskSessionStateTransition(row.state, nextState);
+      this.database.prepare(`
+        UPDATE task_session_orchestrations
+        SET state = ?, integration_json = ?, version = version + 1, updated_at = ?
+        WHERE id = ?
+      `).run(nextState, JSON.stringify(revisions), timestamp, id);
+      const message = this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: "internal",
+        type: "integration_recorded",
+        idempotencyKey: `integration:${id}:${integration.revision}`,
+        payload: integration,
+        deliveryState: "acknowledged",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return { orchestration: this.getTaskSessionOrchestration(id), integration, message };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 保存 Jira 写回预览及用户选择，P1 只记录审计，不直接调用远端 Jira。
+  saveTaskSessionWriteback(id, input = {}) {
+    const current = this.#requireTaskSessionOrchestration(id);
+    this.#assertTaskSessionMutable(current);
+    this.#assertTaskSessionBinding(current, input, { requireParent: true });
+    if (
+      current.review?.decision !== "approved"
+      || current.review.resultRevision !== current.currentResultRevision
+    ) {
+      throw new ApiError(409, "REVIEW_NOT_APPROVED", "Jira writeback requires an approved review");
+    }
+    if (!(current.state === "writeback_pending" || current.state === "integrated" || current.state === "synced")) {
+      throw new ApiError(
+        409,
+        "ORCHESTRATION_NOT_READY",
+        "Jira writeback requires an approved result awaiting writeback",
+        { state: current.state },
+      );
+    }
+    this.#assertTaskSessionSourceCurrent(current);
+    const timestamp = input.createdAt ?? now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#requireTaskSessionRow(id);
+      const rowOrchestration = taskSessionOrchestrationFromRow(row);
+      this.#assertTaskSessionBinding(rowOrchestration, input, { requireParent: true });
+      if (row.state === "done") {
+        throw new ApiError(409, "ORCHESTRATION_COMPLETED", "Completed orchestrations are immutable");
+      }
+      if (!(row.state === "writeback_pending" || row.state === "integrated" || row.state === "synced")) {
+        throw new ApiError(
+          409,
+          "ORCHESTRATION_NOT_READY",
+          "Jira writeback requires an approved result awaiting writeback",
+          { state: row.state },
+        );
+      }
+      const rowReviews = taskSessionRevisionArray(row.review_json);
+      const rowReview = rowReviews.at(-1);
+      if (
+        rowReview?.decision !== "approved"
+        || rowReview.resultRevision !== Number(row.current_result_revision)
+      ) {
+        throw new ApiError(409, "REVIEW_NOT_APPROVED", "Jira writeback requires an approved current result");
+      }
+      // 写回预览不能绕过锁内来源复核，即使当前只记录本地预览。
+      this.#assertTaskSessionSourceCurrent(rowOrchestration);
+      const revisions = taskSessionRevisionArray(row.writeback_json);
+      const writeback = {
+        revision: revisions.length + 1,
+        comment: input.comment ?? null,
+        fields: input.fields ?? null,
+        status: input.status ?? null,
+        confirmed: input.confirmed === true,
+        createdAt: timestamp,
+      };
+      revisions.push(writeback);
+      const latestIntegration = taskSessionRevisionArray(row.integration_json).at(-1);
+      // P1 只保存 Jira 预览；已有成功集成时保留 integrated，避免用户点击顺序导致状态倒退。
+      const nextState = writeback.confirmed && latestIntegration?.conflict === false
+        ? row.state === "synced" ? "synced" : "integrated"
+        : "writeback_pending";
+      this.#assertTaskSessionStateTransition(row.state, nextState);
+      this.database.prepare(`
+        UPDATE task_session_orchestrations
+        SET state = ?, writeback_json = ?, version = version + 1, updated_at = ?
+        WHERE id = ?
+      `).run(nextState, JSON.stringify(revisions), timestamp, id);
+      const message = this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: "parent_to_child",
+        type: "jira_writeback_preview",
+        idempotencyKey: `writeback:${id}:${writeback.revision}`,
+        payload: writeback,
+        deliveryState: "acknowledged",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return { orchestration: this.getTaskSessionOrchestration(id), writeback, message };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 只有用户明确确认整个闭环后才进入 done，避免把同步或集成成功当成完成。
+  completeTaskSessionOrchestration(id, input = {}) {
+    const current = this.#requireTaskSessionOrchestration(id);
+    this.#assertTaskSessionBinding(current, input, { requireParent: true });
+    // 即使是重复完成请求，也必须先验证调用者仍是绑定的主会话。
+    if (current.state === "done") return { orchestration: current, message: null, duplicate: true };
+    if (input.confirmed !== true && input.complete !== true) {
+      throw new ApiError(400, "CONFIRMATION_REQUIRED", "Explicit completion confirmation is required");
+    }
+    if (!["synced", "integrated"].includes(current.state)) {
+      throw new ApiError(409, "ORCHESTRATION_NOT_READY", "The orchestration is not ready to complete");
+    }
+    if (current.writeback?.confirmed !== true) {
+      throw new ApiError(
+        409,
+        "WRITEBACK_NOT_CONFIRMED",
+        "Confirm the Jira writeback preview before completing the orchestration",
+      );
+    }
+    if (!current.integration || current.integration.conflict !== false) {
+      throw new ApiError(
+        409,
+        "INTEGRATION_NOT_COMPLETE",
+        "A successful code integration is required before completing the orchestration",
+      );
+    }
+    const timestamp = input.completedAt ?? now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#requireTaskSessionRow(id);
+      if (row.state === "done") {
+        throw new ApiError(409, "ORCHESTRATION_COMPLETED", "Completed orchestrations are immutable");
+      }
+      if (row.state !== current.state || row.version !== current.version) {
+        throw new ApiError(
+          409,
+          "VERSION_CONFLICT",
+          "Orchestration changed by another client",
+          { expectedVersion: current.version, actualVersion: row.version },
+        );
+      }
+      const rowWriteback = taskSessionRevisionArray(row.writeback_json).at(-1);
+      if (rowWriteback?.confirmed !== true) {
+        throw new ApiError(
+          409,
+          "WRITEBACK_NOT_CONFIRMED",
+          "Confirm the Jira writeback preview before completing the orchestration",
+        );
+      }
+      const rowIntegration = taskSessionRevisionArray(row.integration_json).at(-1);
+      if (!rowIntegration || rowIntegration.conflict !== false) {
+        throw new ApiError(
+          409,
+          "INTEGRATION_NOT_COMPLETE",
+          "A successful code integration is required before completing the orchestration",
+        );
+      }
+      // 完成确认必须绑定锁内最新的 Jira 来源，避免检查/写回之后的需求变化沿用旧结论进入 done。
+      this.#assertTaskSessionSourceCurrent(taskSessionOrchestrationFromRow(row));
+      this.database.prepare(`
+        UPDATE task_session_orchestrations
+        SET state = 'done', version = version + 1, updated_at = ?
+        WHERE id = ?
+      `).run(timestamp, id);
+      this.#syncTaskSessionTaskStatus(
+        current.taskId,
+        "done",
+        timestamp,
+        "task_session_completed",
+        new Set(["backlog", "todo", "in_progress", "in_review"]),
+      );
+      const message = this.#appendTaskSessionMessageInTransaction({
+        id,
+        direction: "internal",
+        type: "completed",
+        idempotencyKey: `completed:${id}:${row.version + 1}`,
+        payload: { completedAt: timestamp },
+        deliveryState: "acknowledged",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return { orchestration: this.getTaskSessionOrchestration(id), message };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 编排阶段只推动仍由本地工作流管理的任务状态；已完成、取消或阻塞的用户终态不被自动覆盖。
+  #syncTaskSessionTaskStatus(taskId, nextStatus, timestamp, reason, allowedStatuses) {
+    const task = this.#requireTask(taskId);
+    if (task.archivedAt !== null || !allowedStatuses.has(task.status) || task.status === nextStatus) {
+      return task;
+    }
+    const project = this.database.prepare(`
+      SELECT name FROM projects WHERE id = ?
+    `).get(task.projectId);
+    const placement = this.database.prepare(`
+      SELECT MIN(sort_order) AS minimum
+      FROM tasks
+      WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
+    `).get(task.projectId, nextStatus, task.id);
+    const nextSortOrder = placement.minimum === null ? 1000 : placement.minimum - 1000;
+    const changed = taskFieldChanges(task, { status: nextStatus });
+    this.database.prepare(`
+      UPDATE tasks
+      SET status = ?, sort_order = ?,
+        jira_status_override = CASE WHEN external_source = 'jira' THEN 1 ELSE jira_status_override END,
+        version = version + 1, updated_at = ?
+      WHERE id = ?
+    `).run(nextStatus, nextSortOrder, timestamp, task.id);
+    this.#transitionTaskTimer({
+      taskId: task.id,
+      beforeStatus: task.status,
+      afterStatus: nextStatus,
+      beforeProjectId: task.projectId,
+      afterProjectId: task.projectId,
+      afterProjectName: project?.name ?? "",
+      paused: task.timeTracking.paused,
+      beforeArchived: task.archivedAt !== null,
+      afterArchived: task.archivedAt !== null,
+      timestamp,
+      reason,
+    });
+    this.#recordTaskActivity(task.id, TASK_SESSION_STATUS_ACTOR, changed, timestamp);
+    return this.getTask(task.id);
+  }
+
+  #assertTaskSessionState(state) {
+    if (!TASK_SESSION_STATES.includes(state)) {
+      throw new ApiError(400, "INVALID_FIELD", `Unknown orchestration state '${state}'`);
+    }
+  }
+
+  #assertTaskSessionStateTransition(fromState, toState) {
+    if (fromState === toState) return;
+    const allowed = TASK_SESSION_STATE_TRANSITIONS[fromState];
+    if (!allowed?.has(toState)) {
+      throw new ApiError(
+        409,
+        "INVALID_STATE_TRANSITION",
+        `Cannot move orchestration from '${fromState}' to '${toState}' through this operation`,
+        { fromState, toState },
+      );
+    }
+  }
+
+  #assertTaskSessionLifecycleMessageAction(current, direction, input, nextState) {
+    const type = input.type ?? "message";
+    const parentIdentity = input.parentThreadId ?? input.parentThreadBinding?.threadId;
+    const parentDirection = direction === "parent_to_child" || direction === "internal";
+    if ((current.state === "result_ready" || current.state === "reviewing") && nextState === "executing") {
+      throw new ApiError(
+        409,
+        "REVIEW_ACTION_REQUIRED",
+        "A result under review can only return to execution through an explicit review decision",
+      );
+    }
+    if (current.state === "blocked" && nextState === "executing" && (
+      type !== "recovery_started" || !parentDirection || !parentIdentity
+    )) {
+      throw new ApiError(
+        409,
+        "RECOVERY_ACTION_REQUIRED",
+        "A blocked orchestration requires an explicit parent recovery action",
+      );
+    }
+    if (current.state === "result_ready" && nextState === "reviewing" && (
+      type !== "review_started" || !parentDirection || !parentIdentity
+    )) {
+      throw new ApiError(
+        409,
+        "REVIEW_ACTION_REQUIRED",
+        "Entering review requires an explicit parent review action",
+      );
+    }
+  }
+
+  #assertTaskSessionMutable(orchestration) {
+    if (orchestration.state === "done") {
+      throw new ApiError(409, "ORCHESTRATION_COMPLETED", "Completed orchestrations are immutable");
+    }
+  }
+
+  #assertTaskSessionSourceCurrent(orchestration) {
+    const source = this.getTaskSessionSourceSnapshot(orchestration.taskId);
+    if (!taskSessionSourceDigestMatches(orchestration, source)) {
+      throw new ApiError(
+        409,
+        "INTENT_STALE",
+        "The Jira source snapshot changed; refresh and confirm the intent again",
+        {
+          intentDigest: orchestration.intentDigest,
+          currentDigest: source.digest,
+          intentVersion: orchestration.intentVersion,
+        },
+      );
+    }
+    return source;
+  }
+
+  #requireTaskSessionRow(id) {
+    const row = this.database.prepare(`
+      SELECT * FROM task_session_orchestrations WHERE id = ?
+    `).get(id);
+    if (!row) {
+      throw new ApiError(404, "ORCHESTRATION_NOT_FOUND", `Orchestration '${id}' does not exist`);
+    }
+    return row;
+  }
+
+  #requireTaskSessionOrchestration(id) {
+    const row = this.#requireTaskSessionRow(id);
+    return taskSessionOrchestrationFromRow(row);
+  }
+
+  #assertTaskSessionBinding(current, input, { requireParent = false, requireChild = false } = {}) {
+    const parentBinding = input.parentThreadBinding
+      ?? input.parentBinding
+      ?? input.threadBinding;
+    const childBinding = input.childThreadBinding
+      ?? input.childThread
+      ?? (input.identity && typeof input.identity === "object" ? input.identity : undefined);
+    const parentThreadId = input.parentThreadId
+      ?? parentBinding?.threadId;
+    const childThreadId = input.childThreadId
+      ?? childBinding?.threadId;
+    const storedParentThreadId = current.parentThreadBinding?.threadId;
+    const storedChildThreadId = current.childThreadBinding?.threadId;
+    if (requireParent && !storedParentThreadId) {
+      throw new ApiError(409, "PARENT_THREAD_UNBOUND", "This orchestration has no parent thread binding");
+    }
+    if (requireChild && !storedChildThreadId) {
+      throw new ApiError(409, "CHILD_THREAD_UNBOUND", "This orchestration has no child thread binding");
+    }
+    if (requireParent && !parentThreadId) {
+      throw new ApiError(403, "PARENT_THREAD_REQUIRED", "The bound parent thread must identify this request");
+    }
+    if (requireChild && !childThreadId) {
+      throw new ApiError(403, "CHILD_THREAD_REQUIRED", "The bound child thread must identify this request");
+    }
+    if (parentThreadId && parentThreadId !== storedParentThreadId) {
+      throw new ApiError(403, "PARENT_THREAD_MISMATCH", "The parent thread is not bound to this orchestration");
+    }
+    if (childThreadId && childThreadId !== storedChildThreadId) {
+      throw new ApiError(403, "CHILD_THREAD_MISMATCH", "The child thread is not bound to this orchestration");
+    }
+    if (parentBinding && parentThreadId === storedParentThreadId) {
+      const conflicts = taskSessionBindingIdentityConflicts(current.parentThreadBinding, parentBinding);
+      if (conflicts.length > 0) {
+        throw new ApiError(
+          403,
+          "PARENT_THREAD_MISMATCH",
+          "The parent thread identity is not bound to this orchestration",
+          { mismatchedFields: conflicts },
+        );
+      }
+    }
+    if (childBinding && childThreadId === storedChildThreadId) {
+      const conflicts = taskSessionBindingIdentityConflicts(current.childThreadBinding, childBinding);
+      if (conflicts.length > 0) {
+        throw new ApiError(
+          403,
+          "CHILD_THREAD_MISMATCH",
+          "The child thread identity is not bound to this orchestration",
+          { mismatchedFields: conflicts },
+        );
+      }
+    }
+  }
+
+  #taskSessionIntentRevision(input, revision, captureDigest, createdAt) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new ApiError(400, "INVALID_FIELD", "Intent must be an object");
+    }
+    const intent = { ...input };
+    delete intent.intent;
+    delete intent.intentVersion;
+    delete intent.revision;
+    delete intent.captureDigest;
+    delete intent.intentDigest;
+    return {
+      ...intent,
+      version: "task-intent.v1",
+      revision,
+      captureDigest: captureDigest ?? null,
+      createdAt,
+    };
+  }
+
+  #appendTaskSessionMessageInTransaction({
+    id,
+    direction,
+    type,
+    idempotencyKey = null,
+    state = null,
+    payload = {},
+    deliveryState = "pending",
+    createdAt = now(),
+  }) {
+    if (!["parent_to_child", "child_to_parent", "internal"].includes(direction)) {
+      throw new ApiError(400, "INVALID_FIELD", "Message direction is invalid");
+    }
+    if (!["pending", "sent", "acknowledged", "failed", "cancelled"].includes(deliveryState)) {
+      throw new ApiError(400, "INVALID_FIELD", "Message deliveryState is invalid");
+    }
+    if (state !== null && !TASK_SESSION_STATES.includes(state)) {
+      throw new ApiError(400, "INVALID_FIELD", "Message state is invalid");
+    }
+    const sequence = Number(this.database.prepare(`
+      SELECT COALESCE(MAX(sequence), 0) + 1 AS value
+      FROM task_session_messages
+      WHERE orchestration_id = ?
+    `).get(id).value);
+    const messageId = randomUUID();
+    this.database.prepare(`
+      INSERT INTO task_session_messages (
+        id, orchestration_id, direction, type, idempotency_key, state,
+        payload_json, delivery_state, sequence, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      messageId,
+      id,
+      direction,
+      type,
+      idempotencyKey,
+      state,
+      JSON.stringify(payload),
+      deliveryState,
+      sequence,
+      createdAt,
+      createdAt,
+    );
+    return taskSessionMessageFromRow(
+      this.database.prepare("SELECT * FROM task_session_messages WHERE id = ?").get(messageId),
+    );
   }
 
   listTasks(filters) {

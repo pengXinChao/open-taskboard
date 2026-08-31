@@ -169,6 +169,35 @@ test("opaque iframe messages require the current document capability", () => {
   assert.match(source, /postMessage\(message, frameOrigin === "null" \? "\*" : frameOrigin\)/);
 });
 
+test("handshake results are bounded, deduplicated, and replayed after iframe readiness", () => {
+  assert.match(source, /const HANDSHAKE_RESULT_QUEUE_MAX = 32/);
+  assert.match(source, /const HANDSHAKE_RESULT_QUEUE_TTL_MS = 90_000/);
+  assert.match(source, /const HANDSHAKE_RESULT_RETRY_MS = 1_000/);
+  assert.match(source, /let pendingHandshakeResults = new Map\(\)/);
+  assert.match(source, /function isHandshakeResultMessage\(message\)/);
+  assert.match(source, /message\?\.type === "taskboard:parent-thread-ready"/);
+  assert.match(source, /message\?\.type === "taskboard:child-thread-ready"/);
+  assert.match(source, /message\?\.type === "taskboard:thread-create-error"/);
+  assert.match(
+    source,
+    /function handshakeResultKeyForPayload\(payload\)[\s\S]*?payload\.taskId[\s\S]*?payload\.orchestrationId[\s\S]*?payload\.conversationRole/,
+  );
+  assert.match(source, /return `\$\{taskId\}:\$\{orchestrationId \|\| "legacy"\}:\$\{role\}`/);
+  assert.match(source, /pendingHandshakeResults\.delete\(key\);\s*pendingHandshakeResults\.set\(key/);
+  assert.match(source, /while \(pendingHandshakeResults\.size > HANDSHAKE_RESULT_QUEUE_MAX\)/);
+  assert.match(source, /expiresAt: Date\.now\(\) \+ HANDSHAKE_RESULT_QUEUE_TTL_MS/);
+  assert.match(source, /postHandshakeResultToFrame\(\{[\s\S]*type: "taskboard:thread-create-error"/);
+  assert.match(source, /postHandshakeResultToFrame\(\{[\s\S]*type: conversationRole === "parent"/);
+  assert.match(source, /postHandshakeResultToFrame\(\{[\s\S]*type: "taskboard:thread-create-error"[\s\S]*error: error instanceof Error/);
+  assert.match(source, /if \(message\.type === "taskboard:ready"\)[\s\S]*?flushHandshakeResults\(\);/);
+  assert.match(source, /message\.type === "taskboard:thread-handshake-ack"/);
+  assert.match(source, /pendingHandshakeResults\.delete\(key\)/);
+  assert.match(
+    source,
+    /pendingThreadCreation = null;[\s\S]*?handshakeResultQueueTimer !== null[\s\S]*?pendingHandshakeResults\.clear\(\);/,
+  );
+});
+
 test("HTTP and HTTPS links are opened by the authenticated host instead of a sandbox popup", () => {
   assert.match(embeddedHost, /a\[target="_blank"\]/);
   assert.match(embeddedHost, /url\.protocol !== "http:" && url\.protocol !== "https:"/);
@@ -285,13 +314,40 @@ test("issues open an unsent native Codex composer in the confirmed project", () 
   );
   assert.match(source, /const focusComposerNonce = crypto\.randomUUID\(\)/);
   assert.match(createThreadSource, /type: "navigate-to-route",\s*path: "\/",\s*state: \{\s*focusComposerNonce,\s*prefillPrompt: instruction,/);
-  assert.match(createThreadSource, /type: "taskboard:thread-prepared", payload: \{ taskId \}/);
-  assert.doesNotMatch(createThreadSource, /start-task-conversation|previousThreadId|threadId:/);
+  assert.match(createThreadSource, /let resolvedProjectId = requestedProjectId/);
+  assert.match(createThreadSource, /resolvedProjectId = target\.projectId/);
+  assert.match(createThreadSource, /requestHostTaskConversationStart\(\{[\s\S]*previousThreadId,[\s\S]*codexProjectId: resolvedProjectId,[\s\S]*targetRoot,[\s\S]*instruction,[\s\S]*title,/);
+  assert.match(createThreadSource, /const startedThreadId = normalizeThreadId\(started\?\.threadId\)/);
+  assert.match(
+    createThreadSource,
+    /conversationRole === "parent"\s*\?\s*"taskboard:parent-thread-ready"/,
+  );
+  assert.match(
+    createThreadSource,
+    /conversationRole === "child"\s*\?\s*"taskboard:child-thread-ready"/,
+  );
+  assert.match(createThreadSource, /type: "taskboard:thread-prepared", payload: readyPayload/);
+  assert.match(createThreadSource, /childThreadId: started\.threadId/);
+  assert.match(createThreadSource, /codexProjectKind === "remote"[\s\S]*waitForRemoteThreadRow\(startedThreadId, resolvedProjectId\)/);
+  assert.match(createThreadSource, /else \{[\s\S]*path: routeForThread\(startedThreadId\)/);
   assert.match(webApp, /title: task\.title,/);
   assert.match(webApp, /instruction: embeddedInstruction,/);
   assert.match(webApp, /type: "taskboard:create-thread"/);
   assert.match(webApp, /codexProjectWorkspacePath: codexProjectContext\?\.workspacePath/);
   assert.match(webApp, /workspacePath,/);
+  const openTaskSource = webApp.slice(
+    webApp.indexOf("async function openTaskInThread"),
+    webApp.indexOf("async function dispatchTaskSessionFromPanel"),
+  );
+  assert.equal((openTaskSource.match(/if \(conversationRole === "child"\)/g) || []).length, 2);
+  assert.match(
+    openTaskSource,
+    /if \(!worktreeExists\) \{\s*if \(conversationRole === "child"\) \{[\s\S]*?return false;\s*\}\s*workspacePath = developmentScan\.workspacePath \?\? baseWorkspacePath;/,
+  );
+  assert.match(
+    openTaskSource,
+    /if \(!worktreeExists\) \{\s*if \(conversationRole === "child"\) \{[\s\S]*?return false;\s*\}\s*workspacePath = scan\.workspacePath \?\? baseWorkspacePath;/,
+  );
 });
 
 test("the standalone web page opens linked Codex tasks through the app deep link", () => {

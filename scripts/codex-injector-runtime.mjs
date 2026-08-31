@@ -1,6 +1,10 @@
 const HOST_REQUEST_ERROR = "自动认领配置暂时无法应用，请刷新后重试";
 const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
 
+function normalizedTaskConversationThreadId(value) {
+  return String(value ?? "").trim().replace(/^(?:local|cloud):/i, "");
+}
+
 function parseHostRequest(payload, parseAutomationRequest) {
   if (typeof payload !== "string" || payload.length > 4_194_304) {
     return { id: null, request: null, error: HOST_REQUEST_ERROR };
@@ -65,10 +69,50 @@ function parseHostRequest(payload, parseAutomationRequest) {
     && !/[\u0000-\u001f\u007f]/.test(request.taskId)
     && typeof request.previousThreadId === "string"
     && request.previousThreadId.length <= 240
+    && (request.orchestrationId === undefined
+      || (
+        typeof request.orchestrationId === "string"
+        && request.orchestrationId.length > 0
+        && request.orchestrationId.length <= 128
+        && !/[\u0000-\u001f\u007f]/.test(request.orchestrationId)
+      ))
+    && (request.openingRequestId === undefined
+      || (
+        typeof request.openingRequestId === "string"
+        && request.openingRequestId.length > 0
+        && request.openingRequestId.length <= 128
+        && !/[\u0000-\u001f\u007f]/.test(request.openingRequestId)
+      ))
+    && (request.conversationRole === undefined
+      || request.conversationRole === "parent"
+      || request.conversationRole === "child")
+    && (request.parentThreadId === undefined
+      || (
+        typeof request.parentThreadId === "string"
+        && request.parentThreadId.length > 0
+        && request.parentThreadId.length <= 240
+        && !/[\u0000-\u001f\u007f]/.test(request.parentThreadId)
+      ))
+    && (request.conversationRole !== "child"
+      || (
+        typeof request.parentThreadId === "string"
+        && normalizedTaskConversationThreadId(request.parentThreadId)
+        && normalizedTaskConversationThreadId(request.parentThreadId)
+          === normalizedTaskConversationThreadId(request.previousThreadId)
+      ))
     && typeof request.codexHostId === "string"
     && request.codexHostId.length > 0
     && request.codexHostId.length <= 240
     && !/[\u0000-\u001f\u007f]/.test(request.codexHostId)
+    && (request.codexProjectId === undefined
+      || (
+        typeof request.codexProjectId === "string"
+        && request.codexProjectId.length <= 240
+        && !/[\u0000-\u001f\u007f]/.test(request.codexProjectId)
+      ))
+    && (request.codexProjectKind === undefined
+      || request.codexProjectKind === "local"
+      || request.codexProjectKind === "remote")
     && typeof request.projectless === "boolean"
     && (
       request.projectless
@@ -111,6 +155,8 @@ export async function handleHostBindingPayload(params, handlers) {
   }
 
   try {
+    const openingRequestId = parsed.request.openingRequestId;
+    const correlation = openingRequestId === undefined ? {} : { openingRequestId };
     let result;
     if (parsed.request.action === "ensure") {
       result = await handlers.ensure();
@@ -128,14 +174,18 @@ export async function handleHostBindingPayload(params, handlers) {
     await handlers.sendResponse(params.executionContextId, {
       id: parsed.request.id,
       ok: true,
+      ...correlation,
       ...result,
     });
   } catch (error) {
+    const openingRequestId = parsed.request.openingRequestId;
     await handlers.sendResponse(params.executionContextId, {
       id: parsed.request.id,
       ok: false,
+      ...(openingRequestId === undefined ? {} : { openingRequestId }),
       error: error.message,
       ...(typeof error?.threadId === "string" ? { threadId: error.threadId } : {}),
+      ...(error?.identity && typeof error.identity === "object" ? { identity: error.identity } : {}),
       ...(error?.uncertain === true ? { uncertain: true } : {}),
     });
   }
