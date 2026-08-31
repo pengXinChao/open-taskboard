@@ -2403,6 +2403,15 @@ kbd {
   animation: task-card-settle 200ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 
+.board-column.status-in_review .column-list {
+  view-transition-name: review-task-list;
+  view-transition-group: contain;
+}
+
+::view-transition-group-children(review-task-list) {
+  overflow: clip;
+}
+
 ::view-transition-group(*) {
   animation-duration: 220ms;
   animation-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
