@@ -264,21 +264,28 @@ test("issues open an unsent native Codex composer in the confirmed project", () 
   assert.match(source, /async function nativeProjectContext\(\)/);
   assert.match(source, /async function activeNativeWorkspaceRoots\(\)/);
   assert.match(source, /requestNativeFetch\("active-workspace-roots", \{\}\)/);
+  assert.match(source, /available: Array\.isArray\(roots\)/);
   assert.match(source, /function normalizeNativeRootPath\(value\)/);
+  assert.match(source, /async function canonicalNativeRootPaths\(roots\)/);
+  assert.match(source, /requestNativeFetch\("workspace-root-options", \{\s*hostId: "local",\s*canonicalizeRoots: roots,/);
   assert.match(source, /async function resolveNativeProject\(requestedProjectId, workspacePath\)/);
-  assert.match(source, /candidate\.id === requestedProjectId\s*\|\|\s*candidate\.rootPaths\.some/);
+  assert.match(source, /let project = context\.projects\.find\(\(candidate\) => candidate\.id === requestedProjectId\) \?\? null/);
+  assert.match(source, /if \(!project && normalizedWorkspacePath\)/);
   assert.match(source, /const targetRoot = normalizedWorkspacePath \? workspacePath : project\?\.rootPaths\[0\]/);
-  assert.match(source, /async function waitForNativeProject\(targetRoot\)/);
+  assert.match(source, /async function waitForNativeProject\(targetRoot, expectedProjectId\)/);
   const waitStart = source.indexOf("async function waitForNativeProject");
   const waitSource = source.slice(waitStart, source.indexOf("async function createThreadForTask", waitStart));
   assert.match(waitSource, /selectedNativeProjectId\(\)/);
   assert.match(waitSource, /activeNativeWorkspaceRoots\(\)/);
-  assert.match(waitSource, /projectId\s*&&\s*normalizeNativeRootPath\(activeRoots\[0\]\) === normalizedTargetRoot/);
+  assert.match(waitSource, /if \(projectId && projectId === expectedProjectId\)/);
+  assert.match(waitSource, /if \(!activeWorkspace\.available\) return projectId/);
+  assert.match(waitSource, /canonicalNativeRootPaths\(\[\s*targetRoot,\s*\.\.\.activeWorkspace\.roots,/);
+  assert.match(waitSource, /canonicalActiveRoots\.some\(\(root\) => root === canonicalTargetRoot\)/);
   assert.match(
     source,
     /bridge\.sendMessageFromView\(\{\s*type: "electron-add-new-workspace-root-option",\s*root: targetRoot,/,
   );
-  assert.match(source, /await waitForNativeProject\(targetRoot\)/);
+  assert.match(source, /await waitForNativeProject\(targetRoot, projectId\)/);
   assert.match(
     createThreadSource,
     /if \(!projectless && codexProjectKind === "remote"\) \{[\s\S]*?codexHostId = typeof payload\?\.codexHostId[\s\S]*?codexProjectWorkspacePath[\s\S]*?await waitForRemoteProject\(requestedProjectId, codexHostId, codexProjectWorkspacePath\);/,
@@ -357,9 +364,89 @@ test("the standalone web page always opens a project-scoped Codex composer", () 
   assert.match(webApp, /deepLink\.searchParams\.set\("prompt", embeddedInstruction\)/);
 });
 
+test("native fetch preserves successful null bodies and returns undefined when unavailable", async () => {
+  const functionSource = source.slice(
+    source.indexOf("function requestNativeFetch"),
+    source.indexOf("\n\n  async function selectedNativeProjectId"),
+  );
+  const loadRequestNativeFetch = (window) => vm.runInNewContext(`(${functionSource})`, {
+    crypto: { randomUUID: () => "request-id" },
+    window,
+  });
+  const responseWindow = (status, bodyJsonString) => {
+    let onMessage;
+    return {
+      electronBridge: {
+        sendMessageFromView(message) {
+          onMessage({
+            data: {
+              type: "fetch-response",
+              requestId: message.requestId,
+              status,
+              bodyJsonString,
+            },
+          });
+        },
+      },
+      setTimeout,
+      clearTimeout,
+      addEventListener(_type, listener) { onMessage = listener; },
+      removeEventListener() {},
+    };
+  };
+
+  assert.equal(await loadRequestNativeFetch({})("get-global-state", {}), undefined);
+  assert.equal(
+    await loadRequestNativeFetch(responseWindow(200, "null"))("get-global-state", {}),
+    null,
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await loadRequestNativeFetch(responseWindow(200, '{"value":null}'))("get-global-state", {}),
+    )),
+    { value: null },
+  );
+  assert.equal(
+    await loadRequestNativeFetch(responseWindow(500, '{"value":{}}'))("get-global-state", {}),
+    undefined,
+  );
+  assert.equal(
+    await loadRequestNativeFetch(responseWindow(200, "{"))("get-global-state", {}),
+    undefined,
+  );
+
+  let expire;
+  const timeoutWindow = {
+    electronBridge: { sendMessageFromView() {} },
+    setTimeout(callback) { expire = callback; return 1; },
+    clearTimeout() {},
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const timeoutRequest = loadRequestNativeFetch(timeoutWindow)("get-global-state", {});
+  expire();
+  assert.equal(await timeoutRequest, undefined);
+
+  const throwingWindow = {
+    electronBridge: { sendMessageFromView() { throw new Error("unavailable"); } },
+    setTimeout,
+    clearTimeout,
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  assert.equal(
+    await loadRequestNativeFetch(throwingWindow)("get-global-state", {}),
+    undefined,
+  );
+});
+
 test("host context captures all Codex projects even when the sidebar section is collapsed", () => {
   assert.match(source, /async function readCodexProjectMetadata\(\)/);
   assert.match(source, /await window\.electronBridge\?\.getInitialSidebarBootstrap\?\.\(\)/);
+  assert.match(source, /requestNativeFetch\("get-global-state", \{ key: "local-projects" \}\)/);
+  assert.match(source, /requestNativeFetch\("get-global-state", \{ key: "remote-projects" \}\)/);
+  assert.match(source, /currentLocalProjects === undefined\s*\? entries\.get\("local-projects"\)\s*: currentLocalProjects\?\.value/);
+  assert.match(source, /currentRemoteProjects === undefined\s*\? entries\.get\("remote-projects"\)\s*: currentRemoteProjects\?\.value/);
   assert.match(source, /entries\.get\("local-projects"\)/);
   assert.match(source, /entries\.get\("remote-projects"\)/);
   assert.match(source, /projectKind: "remote"/);
@@ -386,6 +473,7 @@ test("Codex bootstrap metadata resolves local roots and SSH remote roots asynchr
     source.indexOf("\n\n  async function activeNativeWorkspaceRoots"),
   );
   const readCodexProjectMetadata = vm.runInNewContext(`(${functionSource})`, {
+    requestNativeFetch: async () => undefined,
     window: {
       electronBridge: {
         getInitialSidebarBootstrap: async () => ({
@@ -425,6 +513,333 @@ test("Codex bootstrap metadata resolves local roots and SSH remote roots asynchr
       }],
     ],
   );
+});
+
+test("Codex project metadata prefers the live global state over the startup bootstrap", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function readCodexProjectMetadata"),
+    source.indexOf("\n\n  async function activeNativeWorkspaceRoots"),
+  );
+  const readCodexProjectMetadata = vm.runInNewContext(`(${functionSource})`, {
+    requestNativeFetch: async (_path, body) => ({
+      value: body.key === "local-projects"
+        ? { live: { rootPaths: ["/Users/example/live"] } }
+        : [{
+          id: "live-remote",
+          hostId: "remote-ssh-discovered:live",
+          remotePath: "/srv/live",
+          label: "Live Remote",
+        }],
+    }),
+    window: {
+      electronBridge: {
+        getInitialSidebarBootstrap: async () => ({
+          globalStateEntries: [
+            {
+              key: "local-projects",
+              value: { stale: { rootPaths: ["/Users/example/stale"] } },
+            },
+            {
+              key: "remote-projects",
+              value: [{
+                id: "stale-remote",
+                hostId: "remote-ssh-discovered:stale",
+                remotePath: "/srv/stale",
+              }],
+            },
+          ],
+        }),
+      },
+    },
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify([...(await readCodexProjectMetadata()).entries()])),
+    [
+      ["live", {
+        projectKind: "local",
+        hostId: "local",
+        workspacePath: "/Users/example/live",
+      }],
+      ["live-remote", {
+        projectKind: "remote",
+        workspacePath: "/srv/live",
+        hostId: "remote-ssh-discovered:live",
+        name: "Live Remote",
+      }],
+    ],
+  );
+});
+
+test("successful empty Codex project state does not revive startup metadata", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function readCodexProjectMetadata"),
+    source.indexOf("\n\n  async function activeNativeWorkspaceRoots"),
+  );
+  const bootstrap = {
+    globalStateEntries: [
+      {
+        key: "local-projects",
+        value: { stale: { rootPaths: ["/Users/example/stale"] } },
+      },
+      {
+        key: "remote-projects",
+        value: [{
+          id: "stale-remote",
+          hostId: "remote-ssh-discovered:stale",
+          remotePath: "/srv/stale",
+        }],
+      },
+    ],
+  };
+  const loadMetadata = (requestNativeFetch) => vm.runInNewContext(`(${functionSource})`, {
+    requestNativeFetch,
+    window: {
+      electronBridge: { getInitialSidebarBootstrap: async () => bootstrap },
+    },
+  });
+
+  for (const requestNativeFetch of [
+    async () => null,
+    async () => ({ value: null }),
+    async (_path, body) => ({ value: body.key === "local-projects" ? {} : [] }),
+  ]) {
+    assert.deepEqual(
+      JSON.parse(JSON.stringify([...(await loadMetadata(requestNativeFetch)()).entries()])),
+      [],
+    );
+  }
+});
+
+test("new Codex conversations resolve projects added after startup", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function nativeProjectContext"),
+    source.indexOf("\n\n  async function resolveNativeProject"),
+  );
+  const nativeProjectContext = vm.runInNewContext(`(${functionSource})`, {
+    requestNativeFetch: async () => ({
+      value: {
+        "live-project": { rootPaths: ["/Users/example/live"] },
+      },
+    }),
+    window: {
+      electronBridge: {
+        getInitialSidebarBootstrap: async () => ({
+          globalStateEntries: [{
+            key: "local-projects",
+            value: { stale: { rootPaths: ["/Users/example/stale"] } },
+          }],
+        }),
+      },
+    },
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify((await nativeProjectContext()).projects)),
+    [{ id: "live-project", rootPaths: ["/Users/example/live"] }],
+  );
+});
+
+test("new Codex conversations only use startup projects when the live request is unavailable", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function nativeProjectContext"),
+    source.indexOf("\n\n  async function resolveNativeProject"),
+  );
+  const bootstrap = {
+    globalStateEntries: [{
+      key: "local-projects",
+      value: { stale: { rootPaths: ["/Users/example/stale"] } },
+    }],
+  };
+  const loadContext = (response) => vm.runInNewContext(`(${functionSource})`, {
+    requestNativeFetch: async () => response,
+    window: {
+      electronBridge: { getInitialSidebarBootstrap: async () => bootstrap },
+    },
+  });
+
+  for (const response of [null, { value: null }, { value: {} }, { value: [] }]) {
+    assert.deepEqual(
+      JSON.parse(JSON.stringify((await loadContext(response)()).projects)),
+      [],
+    );
+  }
+  assert.deepEqual(
+    JSON.parse(JSON.stringify((await loadContext(undefined)()).projects)),
+    [{ id: "stale", rootPaths: ["/Users/example/stale"] }],
+  );
+});
+
+test("native root canonicalization follows the filesystem's case sensitivity", async () => {
+  const start = source.indexOf("function normalizeNativeRootPath");
+  const functionSource = source.slice(
+    start,
+    source.indexOf("\n\n  function readCodexProjects", start),
+  );
+  const roots = [
+    "/private/tmp/LOCAL344-default/Project",
+    "/private/tmp/local344-default/project",
+    "/Volumes/LOCAL344CASE/Project",
+    "/Volumes/LOCAL344CASE/project",
+  ];
+  const loadCanonicalizer = (requestNativeFetch) => vm.runInNewContext(`(() => {
+    ${functionSource}
+    return { normalizeNativeRootPath, canonicalNativeRootPaths };
+  })()`, { requestNativeFetch });
+  const calls = [];
+  const canonicalizer = loadCanonicalizer(async (path, body) => {
+    calls.push({ path, body: JSON.parse(JSON.stringify(body)) });
+    return {
+      canonicalPathByRoot: {
+        [roots[0]]: roots[0],
+        [roots[1]]: roots[0],
+        [roots[2]]: roots[2],
+        [roots[3]]: roots[3],
+      },
+    };
+  });
+  const canonicalRoots = await canonicalizer.canonicalNativeRootPaths(roots);
+
+  assert.equal(canonicalRoots[0], canonicalRoots[1]);
+  assert.notEqual(canonicalRoots[2], canonicalRoots[3]);
+  assert.notEqual(
+    canonicalizer.normalizeNativeRootPath(roots[2]),
+    canonicalizer.normalizeNativeRootPath(roots[3]),
+  );
+  assert.deepEqual(calls, [{
+    path: "workspace-root-options",
+    body: { hostId: "local", canonicalizeRoots: roots },
+  }]);
+
+  const unavailable = loadCanonicalizer(async () => undefined);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(await unavailable.canonicalNativeRootPaths([roots[2], roots[3]]))),
+    [roots[2], roots[3]],
+  );
+  const missingMapping = loadCanonicalizer(async () => ({
+    canonicalPathByRoot: { [roots[0]]: "/private/tmp/LOCAL344-default/Project" },
+  }));
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(await missingMapping.canonicalNativeRootPaths([roots[0], roots[1]]))),
+    [roots[0], roots[1]],
+  );
+});
+
+test("native project resolution gives the explicit project ID priority over path candidates", async () => {
+  const functionSource = source.slice(
+    source.indexOf("async function resolveNativeProject"),
+    source.indexOf("\n\n  async function ensureProjectRows"),
+  );
+  let canonicalCalls = 0;
+  const resolveNativeProject = vm.runInNewContext(`(${functionSource})`, {
+    nativeProjectContext: async () => ({
+      projects: [
+        { id: "wrong", rootPaths: ["/Volumes/LOCAL344CASE/project"] },
+        { id: "expected", rootPaths: ["/Volumes/LOCAL344CASE/Project"] },
+      ],
+    }),
+    normalizeNativeRootPath: (value) => String(value || "").replace(/\/+$/, ""),
+    canonicalNativeRootPaths: async () => { canonicalCalls += 1; return []; },
+  });
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await resolveNativeProject("expected", "/Volumes/LOCAL344CASE/project"),
+    )),
+    { projectId: "expected", targetRoot: "/Volumes/LOCAL344CASE/project" },
+  );
+  assert.equal(canonicalCalls, 0);
+});
+
+test("native project confirmation composes exact IDs, root availability, and canonical roots", async () => {
+  const normalizeStart = source.indexOf("function normalizeNativeRootPath");
+  const canonicalSource = source.slice(
+    normalizeStart,
+    source.indexOf("\n\n  function readCodexProjects", normalizeStart),
+  );
+  const waitStart = source.indexOf("async function waitForNativeProject");
+  const waitSource = source.slice(
+    waitStart,
+    source.indexOf("\n\n  async function createThreadForTask", waitStart),
+  );
+  const loadWait = ({ projectId, activeWorkspace, canonicalPathByRoot }) => {
+    let now = 0;
+    const canonicalCalls = [];
+    const api = vm.runInNewContext(`(() => {
+      ${canonicalSource}
+      ${waitSource}
+      return { waitForNativeProject };
+    })()`, {
+      Date: { now: () => now },
+      activeNativeWorkspaceRoots: async () => activeWorkspace,
+      hostText: (_chinese, english) => english,
+      requestNativeFetch: async (path, body) => {
+        canonicalCalls.push({ path, body: JSON.parse(JSON.stringify(body)) });
+        return canonicalPathByRoot === undefined ? undefined : { canonicalPathByRoot };
+      },
+      selectedNativeProjectId: async () => projectId,
+      window: {
+        setTimeout(resolve) { now = 8_001; resolve(); },
+      },
+    });
+    return { waitForNativeProject: api.waitForNativeProject, canonicalCalls };
+  };
+
+  const unavailable = loadWait({
+    projectId: "expected",
+    activeWorkspace: { available: false, roots: [] },
+  });
+  assert.equal(
+    await unavailable.waitForNativeProject("/Volumes/LOCAL344CASE/Project", "expected"),
+    "expected",
+  );
+  assert.deepEqual(unavailable.canonicalCalls, []);
+
+  const defaultTarget = "/private/tmp/LOCAL344-default/Project";
+  const defaultActive = "/private/tmp/local344-default/project";
+  const canonicalMatch = loadWait({
+    projectId: "expected",
+    activeWorkspace: { available: true, roots: [defaultActive] },
+    canonicalPathByRoot: {
+      [defaultTarget]: defaultTarget,
+      [defaultActive]: defaultTarget,
+    },
+  });
+  assert.equal(
+    await canonicalMatch.waitForNativeProject(defaultTarget, "expected"),
+    "expected",
+  );
+  assert.deepEqual(canonicalMatch.canonicalCalls, [{
+    path: "workspace-root-options",
+    body: { hostId: "local", canonicalizeRoots: [defaultTarget, defaultActive] },
+  }]);
+
+  const emptyRoots = loadWait({
+    projectId: "expected",
+    activeWorkspace: { available: true, roots: [] },
+    canonicalPathByRoot: {},
+  });
+  await assert.rejects(
+    emptyRoots.waitForNativeProject("/Volumes/LOCAL344CASE/Project", "expected"),
+  );
+
+  const sensitiveTarget = "/Volumes/LOCAL344CASE/Project";
+  const sensitiveOther = "/Volumes/LOCAL344CASE/project";
+  const mismatch = loadWait({
+    projectId: "expected",
+    activeWorkspace: { available: true, roots: [sensitiveOther] },
+    canonicalPathByRoot: {
+      [sensitiveTarget]: sensitiveTarget,
+      [sensitiveOther]: sensitiveOther,
+    },
+  });
+  await assert.rejects(mismatch.waitForNativeProject(sensitiveTarget, "expected"));
+
+  const wrongProject = loadWait({
+    projectId: "wrong",
+    activeWorkspace: { available: true, roots: [defaultTarget] },
+    canonicalPathByRoot: { [defaultTarget]: defaultTarget },
+  });
+  await assert.rejects(wrongProject.waitForNativeProject(defaultTarget, "expected"));
+  assert.deepEqual(wrongProject.canonicalCalls, []);
 });
 
 test("SSH task project selection uses its stable ID and local project IDs use bootstrap keys", () => {
