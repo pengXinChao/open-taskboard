@@ -107,6 +107,19 @@ let quotaPoliciesWritePromise = Promise.resolve();
 const taskConversationAppServerTimeoutMs = 30_000;
 const remoteAutomationTurnTimeoutMs = 30 * 60_000;
 
+function stableCodexUserId(account) {
+  const email = account?.account?.type === "chatgpt"
+    && typeof account.account.email === "string"
+    ? account.account.email.trim().toLowerCase()
+    : "";
+  if (!email) return "";
+  const digest = createHash("sha256")
+    .update("codex-taskboard-user\0")
+    .update(email)
+    .digest("hex");
+  return `codex-user-${digest}`;
+}
+
 function parseArgs(argv) {
   const options = {
     port: defaultCodexDebuggingPort,
@@ -339,6 +352,28 @@ function codexExecutablePath(appPath) {
   );
 }
 
+function codexAppBundleBuild(appPath) {
+  if (process.platform !== "darwin") return null;
+  const result = spawnSync(
+    "/usr/bin/plutil",
+    [
+      "-extract",
+      "CFBundleVersion",
+      "raw",
+      "-o",
+      "-",
+      path.join(appPath, "Contents", "Info.plist"),
+    ],
+    {
+      encoding: "utf8",
+      env: withoutTaskboardLauncherEnvironment(process.env),
+      stdio: ["ignore", "pipe", "ignore"],
+    },
+  );
+  if (result.status !== 0) return null;
+  return result.stdout.trim() || null;
+}
+
 function codexAppProcesses(appPath) {
   const processes = spawnSync("/bin/ps", ["-ww", "-axo", "pid=,command="], {
     encoding: "utf8",
@@ -359,6 +394,24 @@ function codexAppProcesses(appPath) {
     }
   }
   return matches;
+}
+
+function codexUpdateReplacementProcess(appPath, exitedPid, previousBuild) {
+  if (process.platform !== "darwin" || !previousBuild) return null;
+  const build = codexAppBundleBuild(appPath);
+  if (!build || build === previousBuild) return null;
+
+  const candidates = codexAppProcesses(appPath)
+    .filter((record) => record.pid !== exitedPid);
+  if (candidates.length !== 1) return null;
+
+  const [candidate] = candidates;
+  const profileArgument = `--user-data-dir=${independentCodexProfilePath}`;
+  if (
+    candidate.command.includes(` ${profileArgument}`)
+    || / --remote-debugging-port(?:=|\s|$)/.test(candidate.command)
+  ) return null;
+  return { build, process: candidate };
 }
 
 function managedCodexProcesses(appPath) {
@@ -2242,6 +2295,31 @@ function installTaskboardHostBinding(
       isAuthorizedContext: (executionContextId) => executionContextId === activeContextId,
       parseAutomationRequest: parseTaskboardAutomationHostRequest,
       ensure: () => supervisor.ensure({ force: true }),
+      readCurrentUser: async () => {
+        let account = await requestCodexAppServerViaCdp(
+          cdp,
+          undefined,
+          "local",
+          "account/read",
+          { refreshToken: false },
+        );
+        if (
+          account?.account?.type === "chatgpt"
+          && (
+            typeof account.account.email !== "string"
+            || !account.account.email.trim()
+          )
+        ) {
+          account = await requestCodexAppServerViaCdp(
+            cdp,
+            undefined,
+            "local",
+            "account/read",
+            { refreshToken: true },
+          );
+        }
+        return { userId: stableCodexUserId(account) };
+      },
       loadFrame: (request) => loadTaskboardFrameViaCdp(
         cdp,
         request.frameName,
@@ -2710,6 +2788,8 @@ async function main() {
   let pendingCodexLaunch = null;
   let cdpRuntime = null;
   let codexAppPid = null;
+  let managedCodexBuild = null;
+  let exitedManagedCodex = null;
   let nativeCodexBrowser = false;
   let runtimePublishPromise = null;
   const injectedTargets = new Map();
@@ -2948,6 +3028,9 @@ async function main() {
     try {
       managedCodex = await launchPromise;
       codexAppPid = managedCodex.pid;
+      if (process.platform === "darwin" && options.watch) {
+        managedCodexBuild = codexAppBundleBuild(options.appPath);
+      }
     } catch (error) {
       if (!stopping) throw error;
     } finally {
@@ -2962,6 +3045,49 @@ async function main() {
     }
     if (!stopping) cdpRuntime = tcpCdpRuntime(options.port);
     return !stopping;
+  };
+
+  const recoverManagedCodexAfterUpdate = async () => {
+    if (!exitedManagedCodex) return false;
+    const updateReplacement = codexUpdateReplacementProcess(
+      options.appPath,
+      exitedManagedCodex.pid,
+      exitedManagedCodex.build,
+    );
+    if (!updateReplacement) return false;
+
+    const previousManagedCodex = exitedManagedCodex;
+    exitedManagedCodex = null;
+    try {
+      await stopManagedCodex(updateReplacement.process);
+      managedCodex = null;
+      managedCodexBuild = null;
+      codexAppPid = null;
+      nativeCodexBrowser = false;
+      if (!(await startManagedCodex())) {
+        throw new Error("Managed Codex did not restart after the app update");
+      }
+      idleAfterNormalExit = false;
+      console.log(JSON.stringify({
+        restartedCodexAfterUpdate: true,
+        previousPid: previousManagedCodex.pid,
+        replacementPid: updateReplacement.process.pid,
+        managedPid: codexAppPid,
+        previousBuild: previousManagedCodex.build,
+        build: managedCodexBuild,
+        cdpPort: options.port,
+      }));
+    } catch (restartError) {
+      cdpRuntime?.close();
+      cdpRuntime = null;
+      managedCodex = null;
+      managedCodexBuild = null;
+      codexAppPid = null;
+      nativeCodexBrowser = false;
+      idleAfterNormalExit = true;
+      console.error(`Waiting for Codex after update recovery failed: ${restartError.message}`);
+    }
+    return true;
   };
 
   let cleanupPromise = null;
@@ -3068,6 +3194,9 @@ async function main() {
         managedCodex = managedCodexProcesses(options.appPath)
           .find((record) => record.pid === runningCodex.pid) ?? null;
         codexAppPid = runningCodex.pid;
+        if (process.platform === "darwin" && options.watch && managedCodex) {
+          managedCodexBuild = codexAppBundleBuild(options.appPath);
+        }
         if (!managedCodex) {
           options.attachExisting = true;
           console.log(JSON.stringify({ reusedCodexPid: runningCodex.pid, cdpPort: options.port }));
@@ -3154,16 +3283,21 @@ async function main() {
         continue;
       }
       if (idleAfterNormalExit) {
-        if (!hasOpenPending()) continue;
-        try {
-          if (!(await startManagedCodex())) {
-            if (nativeCodexBrowser) await requestTaskboardOpen();
+        if (await recoverManagedCodexAfterUpdate()) {
+          if (idleAfterNormalExit) continue;
+        } else {
+          if (!hasOpenPending()) continue;
+          try {
+            if (!(await startManagedCodex())) {
+              if (nativeCodexBrowser) await requestTaskboardOpen();
+              continue;
+            }
+            exitedManagedCodex = null;
+            idleAfterNormalExit = false;
+          } catch (restartError) {
+            console.error(`Waiting to restart Codex: ${restartError.message}`);
             continue;
           }
-          idleAfterNormalExit = false;
-        } catch (restartError) {
-          console.error(`Waiting to restart Codex: ${restartError.message}`);
-          continue;
         }
       }
       try {
@@ -3231,6 +3365,10 @@ async function main() {
           : codexAppPid && !codexAppProcesses(options.appPath)
             .some((record) => record.pid === codexAppPid);
         if (launchedCodexExited) {
+          const exitedCodexPid = codexAppPid;
+          exitedManagedCodex = managedCodex?.pid === exitedCodexPid && managedCodexBuild
+            ? { pid: exitedCodexPid, build: managedCodexBuild }
+            : null;
           injectedTargets.forEach((connection) => {
             unregisterRoutableCodexConnection(connection);
             unregisterQuotaPolicyCdp(connection);
@@ -3258,7 +3396,9 @@ async function main() {
             }
             continue;
           }
+          if (await recoverManagedCodexAfterUpdate()) continue;
           managedCodex = null;
+          managedCodexBuild = null;
           codexAppPid = null;
           idleAfterNormalExit = true;
           console.error(
