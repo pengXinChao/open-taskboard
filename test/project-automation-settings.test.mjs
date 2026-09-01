@@ -77,7 +77,7 @@ test("project mapping is based on exact ids and workspace paths, never project n
   assert.doesNotMatch(appSource, /project\.name === selectedProject\.name/);
 });
 
-test("global tasks open a projectless conversation", () => {
+test("Jira parent sessions open a projectless conversation", () => {
   const openTaskSource = appSource.slice(
     appSource.indexOf("function codexProjectContextForTaskProject"),
     appSource.indexOf("function changeProject"),
@@ -88,10 +88,10 @@ test("global tasks open a projectless conversation", () => {
   );
   assert.match(
     openTaskSource,
-    /const projectless = task\.projectId === GLOBAL_PROJECT_ID/,
+    /const projectless = conversationRole === "parent" \|\| jiraEntry/,
   );
   assert.match(openTaskSource, /codexProjectId: codexProject\.id,\s*codexProjectKind: codexProject\.projectKind/);
-  assert.match(openTaskSource, /const savedRemoteIdentity = projectCodexIdentities\[task\.projectId\]/);
+  assert.match(openTaskSource, /const savedRemoteIdentity = !projectless\s*&& projectCodexIdentities\[task\.projectId\]/);
   assert.match(openTaskSource, /codexProjectContextForTaskProject\(task\.projectId\)/);
   assert.match(openTaskSource, /project\.hostId === baseIdentity\.codexHostId/);
   assert.match(openTaskSource, /project\.workspacePath === worktreePath/);

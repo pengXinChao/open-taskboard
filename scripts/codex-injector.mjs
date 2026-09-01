@@ -807,13 +807,15 @@ async function restartResidentInjectorForRefresh(port) {
   });
 }
 
-async function refreshTaskboardFrames(port) {
-  const targets = await codexTargets(port);
+async function refreshTaskboardFrames(port, runtime = null) {
+  const targets = runtime ? await runtime.targets() : await codexTargets(port);
   const results = [];
 
   for (const target of targets) {
-    const cdp = new CdpConnection(target.webSocketDebuggerUrl);
-    await cdp.open();
+    const cdp = runtime
+      ? await runtime.connect(target)
+      : new CdpConnection(target.webSocketDebuggerUrl);
+    if (!runtime) await cdp.open();
     try {
       await cdp.send("Runtime.enable");
       const evaluation = await cdp.send("Runtime.evaluate", {
@@ -2821,6 +2823,7 @@ async function main() {
   let managedCodex = null;
   let pendingCodexLaunch = null;
   let cdpRuntime = null;
+  let rendererRecoveryAttempts = 0;
   let codexAppPid = null;
   let nativeCodexBrowser = false;
   let runtimePublishPromise = null;
@@ -3267,6 +3270,22 @@ async function main() {
     let firstResults = [];
     const firstOpenGeneration = openRequestGeneration;
     const shouldOpenFirstTarget = firstOpenGeneration > openedRequestGeneration;
+    const recoverRendererFrame = async (error) => {
+      if (
+        !error?.message?.includes("Taskboard frame did not report ready")
+        || !cdpRuntime
+        || rendererRecoveryAttempts >= 3
+      ) return;
+      rendererRecoveryAttempts += 1;
+      try {
+        await refreshTaskboardFrames(options.port, cdpRuntime);
+        console.error(
+          `Reloaded Taskboard frame after renderer readiness failure (attempt ${rendererRecoveryAttempts}/3)`,
+        );
+      } catch (refreshError) {
+        console.error(`Taskboard frame recovery failed: ${refreshError.message}`);
+      }
+    };
     if (!idleAfterNormalExit && !nativeCodexBrowser) {
       try {
         firstResults = await injectAll(
@@ -3287,6 +3306,7 @@ async function main() {
       } catch (error) {
         if (!options.watch) throw error;
         console.error(`Waiting for Codex renderer: ${error.message}`);
+        await recoverRendererFrame(error);
       }
     }
     if (stopping) return;
@@ -3365,6 +3385,7 @@ async function main() {
           unregisterRoutableCodexConnection,
         );
         if (results.length > 0) {
+          rendererRecoveryAttempts = 0;
           console.log(JSON.stringify({ injected: results }, null, 2));
         }
         if (hasOpenPending()) {
@@ -3372,6 +3393,7 @@ async function main() {
         }
       } catch (error) {
         if (stopping) break;
+        await recoverRendererFrame(error);
         if (options.cdpPipe && !cdpRuntime.isHealthy()) {
           const launchedCodex = codexProcess;
           if (

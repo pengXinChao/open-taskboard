@@ -24,6 +24,9 @@ test("the resident injector authenticates its launcher-managed Taskboard service
   assert.match(source, /proof/);
   assert.match(source, /taskboardInstanceSecret/);
   assert.match(source, /Page\.setDocumentContent/);
+  assert.match(source, /Reloaded Taskboard frame after renderer readiness failure/);
+  assert.match(source, /refreshTaskboardFrames\(options\.port, cdpRuntime\)/);
+  assert.match(source, /runtime\s*\?\s*await runtime\.connect\(target\)/);
   assert.match(runtimeSource, /request\.action === "load-frame"/);
   assert.match(supervisorSource, /ensureInFlight/);
   assert.match(supervisorSource, /await terminateManagedChild\(managedChild\)/);

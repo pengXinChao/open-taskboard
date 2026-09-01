@@ -1176,7 +1176,17 @@ fn watch_launcher_output<R: std::io::Read + Send + 'static>(
     thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
             append_log(&state, &line);
-            if is_stderr && line.contains("Waiting for Codex") {
+            if is_stderr && line.contains("Taskboard frame did not report ready") {
+                // renderer 已连接但 iframe 握手失败时，明确提示自动恢复，避免长期显示泛化的启动状态。
+                update_snapshot(&app, &state, |snapshot| {
+                    if state.generation.load(Ordering::SeqCst) == generation
+                        && snapshot.child_pid == Some(pid)
+                    {
+                        snapshot.phase = "starting".into();
+                        snapshot.message = "任务面板加载失败，正在自动恢复…".into();
+                    }
+                });
+            } else if is_stderr && line.contains("Waiting for Codex") {
                 update_snapshot(&app, &state, |snapshot| {
                     if state.generation.load(Ordering::SeqCst) == generation
                         && snapshot.child_pid == Some(pid)

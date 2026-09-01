@@ -433,24 +433,33 @@ test("orchestration-driven Jira status changes retain local override until remot
   }
 });
 
-test("Jira sync maps targetless todo to backlog in newer databases", async () => {
-  const fixture = await createFixture();
+test("Jira sync preserves targetless todo after removing the legacy execution constraint", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-orchestration-legacy-test-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const initialDatabase = new TaskboardDatabase(databasePath);
+  initialDatabase.createProject({
+    id: "orchestration-project",
+    name: "Orchestration Project",
+    workspacePath: "/tmp/orchestration-project",
+  });
+  initialDatabase.database.exec(`
+    ALTER TABLE tasks ADD COLUMN execution_target TEXT;
+    CREATE TRIGGER tasks_todo_execution_target_update
+    BEFORE UPDATE OF status, execution_target ON tasks
+    WHEN NEW.status = 'todo' AND NEW.execution_target IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'todo requires an execution target');
+    END;
+    CREATE TRIGGER tasks_todo_execution_target_insert
+    BEFORE INSERT ON tasks
+    WHEN NEW.status = 'todo' AND NEW.execution_target IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'todo requires an execution target');
+    END;
+  `);
+  initialDatabase.close();
+  const database = new TaskboardDatabase(databasePath);
   try {
-    fixture.database.database.exec(`
-      ALTER TABLE tasks ADD COLUMN execution_target TEXT;
-      CREATE TRIGGER tasks_todo_execution_target_update
-      BEFORE UPDATE OF status, execution_target ON tasks
-      WHEN NEW.status = 'todo' AND NEW.execution_target IS NULL
-      BEGIN
-        SELECT RAISE(ABORT, 'todo requires an execution target');
-      END;
-      CREATE TRIGGER tasks_todo_execution_target_insert
-      BEFORE INSERT ON tasks
-      WHEN NEW.status = 'todo' AND NEW.execution_target IS NULL
-      BEGIN
-        SELECT RAISE(ABORT, 'todo requires an execution target');
-      END;
-    `);
     const issue = {
       id: "jira-targetless-todo",
       identifier: "JIRA:ORCHESTRATION:jira-targetless-todo",
@@ -472,10 +481,17 @@ test("Jira sync maps targetless todo to backlog in newer databases", async () =>
       updatedAt: "2026-08-30T00:00:00.000Z",
     };
 
-    fixture.database.syncJiraTasks([issue], { projectName: "Jira" });
-    assert.equal(fixture.database.getTask(issue.id).status, "backlog");
+    database.syncJiraTasks([issue], { projectName: "Jira" });
+    assert.equal(database.getTask(issue.id).status, "todo");
+    assert.equal(
+      database.database.prepare(
+        "SELECT COUNT(*) AS count FROM sqlite_schema WHERE type = 'trigger' AND name LIKE 'tasks_todo_execution_target_%'",
+      ).get().count,
+      0,
+    );
   } finally {
-    await fixture.close();
+    database.close();
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
