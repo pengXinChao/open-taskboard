@@ -36,9 +36,10 @@ test("embedded page uses the launcher URL inside an opaque sandbox", () => {
 });
 
 test("entry clones the native Plugins row and the page covers the complete Codex workspace", () => {
-  assert.match(source, /const PLUGIN_LABELS = \["插件", "plugins"\]/);
+  assert.match(source, /const PLUGIN_LABELS = \["插件", "plugins", "外掛程式", "プラグイン"\]/);
   assert.match(source, /if \(plugin\?\.parentElement\) return plugin;/);
-  assert.match(source, /return directButtons\.length >= 3/);
+  assert.match(source, /button\.getAttribute\(OWNED_ATTRIBUTE\) !== "true"/);
+  assert.match(source, /rect\.bottom <= sectionTop/);
   assert.match(source, /const button = reference\.cloneNode\(true\)/);
   assert.match(source, /reference\.after\(entry\)/);
   assert.match(source, /document\.querySelector\("\.app-shell-main-content-frame"\)/);
@@ -51,6 +52,82 @@ test("entry clones the native Plugins row and the page covers the complete Codex
   assert.doesNotMatch(source, /codex-taskboard-overlay/);
   assert.doesNotMatch(source, /codex-taskboard-toolbar/);
   assert.doesNotMatch(source, /aria-modal/);
+});
+
+test("entry recognizes known Plugins labels and structurally anchors an unenumerated locale", () => {
+  const normalizedLabelSource = source.slice(
+    source.indexOf("function normalizedLabel"),
+    source.indexOf("\n\n  function hostLanguage"),
+  );
+  const referenceSource = source.slice(
+    source.indexOf("function buttonMatches"),
+    source.indexOf("\n\n  function replaceEntryIcon"),
+  );
+  let currentButtons;
+  let currentSection;
+  const scroll = {
+    querySelector: (selector) => selector === "[data-app-action-sidebar-section]" ? currentSection : null,
+    querySelectorAll: (selector) => selector === "button" ? currentButtons : [],
+  };
+  const findReferenceButton = vm.runInNewContext(`(() => {
+    const PLUGIN_LABELS = ["插件", "plugins", "外掛程式", "プラグイン"];
+    const OWNED_ATTRIBUTE = "data-codex-taskboard-owned";
+    ${normalizedLabelSource}
+    ${referenceSource}
+    return findReferenceButton;
+  })()`, {
+    document: { querySelector: () => scroll },
+  });
+
+  for (const textContent of ["插件", "外掛程式", "プラグイン", "Plugins"]) {
+    const currentButton = {
+      textContent,
+      getAttribute: () => null,
+      parentElement: {},
+    };
+    currentButtons = [currentButton];
+    currentSection = null;
+    assert.equal(findReferenceButton(), currentButton);
+  }
+
+  const topButton = (textContent, top, owned = false) => ({
+    textContent,
+    getAttribute: (name) => name === "data-codex-taskboard-owned" && owned ? "true" : null,
+    getBoundingClientRect: () => ({ top, bottom: top + 30, height: 30 }),
+    parentElement: {},
+  });
+  const unenumeratedPlugin = topButton("Приклучоци", 160);
+  currentButtons = [
+    topButton("Барања за повлекување", 100),
+    topButton("Локации", 120),
+    topButton("Закажано", 140),
+    unenumeratedPlugin,
+    topButton("Taskboard", 180, true),
+  ];
+  currentSection = { getBoundingClientRect: () => ({ top: 200 }) };
+  assert.equal(findReferenceButton(), unenumeratedPlugin);
+
+  const languageDocument = { documentElement: { lang: "" } };
+  const languageSource = source.slice(
+    source.indexOf("function hostLanguage"),
+    source.indexOf("\n\n  function hostError"),
+  );
+  const hostText = vm.runInNewContext(`(() => {
+    ${languageSource}
+    return hostText;
+  })()`, {
+    document: languageDocument,
+    navigator: { language: "en-US" },
+  });
+
+  for (const language of ["zh", "zh-CN", "zh-TW", "zh-HK"]) {
+    languageDocument.documentElement.lang = language;
+    assert.equal(hostText("任务面板", "Taskboard"), "任务面板");
+  }
+  for (const language of ["en-US", "ja-JP", "de-DE"]) {
+    languageDocument.documentElement.lang = language;
+    assert.equal(hostText("任务面板", "Taskboard"), "Taskboard");
+  }
 });
 
 test("opening Taskboard suppresses native selection and contextual header until close", () => {

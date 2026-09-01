@@ -14,127 +14,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release-linux:
-    name: Build Ubuntu 24.04 x64 packages
+  release-preflight:
+    name: Validate release tag and versions
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set up Node.js 22
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Set up Rust 1.88
-        uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
-        with:
-          targets: x86_64-unknown-linux-gnu
-
-      - name: Install Ubuntu build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            curl \
-            file \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            patchelf \
-            wget
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build Ubuntu 24.04 x64 packages and updater
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: >-
-          npm run app:build:linux:x64 --
-          --config '{"bundle":{"createUpdaterArtifacts":true}}'
-
-      - name: Verify Ubuntu 24.04 x64 package contents
-        run: >-
-          node scripts/verify-linux-packages.mjs
-          src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
-          src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
-
-      - name: Stage Ubuntu 24.04 x64 release assets
-        run: |
-          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
-          LINUX_RELEASE="$RUNNER_TEMP/linux-release"
-          mkdir -p "$LINUX_RELEASE"
-          cp \
-            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb \
-            "$LINUX_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_Ubuntu-24.04-x64.deb"
-          cp \
-            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb.sig \
-            "$LINUX_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_Ubuntu-24.04-x64.deb.sig"
-          cp \
-            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage \
-            "$LINUX_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_Ubuntu-24.04-x64.AppImage"
-          cp \
-            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig \
-            "$LINUX_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_Ubuntu-24.04-x64.AppImage.sig"
-
-      - name: Preserve Ubuntu 24.04 x64 release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: linux-release-${{ github.sha }}
-          path: ${{ runner.temp }}/linux-release
-          if-no-files-found: error
-
-  release-windows-preview:
-    name: Build unsigned Windows x64 Preview
-    runs-on: windows-2025
-    timeout-minutes: 40
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set up Node.js 22
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Set up Rust 1.88
-        uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build unsigned Windows x64 Preview
-        run: npm run app:build:windows
-
-      - name: Preserve unsigned Windows x64 Preview
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: windows-preview-${{ github.sha }}
-          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
-          if-no-files-found: error
-
-  release-macos:
-    name: Build signed universal macOS app
-    needs:
-      - release-linux
-      - release-windows-preview
-    runs-on: macos-latest
-    timeout-minutes: 90
+    outputs:
+      release_tag: ${{ steps.validate.outputs.release_tag }}
+      package_version: ${{ steps.validate.outputs.package_version }}
 
     steps:
       - name: Checkout
@@ -147,9 +32,9 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
-          cache: npm
 
       - name: Validate release tag and versions
+        id: validate
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
@@ -236,6 +121,146 @@ jobs:
           NODE
           echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
           echo "PACKAGE_VERSION=$PACKAGE_VERSION" >> "$GITHUB_ENV"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "package_version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+
+  release-linux:
+    name: Build Ubuntu 24.04 x64 packages
+    needs: release-preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust 1.88
+        uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install Ubuntu build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Ubuntu 24.04 x64 packages and updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: >-
+          npm run app:build:linux:x64 --
+          --config '{"bundle":{"createUpdaterArtifacts":true}}'
+
+      - name: Verify Ubuntu 24.04 x64 package contents
+        run: >-
+          node scripts/verify-linux-packages.mjs
+          src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+          src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+
+      - name: Stage Ubuntu 24.04 x64 release assets
+        run: |
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          LINUX_RELEASE="$RUNNER_TEMP/linux-release"
+          mkdir -p "$LINUX_RELEASE"
+          cp \
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb \
+            "$LINUX_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_Ubuntu-24.04-x64.deb"
+          cp \
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb.sig \
+            "$LINUX_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_Ubuntu-24.04-x64.deb.sig"
+          cp \
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage \
+            "$LINUX_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_Ubuntu-24.04-x64.AppImage"
+          cp \
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig \
+            "$LINUX_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_Ubuntu-24.04-x64.AppImage.sig"
+
+      - name: Preserve Ubuntu 24.04 x64 release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-release-${{ github.sha }}
+          path: ${{ runner.temp }}/linux-release
+          if-no-files-found: error
+
+  release-windows-preview:
+    name: Build unsigned Windows x64 Preview
+    needs: release-preflight
+    runs-on: windows-2025
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust 1.88
+        uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build unsigned Windows x64 Preview
+        run: npm run app:build:windows
+
+      - name: Preserve unsigned Windows x64 Preview
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-preview-${{ github.sha }}
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+
+  release-macos:
+    name: Build signed universal macOS app
+    needs: release-preflight
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ needs['release-preflight'].outputs.release_tag }}
+      PACKAGE_VERSION: ${{ needs['release-preflight'].outputs.package_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
 
       - name: Set up Rust 1.88
         uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
@@ -371,6 +396,62 @@ jobs:
           RELEASE_ROOT="$BUNDLE_ROOT/release"
           npm run app:verify-release -- "$APP_PATH" "$DMG_PATH" "$RELEASE_ROOT" "$RELEASE_TAG"
 
+      - name: Stage final public macOS release assets
+        run: |
+          BUNDLE_ROOT="src-tauri/target/universal-apple-darwin/release/bundle"
+          MACOS_RELEASE="$RUNNER_TEMP/macos-release"
+          mkdir -p "$MACOS_RELEASE"
+          cp \
+            "$BUNDLE_ROOT/dmg/Codex.Taskboard_${PACKAGE_VERSION}_universal.dmg" \
+            "$MACOS_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_macOS-universal.dmg"
+          cp "$BUNDLE_ROOT/release/Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz" "$MACOS_RELEASE/"
+          cp "$BUNDLE_ROOT/release/Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz.sig" "$MACOS_RELEASE/"
+          cp "$BUNDLE_ROOT/release/latest.json" "$MACOS_RELEASE/"
+
+      - name: Preserve final public macOS release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-release-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-release
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove temporary signing files
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/codex-taskboard-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          rm -f "$RUNNER_TEMP/app-store-connect.p8"
+
+  draft-release:
+    name: Create draft release
+    needs:
+      - release-preflight
+      - release-linux
+      - release-windows-preview
+      - release-macos
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ needs['release-preflight'].outputs.release_tag }}
+      PACKAGE_VERSION: ${{ needs['release-preflight'].outputs.package_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+
+      - name: Restore final public macOS release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-release-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-release
+
       - name: Restore unsigned Windows x64 Preview
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -385,8 +466,7 @@ jobs:
 
       - name: Add and verify the Linux x64 updater
         run: |
-          BUNDLE_ROOT="src-tauri/target/universal-apple-darwin/release/bundle"
-          LATEST_PATH="$BUNDLE_ROOT/release/latest.json"
+          LATEST_PATH="$RUNNER_TEMP/macos-release/latest.json"
           LINUX_DEB_NAME="Codex.Taskboard_${PACKAGE_VERSION}_Ubuntu-24.04-x64.deb"
           LINUX_APPIMAGE_NAME="Codex.Taskboard_${PACKAGE_VERSION}_Ubuntu-24.04-x64.AppImage"
           LINUX_DEB="$RUNNER_TEMP/linux-release/$LINUX_DEB_NAME"
@@ -409,16 +489,14 @@ jobs:
       - name: Create trusted release asset manifest
         run: |
           set -euo pipefail
-          BUNDLE_ROOT="src-tauri/target/universal-apple-darwin/release/bundle"
+          MACOS_RELEASE="$RUNNER_TEMP/macos-release"
           RELEASE_ASSETS="$RUNNER_TEMP/release-assets"
           MANIFEST_ROOT="$RUNNER_TEMP/release-manifest"
           mkdir -p "$RELEASE_ASSETS" "$MANIFEST_ROOT"
-          cp \
-            "$BUNDLE_ROOT/dmg/Codex.Taskboard_${PACKAGE_VERSION}_universal.dmg" \
-            "$RELEASE_ASSETS/Codex.Taskboard_${PACKAGE_VERSION}_macOS-universal.dmg"
-          cp "$BUNDLE_ROOT/release/Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz" "$RELEASE_ASSETS/"
-          cp "$BUNDLE_ROOT/release/Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz.sig" "$RELEASE_ASSETS/"
-          cp "$BUNDLE_ROOT/release/latest.json" "$RELEASE_ASSETS/"
+          cp "$MACOS_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_macOS-universal.dmg" "$RELEASE_ASSETS/"
+          cp "$MACOS_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz" "$RELEASE_ASSETS/"
+          cp "$MACOS_RELEASE/Codex.Taskboard_${PACKAGE_VERSION}_universal.app.tar.gz.sig" "$RELEASE_ASSETS/"
+          cp "$MACOS_RELEASE/latest.json" "$RELEASE_ASSETS/"
           cp \
             "$RUNNER_TEMP/windows-preview/Codex Taskboard_${PACKAGE_VERSION}_x64-setup.exe" \
             "$RELEASE_ASSETS/Codex.Taskboard_${PACKAGE_VERSION}_NSIS-x64-unsigned.exe"
@@ -494,16 +572,9 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             "$RELEASE_ASSETS/latest.json"
 
-      - name: Remove temporary signing files
-        if: always()
-        run: |
-          security delete-keychain "$RUNNER_TEMP/codex-taskboard-signing.keychain-db" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/developer-id.p12"
-          rm -f "$RUNNER_TEMP/app-store-connect.p8"
-
   promote-release:
     name: Verify and publish immutable macOS release
-    needs: release-macos
+    needs: draft-release
     runs-on: macos-latest
     timeout-minutes: 30
     environment: macos-release
