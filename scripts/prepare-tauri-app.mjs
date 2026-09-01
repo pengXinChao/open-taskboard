@@ -238,6 +238,11 @@ async function copyApplicationResources() {
       path.join(appResources, "skills", "manage-taskboard"),
       { recursive: true },
     ),
+    cp(
+      path.join(projectRoot, "skills", "task-session-orchestration"),
+      path.join(appResources, "skills", "task-session-orchestration"),
+      { recursive: true },
+    ),
   ]);
   await mkdir(path.join(appResources, "node_modules"), { recursive: true });
   await cp(

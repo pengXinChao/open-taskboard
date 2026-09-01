@@ -9,7 +9,10 @@ export { createTaskboardServer, resolveHost, resolvePort, resolveServerOptions }
 async function main() {
   const pendingInjectorRequests = new Map();
   const onInjectorMessage = (message) => {
-    if (message?.type !== "taskboard:child-session-response") return;
+    if (
+      message?.type !== "taskboard:child-session-response"
+      && message?.type !== "taskboard:child-session-turn-response"
+    ) return;
     const pending = pendingInjectorRequests.get(message.requestId);
     if (!pending) return;
     pendingInjectorRequests.delete(message.requestId);
@@ -45,7 +48,35 @@ async function main() {
       });
     });
   };
-  const app = createTaskboardServer({ createChildSession });
+  const startChildSessionTurn = (payload) => {
+    if (typeof process.send !== "function") {
+      throw new Error("The Codex child-session bridge is unavailable");
+    }
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingInjectorRequests.delete(requestId);
+        reject(new Error("The Codex child-session turn bridge timed out"));
+      }, 30_000);
+      timer.unref?.();
+      pendingInjectorRequests.set(requestId, {
+        resolve: (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+      process.send({
+        type: "taskboard:child-session-turn-request",
+        requestId,
+        payload,
+      });
+    });
+  };
+  const app = createTaskboardServer({ createChildSession, startChildSessionTurn });
   const host = resolveHost();
   const listenFd = process.env.CODEX_TASKBOARD_LISTEN_FD === undefined
     ? null

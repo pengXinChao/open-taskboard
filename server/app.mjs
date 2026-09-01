@@ -79,7 +79,9 @@ const CONTENT_TYPES = new Map([
 ]);
 
 function isTaskSessionRoute(pathname) {
-  return pathname === "/api/orchestrations"
+  return pathname === "/api/session/context"
+    || pathname === "/api/session/packet"
+    || pathname === "/api/orchestrations"
     || pathname.startsWith("/api/orchestrations/")
     || /^\/api\/tasks\/[^/]+\/(?:orchestrations|child-session)(?:\/|$)/.test(pathname);
 }
@@ -2183,6 +2185,9 @@ export function resolveServerOptions(options = {}) {
     skillPath: options.skillPath
       ?? environment.CODEX_TASKBOARD_SKILL_PATH
       ?? path.join(PROJECT_ROOT, "skills", "manage-taskboard", "SKILL.md"),
+    taskSessionOrchestrationSkillPath: options.taskSessionOrchestrationSkillPath
+      ?? environment.CODEX_TASK_SESSION_ORCHESTRATION_SKILL_PATH
+      ?? path.join(PROJECT_ROOT, "skills", "task-session-orchestration", "SKILL.md"),
     codexExecutable: resolveCodexExecutable({ explicit: options.codexExecutable }),
     codexStatePath: options.codexStatePath
       ?? path.join(codexHome, ".codex-global-state.json"),
@@ -2305,6 +2310,55 @@ export function createTaskboardServer(options = {}) {
     };
   }
 
+  function taskSessionContextView(context) {
+    const { orchestration, role } = context;
+    const task = database.getTask(orchestration.taskId);
+    return {
+      role,
+      task: task
+        ? { id: task.id, identifier: task.identifier, title: task.title }
+        : null,
+      taskId: orchestration.taskId,
+      orchestrationId: orchestration.id,
+      parentThreadId: orchestration.parentThreadBinding?.threadId ?? null,
+      childThreadId: orchestration.childThreadBinding?.threadId ?? null,
+      intentVersion: orchestration.intentVersion,
+      confirmedIntentVersion: orchestration.confirmedIntentVersion,
+      currentResultRevision: orchestration.currentResultRevision,
+      state: orchestration.state,
+      parentThreadBinding: orchestration.parentThreadBinding,
+      childThreadBinding: orchestration.childThreadBinding,
+    };
+  }
+
+  function taskSessionPacketView(context) {
+    if (context.role !== "child") {
+      throw new ApiError(
+        403,
+        "SESSION_PACKET_CHILD_REQUIRED",
+        "The session packet can only be read from the bound child thread",
+      );
+    }
+    return database.getTaskSessionPacket(context.orchestration.id);
+  }
+
+  function requireTaskSessionCaller(request, orchestrationId, role) {
+    const threadId = parseThreadId(requestHeader(request, "x-codex-thread-id"));
+    if (!threadId) throw new ApiError(400, "THREAD_ID_REQUIRED", "X-Codex-Thread-Id is required");
+    const context = database.getActiveTaskSessionContextByThread(threadId);
+    if (!context) {
+      throw new ApiError(404, "SESSION_CONTEXT_NOT_FOUND", `No active task session orchestration is bound to thread '${threadId}'`);
+    }
+    if (context.orchestration.id !== orchestrationId || context.role !== role) {
+      throw new ApiError(
+        403,
+        "SESSION_ROLE_MISMATCH",
+        `The current thread is not the bound ${role} session for this orchestration`,
+      );
+    }
+    return context;
+  }
+
   function emitOrchestrationUpdate(id, message = null) {
     const orchestration = database.getTaskSessionOrchestration(id);
     if (!orchestration) return;
@@ -2342,6 +2396,7 @@ export function createTaskboardServer(options = {}) {
       });
     }
     let child = orchestration.childThreadBinding;
+    let childCreated = false;
     if (!child) {
       if (typeof options.createChildSession !== "function") {
         throw new ApiError(
@@ -2352,16 +2407,20 @@ export function createTaskboardServer(options = {}) {
       }
       child = await options.createChildSession({
         taskId,
+        orchestrationId: orchestration.id,
         parentThreadId: input.parentThreadId,
+        intentVersion: orchestration.intentVersion,
         title: input.title,
         instruction: input.instruction,
         analysis: input.analysis,
         attachmentRefs: input.attachmentRefs,
         parentBinding,
+        deferTurn: typeof options.startChildSessionTurn === "function",
       });
       if (!child?.threadId) {
         throw new ApiError(502, "CHILD_SESSION_CREATE_FAILED", "Codex did not return a child thread ID");
       }
+      childCreated = true;
       orchestration = database.dispatchTaskSessionOrchestration(orchestration.id, {
         intentVersion: orchestration.intentVersion,
         parentThreadId: input.parentThreadId,
@@ -2377,11 +2436,19 @@ export function createTaskboardServer(options = {}) {
       intentVersion: orchestration.intentVersion,
       deliveryState: "sent",
       payload: {
+        intentVersion: orchestration.intentVersion,
         analysis: input.analysis,
         attachmentRefs: input.attachmentRefs,
         instruction: input.instruction,
       },
     });
+    if (typeof options.startChildSessionTurn === "function" && childCreated) {
+      await options.startChildSessionTurn({
+        threadId: child.threadId,
+        codexHostId: child.codexHostId ?? parentBinding.codexHostId ?? "local",
+        instruction: input.instruction,
+      });
+    }
     emitOrchestrationUpdate(orchestration.id, message);
     return { orchestrationId: orchestration.id, orchestration, child, message };
   }
@@ -3011,7 +3078,10 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/meta does not accept query parameters");
         }
         return sendJson(response, 200, {
-          ...(configuredTrustedOrigin ? {} : { manageTaskboardSkillPath: resolved.skillPath }),
+          ...(configuredTrustedOrigin ? {} : {
+            manageTaskboardSkillPath: resolved.skillPath,
+            taskSessionOrchestrationSkillPath: resolved.taskSessionOrchestrationSkillPath,
+          }),
           capabilities: {
             localAiChat: !configuredTrustedOrigin
               && isLoopbackAddress(request.socket.remoteAddress),
@@ -3239,6 +3309,39 @@ export function createTaskboardServer(options = {}) {
         }
       }
 
+      if (pathname === "/api/session/context") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/session/context");
+        const threadId = parseThreadId(requestHeader(request, "x-codex-thread-id"));
+        if (!threadId) {
+          throw new ApiError(400, "THREAD_ID_REQUIRED", "X-Codex-Thread-Id is required");
+        }
+        const context = database.getActiveTaskSessionContextByThread(threadId);
+        if (!context) {
+          throw new ApiError(
+            404,
+            "SESSION_CONTEXT_NOT_FOUND",
+            `No active task session orchestration is bound to thread '${threadId}'`,
+          );
+        }
+        return sendJson(response, 200, { context: taskSessionContextView(context) });
+      }
+
+      if (pathname === "/api/session/packet") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/session/packet");
+        const threadId = parseThreadId(requestHeader(request, "x-codex-thread-id"));
+        if (!threadId) throw new ApiError(400, "THREAD_ID_REQUIRED", "X-Codex-Thread-Id is required");
+        const context = database.getActiveTaskSessionContextByThread(threadId);
+        if (!context) {
+          throw new ApiError(404, "SESSION_CONTEXT_NOT_FOUND", `No active task session orchestration is bound to thread '${threadId}'`);
+        }
+        return sendJson(response, 200, {
+          context: taskSessionContextView(context),
+          packet: taskSessionPacketView(context),
+        });
+      }
+
       const taskSessionCreateRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/orchestrations$/);
       if (taskSessionCreateRoute) {
         if (request.method !== "GET" && request.method !== "POST") return methodNotAllowed(response, ["GET", "POST"]);
@@ -3277,6 +3380,18 @@ export function createTaskboardServer(options = {}) {
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/child-session");
         const taskId = decodeRouteSegment(taskSessionChildRoute[1], "Task id");
         const input = parseTaskSessionChildRequest(await readJson(request));
+        const callerThreadId = parseThreadId(requestHeader(request, "x-codex-thread-id"));
+        const caller = callerThreadId
+          ? database.getActiveTaskSessionContextByThread(callerThreadId)
+          : null;
+        if (
+          !caller
+          || callerThreadId !== input.parentThreadId
+          || caller.role !== "parent"
+          || caller.orchestration.taskId !== taskId
+        ) {
+          throw new ApiError(403, "SESSION_ROLE_MISMATCH", "Child sessions can only be created by the bound parent thread");
+        }
         const result = await createTaskSessionChild(taskId, input);
         return sendJson(response, 202, {
           ...result,
@@ -3309,6 +3424,7 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/reports/:revision/ack");
         const id = decodeRouteSegment(taskSessionReportAckRoute[1], "Orchestration id");
+        requireTaskSessionCaller(request, id, "parent");
         const revisionText = decodeRouteSegment(taskSessionReportAckRoute[2], "Result revision");
         if (!/^\d+$/.test(revisionText) || !Number.isSafeInteger(Number(revisionText))) {
           throw new ApiError(400, "INVALID_PATH", "Result revision is invalid");
@@ -3384,9 +3500,11 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/reports");
         const id = decodeRouteSegment(taskSessionReportRoute[1], "Orchestration id");
+        const input = parseTaskSessionReport(await readJson(request));
+        requireTaskSessionCaller(request, id, "child");
         const report = database.createTaskSessionReport(
           id,
-          parseTaskSessionReport(await readJson(request)),
+          input,
         );
         emitOrchestrationUpdate(id, report.message);
         return sendJson(response, report.duplicate ? 200 : 202, report);
@@ -3397,6 +3515,7 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/orchestrations/:id/review");
         const id = decodeRouteSegment(taskSessionReviewRoute[1], "Orchestration id");
+        requireTaskSessionCaller(request, id, "parent");
         const review = database.saveTaskSessionReview(
           id,
           parseTaskSessionReview(await readJson(request)),

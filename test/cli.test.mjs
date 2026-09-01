@@ -64,6 +64,37 @@ test("project list uses the default local service and adds schemaVersion", async
   assert.equal(calls[0].init.headers["x-taskboard-client"], "taskctl");
 });
 
+test("session packet resolves context first and keeps the current thread header", async () => {
+  const calls = [];
+  const result = await run(["session", "packet", "--json"], async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    return calls.length === 1
+      ? response({ context: { role: "child", orchestrationId: "orch-1", currentResultRevision: 0 } })
+      : response({ packet: { version: "task-session-packet.v1", instruction: "work" } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(calls[0].url.endsWith("/api/session/context"), true);
+  assert.equal(calls[1].url.endsWith("/api/session/packet"), true);
+  assert.equal(calls[1].init.headers["x-codex-thread-id"], "thread-current");
+  assert.equal(result.stdout.packet.version, "task-session-packet.v1");
+});
+
+test("session review is parent-only and posts the selected decision", async () => {
+  const calls = [];
+  const result = await run(["session", "review", "--decision", "approved"], async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    return calls.length === 1
+      ? response({ context: { role: "parent", orchestrationId: "orch-1", parentThreadId: "thread-current" } })
+      : response({ review: { decision: "approved" } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(calls[1].url.endsWith("/api/orchestrations/orch-1/review"), true);
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    decision: "approved",
+    parentThreadId: "thread-current",
+  });
+});
+
 test("CODEX_TASKBOARD_URL overrides the service origin", async () => {
   let requestedUrl;
   const result = await run(

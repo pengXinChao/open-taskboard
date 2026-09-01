@@ -172,9 +172,14 @@ test("Jira issues open a projectless main session with a read-only orchestration
 });
 
 test("main sessions can create and message a worker through the local bridge", () => {
-  assert.match(appSource, /taskctl session create-child/);
+  assert.match(appSource, /task-session-orchestration/);
+  assert.match(appSource, /分析需求，确认执行范围，并协调任务会话完成实现/);
+  assert.match(appSource, /执行主会话下发的已确认执行项，并提交结果/);
+  assert.doesNotMatch(appSource, /请先使用.*读取完整 Jira 上下文/);
   assert.match(cliSource, /\["session create-child"/);
+  assert.match(cliSource, /\["session report"/);
   assert.match(cliSource, /\/child-session/);
+  assert.match(serverSource, /\/api\/session\/context/);
   assert.match(serverSource, /createTaskSessionChild/);
   assert.match(serverSource, /options\.createChildSession/);
   assert.match(serverSource, /analysis: input\.analysis/);

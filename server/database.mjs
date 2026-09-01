@@ -2529,6 +2529,31 @@ export class TaskboardDatabase {
     return row ? taskSessionOrchestrationFromRow(row) : null;
   }
 
+  // 通过当前 Codex thread 解析 active 编排，供 child Skill 在不携带路由猜测的情况下读取上下文。
+  getActiveTaskSessionContextByThread(threadId) {
+    const normalizedThreadId = String(threadId ?? "").trim();
+    if (!normalizedThreadId) return null;
+    const row = this.database.prepare(`
+      SELECT * FROM task_session_orchestrations
+      WHERE state != 'done'
+        AND (
+          json_extract(parent_thread_json, '$.threadId') = ?
+          OR json_extract(child_thread_json, '$.threadId') = ?
+        )
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 1
+    `).get(normalizedThreadId, normalizedThreadId);
+    if (!row) return null;
+    const orchestration = taskSessionOrchestrationFromRow(row);
+    const role = orchestration.childThreadBinding?.threadId === normalizedThreadId
+      ? "child"
+      : orchestration.parentThreadBinding?.threadId === normalizedThreadId
+        ? "parent"
+        : null;
+    if (!role) return null;
+    return { orchestration, role };
+  }
+
   // 返回本地已同步的任务、评论和附件快照；digest 不包含抓取时间，便于稳定比较。
   getTaskSessionSourceSnapshot(taskId) {
     const task = this.getTask(taskId);
@@ -3750,6 +3775,65 @@ export class TaskboardDatabase {
       WHERE orchestration_id = ? AND sequence > ?
       ORDER BY sequence
     `).all(id, after).map(taskSessionMessageFromRow);
+  }
+
+  // 从现有 intent 和 analysis_forwarded 时间线消息组合 child 执行包，避免复制一份分析数据。
+  getTaskSessionPacket(id) {
+    const orchestration = this.#requireTaskSessionOrchestration(id);
+    const task = this.#requireTask(orchestration.taskId);
+    const childThreadId = orchestration.childThreadBinding?.threadId;
+    if (!childThreadId) {
+      throw new ApiError(
+        409,
+        "CHILD_SESSION_NOT_CREATED",
+        "The task orchestration has no child session",
+      );
+    }
+    const message = this.database.prepare(`
+      SELECT * FROM task_session_messages
+      WHERE orchestration_id = ? AND type = 'analysis_forwarded'
+      ORDER BY sequence DESC
+      LIMIT 1
+    `).get(id);
+    const forwarded = message ? taskSessionMessageFromRow(message) : null;
+    const instruction = typeof forwarded?.payload?.instruction === "string"
+      ? forwarded.payload.instruction.trim()
+      : "";
+    if (!forwarded || !instruction) {
+      throw new ApiError(
+        409,
+        "SESSION_PACKET_UNAVAILABLE",
+        "The child execution packet is not available or has no instruction",
+      );
+    }
+    if (
+      forwarded.payload?.intentVersion !== undefined
+      && forwarded.payload.intentVersion !== orchestration.intentVersion
+    ) {
+      throw new ApiError(
+        409,
+        "INTENT_VERSION_CONFLICT",
+        "The child execution packet does not match the current intent revision",
+        { expectedVersion: orchestration.intentVersion, actualVersion: forwarded.payload.intentVersion },
+      );
+    }
+    return {
+      version: "task-session-packet.v1",
+      task: { id: task.id, identifier: task.identifier, title: task.title },
+      orchestrationId: orchestration.id,
+      intentVersion: orchestration.intentVersion,
+      intent: orchestration.intent ?? {},
+      analysis: forwarded.payload.analysis ?? {},
+      instruction,
+      attachmentRefs: Array.isArray(forwarded.payload.attachmentRefs)
+        ? forwarded.payload.attachmentRefs
+        : [],
+      parentThreadId: orchestration.parentThreadBinding?.threadId ?? null,
+      childThreadId,
+      state: orchestration.state,
+      sourceDigest: orchestration.intentDigest,
+      sequence: forwarded.sequence,
+    };
   }
 
   // 保存主会话的检查结论；结论绑定到具体结果版本，不覆盖历史判断。

@@ -825,6 +825,7 @@ export function App() {
   const [developmentScan, setDevelopmentScan] = useState<DevelopmentScan>({ workspacePath: null, contexts: [] });
   const [developmentScanLoading, setDevelopmentScanLoading] = useState(false);
   const [manageTaskboardSkillPath, setManageTaskboardSkillPath] = useState("");
+  const [taskSessionOrchestrationSkillPath, setTaskSessionOrchestrationSkillPath] = useState("");
   const [taskboardMetadata, setTaskboardMetadata] = useState<TaskboardMetadata | null>(null);
   const [localAiChatAvailable, setLocalAiChatAvailable] = useState(false);
   const [aiImportReadyProjectId, setAiImportReadyProjectId] = useState<string | null>(null);
@@ -2119,11 +2120,13 @@ export function App() {
         && current.mode === metadata.mode
         && JSON.stringify(current.realtime) === JSON.stringify(metadata.realtime)
         && current.manageTaskboardSkillPath === metadata.manageTaskboardSkillPath
+        && current.taskSessionOrchestrationSkillPath === metadata.taskSessionOrchestrationSkillPath
         && current.localCapabilities?.available === metadata.localCapabilities?.available
           ? current
           : metadata
       ));
       setManageTaskboardSkillPath(metadata.manageTaskboardSkillPath ?? "");
+      setTaskSessionOrchestrationSkillPath(metadata.taskSessionOrchestrationSkillPath ?? "");
       setLocalAiChatAvailable(metadata.capabilities?.localAiChat === true);
       setDeviceWorkspacePaths((current) => {
         const next = { ...current, ...workspaces };
@@ -3356,35 +3359,19 @@ export function App() {
           ?? taskboardProject?.workspacePath;
     const openingKey = session?.orchestrationId ?? `task:${task.id}`;
     const openingRequestId = standalone ? undefined : window.crypto.randomUUID();
+    const orchestrationSkillHint = taskSessionOrchestrationSkillPath
+      ? `[$task-session-orchestration](${taskSessionOrchestrationSkillPath}) `
+      : "";
     const embeddedInstruction = conversationRole === "parent"
-      ? [
-          text(
-            [
-              `你是 Jira 任务 ${task.identifier} 的主会话。`,
-              `请先使用 [$manage-taskboard](${manageTaskboardSkillPath}) 读取完整 Jira 上下文：任务正文、所有评论、任务附件、评论附件，以及能帮助判断需求、问题、范围和约束的上下文。`,
-              "然后分析真正要解决的问题、执行范围、验收标准、有价值的评论或附件、以及待澄清问题。",
-              "分析完成后，把分析结果写入 JSON 文件，并调用 `taskctl session create-child <任务ID> --analysis-file <文件> --instruction-file <执行提示词文件>` 创建独立任务会话；该命令会把分析结果、确认后的执行要求和必要的附件引用发送给任务会话。",
-              "任务会话负责执行工作，不要让它重新解释 Jira；你负责上下文分析、主子会话通信、结果检查和后续 Jira 写回。不要直接替任务会话修改工作区。",
-              "创建任务会话前，确认用户已在 Codex 原生界面选择目标项目空间；主会话本身保持无项目。",
-            ].join("\n"),
-            [
-              `You are the main session for Jira issue ${task.identifier}.`,
-              `First use [$manage-taskboard](${manageTaskboardSkillPath}) to read the complete Jira context: issue body, all comments, task attachments, comment attachments, and any context that clarifies the requirement, problem, scope, and constraints.`,
-              "Then analyze the real problem, execution scope, acceptance criteria, valuable comments or attachments, and unresolved questions.",
-              "After analysis, write the result to a JSON file and run `taskctl session create-child <issue-id> --analysis-file <file> --instruction-file <worker-prompt-file>`; the command creates an independent worker session and sends it the analysis, confirmed execution requirements, and necessary attachment references.",
-              "The worker session executes the work and must not reinterpret Jira. You own context analysis, parent/worker communication, result review, and later Jira writeback. Do not modify the workspace on behalf of the worker session.",
-              "Before creating the worker session, confirm that the user selected the target project in the native Codex UI; the main session itself remains projectless.",
-            ].join("\n"),
-          ),
-        ].join("\n")
+      ? text(
+        `${orchestrationSkillHint}你是 Jira 任务 ${task.identifier} 的主会话：分析需求，确认执行范围，并协调任务会话完成实现。`,
+        `${orchestrationSkillHint}You are the main session for Jira issue ${task.identifier}: analyze the request, confirm scope, and coordinate the worker session.`,
+      )
       : conversationRole === "child"
-        ? [
-            text(
-              "你是任务执行会话，只根据确认后的 task-intent.v1 完成工作，不要重新读取或写回 Jira。",
-              "You are a worker session. Follow the confirmed task-intent.v1; do not reread or write back to Jira.",
-            ),
-            session?.intent ? `task-intent.v1: ${JSON.stringify(session.intent)}` : "",
-          ].filter(Boolean).join("\n")
+        ? text(
+          `${orchestrationSkillHint}你是 Jira 任务 ${task.identifier} 的执行会话：执行主会话下发的已确认执行项，并提交结果。`,
+          `${orchestrationSkillHint}You are the worker session for Jira issue ${task.identifier}: execute the confirmed work from the main session and submit the result.`,
+        )
         : text(
           `[$manage-taskboard](${manageTaskboardSkillPath}) 议题 ID：${task.identifier}`,
           `[$manage-taskboard](${manageTaskboardSkillPath}) Issue ID: ${task.identifier}`,

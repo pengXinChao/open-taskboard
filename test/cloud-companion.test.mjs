@@ -659,6 +659,7 @@ test("configured server proxies business APIs without touching local rows and ad
       },
       localCapabilities: { available: true },
       manageTaskboardSkillPath: app.options.skillPath,
+      taskSessionOrchestrationSkillPath: app.options.taskSessionOrchestrationSkillPath,
     });
     const session = await fetch(`${baseUrl}/api/local/cloud-session`)
       .then((response) => response.json());

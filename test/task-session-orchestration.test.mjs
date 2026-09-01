@@ -136,6 +136,77 @@ test("intent revisions are limited to the draft phase and clear prior confirmati
   }
 });
 
+test("child execution packets are composed from intent and the latest forwarded analysis", async () => {
+  const fixture = await createFixture();
+  try {
+    const task = await fixture.createTask();
+    let orchestration = createOrchestration(fixture.database, task);
+    orchestration = fixture.database.confirmTaskSessionIntent(orchestration.id, {
+      parentThreadId: "parent-thread",
+      intentVersion: orchestration.intentVersion,
+      captureDigest: orchestration.intentDigest,
+    });
+    orchestration = dispatch(fixture.database, orchestration);
+    fixture.database.appendTaskSessionMessage(orchestration.id, {
+      direction: "parent_to_child",
+      type: "analysis_forwarded",
+      idempotencyKey: `${orchestration.id}:analysis:1`,
+      parentThreadId: "parent-thread",
+      childThreadId: "child-thread",
+      intentVersion: orchestration.intentVersion,
+      deliveryState: "sent",
+      payload: {
+        analysis: { problem: "Fix the task" },
+        attachmentRefs: ["attachment-1"],
+        instruction: "Implement the confirmed change",
+      },
+    });
+    const packet = fixture.database.getTaskSessionPacket(orchestration.id);
+    assert.equal(packet.version, "task-session-packet.v1");
+    assert.equal(packet.task.identifier, task.identifier);
+    assert.deepEqual(packet.intent, orchestration.intent);
+    assert.deepEqual(packet.analysis, { problem: "Fix the task" });
+    assert.equal(packet.instruction, "Implement the confirmed change");
+    assert.equal(packet.parentThreadId, "parent-thread");
+    assert.equal(packet.childThreadId, "child-thread");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("packet reads fail clearly before a child is created or when instruction is missing", async () => {
+  const fixture = await createFixture();
+  try {
+    const task = await fixture.createTask();
+    const orchestration = createOrchestration(fixture.database, task);
+    assert.throws(
+      () => fixture.database.getTaskSessionPacket(orchestration.id),
+      (error) => error?.code === "CHILD_SESSION_NOT_CREATED",
+    );
+    const confirmed = fixture.database.confirmTaskSessionIntent(orchestration.id, {
+      parentThreadId: "parent-thread",
+      intentVersion: orchestration.intentVersion,
+      captureDigest: orchestration.intentDigest,
+    });
+    const dispatched = dispatch(fixture.database, confirmed);
+    fixture.database.appendTaskSessionMessage(dispatched.id, {
+      direction: "parent_to_child",
+      type: "analysis_forwarded",
+      idempotencyKey: `${dispatched.id}:analysis:missing-instruction`,
+      parentThreadId: "parent-thread",
+      childThreadId: "child-thread",
+      intentVersion: dispatched.intentVersion,
+      payload: { analysis: {} },
+    });
+    assert.throws(
+      () => fixture.database.getTaskSessionPacket(dispatched.id),
+      (error) => error?.code === "SESSION_PACKET_UNAVAILABLE",
+    );
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("integration conflicts can recover and completion requires confirmed writeback plus integration", async () => {
   const fixture = await createFixture();
   try {

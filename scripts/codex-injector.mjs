@@ -216,7 +216,7 @@ async function waitUntilTaskboardReachable(timeoutMs) {
   throw new Error(`Timed out waiting for authenticated ${taskboardHealthUrl}`);
 }
 
-function startTaskboard({ detached, onCodexAppServerRequest, onChildSessionRequest }) {
+function startTaskboard({ detached, onCodexAppServerRequest, onChildSessionRequest, onChildSessionTurnRequest }) {
   const baseStdio = taskboardListenFd === null
     ? Array(3).fill(detached ? "ignore" : "inherit")
     : Array.from(
@@ -231,15 +231,22 @@ function startTaskboard({ detached, onCodexAppServerRequest, onChildSessionReque
   child.on("message", (message) => {
     const isAppServerRequest = message?.type === "taskboard:codex-app-server-request";
     const isChildSessionRequest = message?.type === "taskboard:child-session-request";
-    if (!isAppServerRequest && !isChildSessionRequest) return;
-    const handler = isAppServerRequest ? onCodexAppServerRequest : onChildSessionRequest;
+    const isChildSessionTurnRequest = message?.type === "taskboard:child-session-turn-request";
+    if (!isAppServerRequest && !isChildSessionRequest && !isChildSessionTurnRequest) return;
+    const handler = isAppServerRequest
+      ? onCodexAppServerRequest
+      : isChildSessionTurnRequest
+        ? onChildSessionTurnRequest
+        : onChildSessionRequest;
     void Promise.resolve(handler(message)).then(
       (result) => {
         if (!child.connected) return;
         child.send({
           type: isAppServerRequest
             ? "taskboard:codex-app-server-response"
-            : "taskboard:child-session-response",
+            : isChildSessionTurnRequest
+              ? "taskboard:child-session-turn-response"
+              : "taskboard:child-session-response",
           requestId: message.requestId,
           ...(message.hostId ? { hostId: message.hostId } : {}),
           result,
@@ -250,7 +257,9 @@ function startTaskboard({ detached, onCodexAppServerRequest, onChildSessionReque
         child.send({
           type: isAppServerRequest
             ? "taskboard:codex-app-server-response"
-            : "taskboard:child-session-response",
+            : isChildSessionTurnRequest
+              ? "taskboard:child-session-turn-response"
+              : "taskboard:child-session-response",
           requestId: message.requestId,
           ...(message.hostId ? { hostId: message.hostId } : {}),
           error: error instanceof Error ? error.message : String(error),
@@ -1166,13 +1175,16 @@ async function requestCodexAppServerViaCdp(
   return response.result;
 }
 
-async function taskboardRequest(pathname, { method = "GET", body } = {}) {
+async function taskboardRequest(pathname, { method = "GET", body, threadId } = {}) {
   const response = await fetch(`${taskboardBaseUrl}${pathname}`, {
     method,
     cache: "no-store",
     headers: {
       accept: "application/json",
       "x-taskboard-client": "taskctl",
+      ...(typeof threadId === "string" && threadId.trim()
+        ? { "x-codex-thread-id": threadId.trim() }
+        : {}),
       ...(body === undefined ? {} : { "content-type": "application/json" }),
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -2001,6 +2013,86 @@ async function restoreQuotaPolicies(cdp) {
 }
 
 async function startTaskConversationViaCdp(cdp, executionContextId, request) {
+  if (request.conversationRole !== "parent") {
+    return startTaskConversationViaComposer(cdp, executionContextId, request);
+  }
+
+  // 主会话优先走 App Server：先取得并验证 thread，再持久化 parent binding，最后才启动首个 turn。
+  // App Server 不可用时才回退到 Composer，保留旧宿主的兼容能力。
+  let threadId = "";
+  let bound = false;
+  try {
+    const started = await requestCodexAppServerViaCdp(
+      cdp,
+      executionContextId,
+      request.codexHostId || "local",
+      "thread/start",
+      {
+        ...(request.projectless ? {} : {
+          cwd: request.workspacePath,
+          runtimeWorkspaceRoots: request.workspacePath ? [request.workspacePath] : [],
+        }),
+        approvalPolicy: "on-request",
+        sandbox: "danger-full-access",
+      },
+      taskConversationAppServerTimeoutMs,
+    );
+    threadId = typeof started?.thread?.id === "string" ? started.thread.id.trim() : "";
+    if (!threadId) throw new Error("Codex did not return a parent thread ID");
+    const verified = await requestCodexAppServerViaCdp(
+      cdp,
+      executionContextId,
+      request.codexHostId || "local",
+      "thread/read",
+      { threadId, includeTurns: false },
+      taskConversationAppServerTimeoutMs,
+    );
+    if (verified?.thread?.id !== threadId) throw new Error("Codex returned an invalid parent thread identity");
+    const binding = {
+      threadId,
+      ...(request.projectless ? {} : {
+        codexProjectId: request.codexProjectId || null,
+        codexProjectKind: request.codexProjectKind || "local",
+        codexHostId: request.codexHostId || "local",
+        workspacePath: verified.thread.cwd || request.workspacePath || null,
+      }),
+    };
+    await taskboardRequest(`/api/tasks/${encodeURIComponent(request.taskId)}/orchestrations`, {
+      method: "POST",
+      threadId,
+      body: { parentThreadId: threadId, parentThreadBinding: binding },
+    });
+    bound = true;
+    await requestCodexAppServerViaCdp(
+      cdp,
+      executionContextId,
+      request.codexHostId || "local",
+      "thread/name/set",
+      { threadId, name: request.title },
+      taskConversationAppServerTimeoutMs,
+    );
+    await requestCodexAppServerViaCdp(
+      cdp,
+      executionContextId,
+      request.codexHostId || "local",
+      "turn/start",
+      { threadId, input: [{ type: "text", text: request.instruction }] },
+      taskConversationAppServerTimeoutMs,
+    );
+    return {
+      threadId,
+      title: request.title,
+      workspacePath: request.projectless ? "" : (verified.thread.cwd || request.workspacePath || ""),
+    };
+  } catch (error) {
+    if (threadId && error && typeof error === "object") error.threadId = threadId;
+    if (bound || threadId) throw error;
+    // 只有 App Server 在创建 thread 之前不可用时才允许 Composer 回退，避免留下孤儿 thread。
+    return startTaskConversationViaComposer(cdp, executionContextId, request);
+  }
+}
+
+async function startTaskConversationViaComposer(cdp, executionContextId, request) {
   const {
     codexHostId,
     instruction,
@@ -2966,6 +3058,12 @@ async function main() {
   const handleChildSessionRequest = async (message) => {
     const request = message?.payload;
     const parentBinding = request?.parentBinding ?? {};
+    const orchestrationId = typeof request?.orchestrationId === "string"
+      ? request.orchestrationId.trim()
+      : "";
+    if (!orchestrationId) {
+      throw new Error("Taskboard orchestration context is missing for the worker session");
+    }
     const codexHostId = typeof parentBinding.codexHostId === "string"
       ? parentBinding.codexHostId
       : "local";
@@ -2991,22 +3089,9 @@ async function main() {
     const threadId = typeof started?.thread?.id === "string" ? started.thread.id : "";
     if (!threadId) throw new Error("Codex did not return a worker thread ID");
     const title = typeof request.title === "string" ? request.title.trim() : "Taskboard worker";
-    const analysis = request.analysis && typeof request.analysis === "object" && !Array.isArray(request.analysis)
-      ? request.analysis
-      : {};
-    const attachmentRefs = Array.isArray(request.attachmentRefs)
-      ? request.attachmentRefs.filter((value) => typeof value === "string").slice(0, 128)
-      : [];
-    // 将主会话的结构化分析和附件引用放进 child 首个 turn，确保任务会话拿到实际上下文而不是只有时间线记录。
-    const workerInstruction = [
-      "主会话已完成 Jira 上下文分析。请按以下结构化结果和执行要求工作，不要重新解释或重新抓取 Jira。",
-      "<taskboard-analysis>",
-      JSON.stringify({ analysis, attachmentRefs }, null, 2),
-      "</taskboard-analysis>",
-      "<taskboard-execution-instruction>",
-      request.instruction,
-      "</taskboard-execution-instruction>",
-    ].join("\n\n");
+    // child 的上下文和执行包由 task-session-orchestration Skill 通过 session API 读取，
+    // 首个 turn 只保留短职责提示词，避免提示词成为第二份不可校验的协议载体。
+    const workerInstruction = request.instruction;
     await requestCodexAppServerViaCdp(
       connection,
       undefined,
@@ -3014,16 +3099,15 @@ async function main() {
       "thread/name/set",
       { threadId, name: title },
     );
-    await requestCodexAppServerViaCdp(
-      connection,
-      undefined,
-      codexHostId,
-      "turn/start",
-      {
-        threadId,
-        input: [{ type: "text", text: workerInstruction }],
-      },
-    );
+    if (!request.deferTurn) {
+      await requestCodexAppServerViaCdp(
+        connection,
+        undefined,
+        codexHostId,
+        "turn/start",
+        { threadId, input: [{ type: "text", text: workerInstruction }] },
+      );
+    }
     return {
       threadId,
       codexProjectId: parentBinding.codexProjectId ?? null,
@@ -3031,6 +3115,23 @@ async function main() {
       codexHostId,
       workspacePath,
     };
+  };
+  const handleChildSessionTurnRequest = async (message) => {
+    const request = message?.payload ?? {};
+    const threadId = typeof request.threadId === "string" ? request.threadId.trim() : "";
+    const codexHostId = typeof request.codexHostId === "string" && request.codexHostId.trim()
+      ? request.codexHostId.trim()
+      : "local";
+    const instruction = typeof request.instruction === "string" ? request.instruction.trim() : "";
+    if (!threadId || !instruction) throw new Error("The worker turn request is incomplete");
+    const connection = await codexConnectionForHost(codexHostId);
+    return requestCodexAppServerViaCdp(
+      connection,
+      undefined,
+      codexHostId,
+      "turn/start",
+      { threadId, input: [{ type: "text", text: instruction }] },
+    );
   };
   const forwardCodexAppServerNotification = (cdp, notification) => {
     handleRemoteAutomationDecisionNotification(notification);
@@ -3052,6 +3153,7 @@ async function main() {
         detached,
         onCodexAppServerRequest: handleCodexAppServerRequest,
         onChildSessionRequest: handleChildSessionRequest,
+        onChildSessionTurnRequest: handleChildSessionTurnRequest,
       });
       taskboardChild = child;
       child.once("exit", () => {

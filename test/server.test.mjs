@@ -107,6 +107,7 @@ test("health and the default local project are available", async () => {
   assert.equal(metadata.response.status, 200);
   assert.deepEqual(metadata.body, {
     manageTaskboardSkillPath: skillPath,
+    taskSessionOrchestrationSkillPath: path.resolve("skills", "task-session-orchestration", "SKILL.md"),
     capabilities: { localAiChat: true },
   });
 
@@ -544,6 +545,7 @@ test("trusted HTTPS origins do not inherit device-local capabilities from tunnel
   assert.equal(localMetadata.response.status, 200);
   assert.deepEqual(localMetadata.body, {
     manageTaskboardSkillPath: skillPath,
+    taskSessionOrchestrationSkillPath: path.resolve("skills", "task-session-orchestration", "SKILL.md"),
     capabilities: { localAiChat: true },
     mode: "cloud",
     realtime: {

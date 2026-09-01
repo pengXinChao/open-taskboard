@@ -74,8 +74,8 @@ test("the CDP bridge accepts service ensure and native task conversation start a
   assert.match(source, /discoveredThreadId = threadId/);
   assert.match(source, /error\.threadId = discoveredThreadId/);
   assert.match(source, /function requestCodexAppServerViaCdp/);
-  assert.match(source, /const workerInstruction = \[/);
-  assert.match(source, /JSON\.stringify\(\{ analysis, attachmentRefs \}, null, 2\)/);
+  assert.match(source, /const workerInstruction = request\.instruction/);
+  assert.doesNotMatch(source, /JSON\.stringify\(\{ analysis, attachmentRefs \}, null, 2\)/);
   assert.match(source, /input: \[\{ type: "text", text: workerInstruction \}\]/);
   assert.match(source, /type: "mcp-request"/);
   assert.match(source, /hostId: \$\{JSON\.stringify\(hostId\)\}/);

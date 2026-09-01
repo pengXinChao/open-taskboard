@@ -126,6 +126,19 @@ const COMMAND_OPTIONS = new Map([
     "thread-id",
     "json",
   ])],
+  ["session context", new Set(["thread-id", "json"])],
+  ["session packet", new Set(["thread-id", "json"])],
+  ["session timeline", new Set(["after", "thread-id", "json"])],
+  ["session report", new Set([
+    "result-file",
+    "result-revision",
+    "intent-version",
+    "idempotency-key",
+    "thread-id",
+    "json",
+  ])],
+  ["session report-ack", new Set(["result-revision", "thread-id", "json"])],
+  ["session review", new Set(["decision", "result-revision", "feedback", "reason", "json", "thread-id"])],
 ]);
 
 const HELP_TEXT = new Map([
@@ -151,6 +164,13 @@ Commands:
   session create-child ISSUE_ID --analysis-file FILE
     (--instruction TEXT | --instruction-file FILE)
     [--title TITLE] [--idempotency-key KEY] [--thread-id ID]
+  session context [--thread-id ID]
+  session packet [--thread-id ID]
+  session timeline [--after SEQUENCE] [--thread-id ID]
+  session report --result-file FILE [--result-revision N]
+    [--intent-version N] [--idempotency-key KEY] [--thread-id ID]
+  session report-ack --result-revision N [--thread-id ID]
+  session review --decision approved|needs_rework|blocked [--result-revision N] [--feedback TEXT]
 
 Global options:
   --runtime-file FILE  Use an explicit launcher runtime descriptor
@@ -211,6 +231,19 @@ The response always includes nextCursor. Omit --after for the full list.
 
 Example:
   taskctl comment list LOCAL-275 --after CURSOR --json`],
+  ["session", `Usage: taskctl session ACTION [options]
+
+Actions:
+  context [--thread-id ID] [--json]
+  packet [--thread-id ID] [--json]
+  timeline [--after SEQUENCE] [--thread-id ID] [--json]
+  create-child ISSUE_ID --analysis-file FILE
+    (--instruction TEXT | --instruction-file FILE)
+    [--title TITLE] [--idempotency-key KEY] [--thread-id ID] [--json]
+  report --result-file FILE [--result-revision N]
+    [--intent-version N] [--idempotency-key KEY] [--thread-id ID] [--json]
+  report-ack --result-revision N [--thread-id ID] [--json]
+  review --decision approved|needs_rework|blocked [--result-revision N] [--feedback TEXT] [--thread-id ID] [--json]`],
 ]);
 
 class TaskctlError extends Error {
@@ -292,7 +325,7 @@ export async function main(argv = process.argv.slice(2), overrides = {}) {
       const scope = `${parsed.resource ?? ""} ${parsed.action ?? ""}`.trim();
       const help = HELP_TEXT.get(scope);
       if (!help || parsed.operands.length > 0 || Object.keys(parsed.options).length !== 1) {
-        throw usageError("Help is available for taskctl, taskctl issue, and taskctl comment list");
+        throw usageError("Help is available for taskctl, taskctl issue, taskctl comment list, and taskctl session");
       }
       stdout.write(`${help}\n`);
       return 0;
@@ -322,7 +355,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/archive/restore/tree/relation, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/archive/restore/tree/relation, comment list/add/update/delete, attachment list/download/upload, context current, session context/packet/timeline/create-child/report/report-ack/review",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -335,7 +368,8 @@ async function execute(parsed, overrides) {
   const target = usesCompanionControl || env.CODEX_TASKBOARD_COMPANION_URL !== undefined
       ? await resolveCompanionUrl(env, overrides)
       : await resolveTaskboardBaseUrl(env, overrides);
-  const api = createApiClient(overrides, target);
+  const requestThreadId = parsed.options["thread-id"] ?? env.CODEX_THREAD_ID;
+  const api = createApiClient(overrides, { ...target, threadId: requestThreadId });
   switch (command) {
     case "project list":
       expectOperandCount(parsed, 0);
@@ -531,6 +565,24 @@ async function execute(parsed, overrides) {
           ?? `child-session:${parsed.operands[0]}:${threadId}`,
       });
     }
+    case "session context":
+      expectOperandCount(parsed, 0);
+      return sessionContext(api, parsed.options, overrides);
+    case "session packet":
+      expectOperandCount(parsed, 0);
+      return sessionPacket(api, parsed.options, overrides);
+    case "session timeline":
+      expectOperandCount(parsed, 0);
+      return sessionTimeline(api, parsed.options, overrides);
+    case "session report":
+      expectOperandCount(parsed, 0);
+      return sessionReport(api, parsed.options, overrides);
+    case "session report-ack":
+      expectOperandCount(parsed, 0);
+      return sessionReportAck(api, parsed.options, overrides);
+    case "session review":
+      expectOperandCount(parsed, 0);
+      return sessionReview(api, parsed.options, overrides);
     default:
       throw usageError(`Unsupported command: ${command}`);
   }
@@ -539,6 +591,7 @@ async function execute(parsed, overrides) {
 function createApiClient(overrides, {
   url: explicitBaseUrl,
   windowsTransport = false,
+  threadId,
 } = {}) {
   const fetchImplementation = overrides.fetch
     ?? (windowsTransport
@@ -563,6 +616,9 @@ function createApiClient(overrides, {
           headers: {
             accept: "application/json",
             "x-taskboard-client": "taskctl",
+            ...(typeof threadId === "string" && threadId.trim().length > 0
+              ? { "x-codex-thread-id": threadId.trim() }
+              : {}),
             ...(body === undefined ? {} : { "content-type": "application/json" }),
           },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -687,6 +743,149 @@ async function downloadAttachment(api, attachmentId, options, overrides) {
     contentType: downloaded.contentType,
     size: downloaded.size,
   };
+}
+
+async function sessionContext(api, options, overrides) {
+  // 所有编排 CLI 都以当前 Codex thread 作为身份入口，避免调用方手工拼接 parent/child 关系。
+  resolveThreadId(options, overrides);
+  const response = await api.request("GET", "/api/session/context");
+  if (!response.context || typeof response.context !== "object" || Array.isArray(response.context)) {
+    throw new TaskctlError("Taskboard service returned an invalid session context", {
+      code: "INVALID_RESPONSE",
+      exitCode: 4,
+    });
+  }
+  return response;
+}
+
+async function sessionPacket(api, options, overrides) {
+  const contextResponse = await sessionContext(api, options, overrides);
+  const response = await api.request("GET", "/api/session/packet");
+  if (!response.packet || typeof response.packet !== "object" || Array.isArray(response.packet)) {
+    throw new TaskctlError("Taskboard service returned an invalid session packet", {
+      code: "INVALID_RESPONSE",
+      exitCode: 4,
+    });
+  }
+  return { context: contextResponse.context, packet: response.packet };
+}
+
+async function sessionTimeline(api, options, overrides) {
+  const contextResponse = await sessionContext(api, options, overrides);
+  const context = contextResponse.context;
+  const rawAfter = options.after ?? "0";
+  const after = Number(rawAfter);
+  if (!/^\d+$/.test(rawAfter) || !Number.isSafeInteger(after) || after < 0) {
+    throw usageError("--after must be a non-negative integer");
+  }
+  const query = new URLSearchParams({ after: String(after) });
+  const timeline = await api.request(
+    "GET",
+    `/api/orchestrations/${encodeURIComponent(context.orchestrationId)}/timeline?${query}`,
+  );
+  return { context, ...timeline };
+}
+
+async function readJsonObject(filePath, overrides, label) {
+  const read = overrides.readFile ?? readFile;
+  let value;
+  try {
+    value = JSON.parse(await read(filePath, "utf8"));
+  } catch (error) {
+    throw new TaskctlError(`Cannot read ${label}: ${filePath}`, {
+      code: "FILE_READ_FAILED",
+      exitCode: 2,
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw usageError(`${label} must contain a JSON object`);
+  }
+  return value;
+}
+
+function positiveIntegerOption(options, name, { defaultValue } = {}) {
+  const raw = options[name];
+  if (raw === undefined && defaultValue === undefined) {
+    throw usageError(`Missing required option --${name}`);
+  }
+  const value = raw === undefined ? defaultValue : Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1 || (raw !== undefined && !/^\d+$/.test(raw))) {
+    throw usageError(`--${name} must be a positive integer`);
+  }
+  return value;
+}
+
+async function sessionReport(api, options, overrides) {
+  const contextResponse = await sessionContext(api, options, overrides);
+  const context = contextResponse.context;
+  if (context.role !== "child") {
+    throw usageError("session report must run from a child session");
+  }
+  const result = await readJsonObject(
+    requiredOption(options, "result-file"),
+    overrides,
+    "--result-file",
+  );
+  const resultRevision = positiveIntegerOption(options, "result-revision", {
+    defaultValue: Number(context.currentResultRevision ?? 0) + 1,
+  });
+  const intentVersion = positiveIntegerOption(options, "intent-version", {
+    defaultValue: Number(context.intentVersion),
+  });
+  return api.request(
+    "POST",
+    `/api/orchestrations/${encodeURIComponent(context.orchestrationId)}/reports`,
+    {
+      parentThreadId: context.parentThreadId,
+      childThreadId: context.childThreadId,
+      intentVersion,
+      resultRevision,
+      idempotencyKey: options["idempotency-key"] ?? `${context.orchestrationId}:${resultRevision}`,
+      payload: result,
+    },
+  );
+}
+
+async function sessionReportAck(api, options, overrides) {
+  const contextResponse = await sessionContext(api, options, overrides);
+  const context = contextResponse.context;
+  if (context.role !== "parent") {
+    throw usageError("session report-ack must run from a parent session");
+  }
+  const resultRevision = positiveIntegerOption(options, "result-revision");
+  return api.request(
+    "POST",
+    `/api/orchestrations/${encodeURIComponent(context.orchestrationId)}/reports/${resultRevision}/ack`,
+    { parentThreadId: context.parentThreadId },
+  );
+}
+
+async function sessionReview(api, options, overrides) {
+  const contextResponse = await sessionContext(api, options, overrides);
+  const context = contextResponse.context;
+  if (context.role !== "parent") {
+    throw usageError("session review must run from a parent session");
+  }
+  const decision = requiredOption(options, "decision");
+  if (!["approved", "needs_rework", "blocked"].includes(decision)) {
+    throw usageError("--decision must be approved, needs_rework, or blocked");
+  }
+  const resultRevision = options["result-revision"] === undefined
+    ? undefined
+    : positiveIntegerOption(options, "result-revision");
+  return api.request(
+    "POST",
+    `/api/orchestrations/${encodeURIComponent(context.orchestrationId)}/review`,
+    {
+      decision,
+      ...(resultRevision === undefined ? {} : { resultRevision }),
+      ...(options.feedback === undefined && options.reason === undefined
+        ? {}
+        : { feedback: options.feedback ?? options.reason }),
+      parentThreadId: context.parentThreadId,
+    },
+  );
 }
 
 async function uploadAttachment(api, options, overrides) {
