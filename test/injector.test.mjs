@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter, once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import vm from "node:vm";
@@ -203,6 +204,112 @@ test("automation list rebuilds a stored policy on the incoming project identity"
   assert.match(source, /policy: storedAutomationPolicy\(current\.request\)/);
 });
 
+test("managed private-CDP spawn failures are bounded without changing the launch path", async () => {
+  const launchStart = source.indexOf("function managedCodexSpawnFailure");
+  const launchEnd = source.indexOf("class CdpConnection", launchStart);
+  assert.notEqual(launchStart, -1);
+  assert.notEqual(launchEnd, -1);
+
+  const executable = String.raw`C:\Users\alice\AppData\Roaming\Codex Taskboard\codex-runtime\codex.exe`;
+  const profile = String.raw`C:\Users\alice\AppData\Roaming\Codex Taskboard\codex-profile`;
+  const launches = [];
+  let spawnMode = "failure";
+  let browserOpenCount = 0;
+  class TestPipeBrowser {
+    constructor(child) {
+      this.child = child;
+    }
+
+    async open() {
+      browserOpenCount += 1;
+    }
+  }
+  const { launchCodexWithPipe } = vm.runInNewContext(
+    `(() => {
+      ${source.slice(launchStart, launchEnd)}
+      return { launchCodexWithPipe };
+    })()`,
+    {
+      CdpPipeBrowser: TestPipeBrowser,
+      Error,
+      once,
+      codexExecutablePath: (appPath) => appPath,
+      independentCodexProfilePath: profile,
+      process: { env: { SAFE_VALUE: "kept", CODEX_TASKBOARD_SECRET: "removed" } },
+      spawn: (command, args, options) => {
+        launches.push({ command, args, options });
+        const child = new EventEmitter();
+        child.exitCode = null;
+        child.signalCode = null;
+        child.kill = () => true;
+        if (spawnMode === "success") {
+          child.pid = 376;
+        } else {
+          queueMicrotask(() => child.emit("error", Object.assign(
+            new Error(`spawn ${command} EPERM`),
+            {
+              code: "EPERM",
+              errno: -4048,
+              syscall: `spawn ${command}`,
+            },
+          )));
+        }
+        return child;
+      },
+      withoutTaskboardLauncherEnvironment: (environment) => ({
+        SAFE_VALUE: environment.SAFE_VALUE,
+      }),
+    },
+  );
+
+  await assert.rejects(launchCodexWithPipe(executable), (failure) => {
+    assert.equal(failure.managedCodexSpawnFailure, true);
+    assert.match(failure.message, /Managed Codex spawn failed/);
+    assert.match(
+      failure.message,
+      /arguments=\["--user-data-dir=<taskboard-profile>","--remote-debugging-pipe"\]/,
+    );
+    assert.match(failure.message, /code=EPERM/);
+    assert.match(failure.message, /errno=-4048/);
+    assert.ok(failure.message.includes(`syscall=${JSON.stringify(`spawn ${executable}`)}`));
+    assert.doesNotMatch(failure.message, /codex-profile/);
+    return true;
+  });
+  assert.equal(browserOpenCount, 0);
+
+  spawnMode = "success";
+  const launched = await launchCodexWithPipe(executable);
+  assert.equal(launched.child.pid, 376);
+  assert.equal(browserOpenCount, 1);
+  assert.equal(launches.at(-1).command, executable);
+  assert.deepEqual(Array.from(launches.at(-1).args), [
+    `--user-data-dir=${profile}`,
+    "--remote-debugging-pipe",
+  ]);
+  assert.deepEqual(
+    Array.from(launches.at(-1).options.stdio),
+    ["ignore", "ignore", "ignore", "pipe", "pipe"],
+  );
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(launches.at(-1).options.env)),
+    { SAFE_VALUE: "kept" },
+  );
+
+  assert.match(source, /if \(!options\.watch \|\| error\?\.managedCodexSpawnFailure !== true\) throw error/);
+  assert.equal(
+    source.match(/const launchRequestGeneration = openRequestGeneration;/g)?.length,
+    3,
+  );
+  assert.equal(
+    source.match(
+      /openedRequestGeneration = Math\.max\(\s*openedRequestGeneration,\s*launchRequestGeneration,\s*\);/g,
+    )?.length,
+    3,
+  );
+  assert.match(source, /if \(!hasOpenPending\(\)\) continue;/);
+  assert.match(source, /idleAfterNormalExit = true;\s*console\.error\(`Waiting for Codex launch:/);
+});
+
 test("the package injection command remains resident for tab-triggered recovery", () => {
   assert.match(packageJson.scripts["codex:inject"], /--watch/);
   assert.match(packageJson.scripts["codex:daemon"], /--daemon --open/);
@@ -211,6 +318,13 @@ test("the package injection command remains resident for tab-triggered recovery"
   assert.match(source, /port: defaultCodexDebuggingPort/);
   assert.match(source, /--startup-token/);
   assert.match(source, /__codexTaskboardHostStartupTokenV1/);
+});
+
+test("the existing-Codex fallback opens its deep link with the platform default application", () => {
+  assert.match(
+    source,
+    /deepLink\.searchParams\.set\("browserUrl", taskboardPageUrl\);\s*await openWithDefaultApplication\(deepLink\.toString\(\)\);/,
+  );
 });
 
 test("attach reconciles the renderer against a hashed current injection source", () => {

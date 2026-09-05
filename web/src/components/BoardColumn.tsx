@@ -24,7 +24,6 @@ interface BoardColumnProps {
   status: TaskStatus;
   tasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
-  now: number;
   emptyMessage: string;
   isDropTarget: boolean;
   draggedTaskId: string | null;
@@ -56,7 +55,6 @@ export function BoardColumn({
   status,
   tasks,
   presentations,
-  now,
   emptyMessage,
   isDropTarget,
   draggedTaskId,
@@ -177,7 +175,6 @@ export function BoardColumn({
               key={task.id}
               task={task}
               presentation={presentations[task.id]}
-              now={now}
               isDragging={draggedTaskId === task.id}
               dragShift={dragShift}
               isMoving={movingTaskId === task.id}

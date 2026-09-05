@@ -13,6 +13,9 @@ if (!debPath || !appImagePath || process.argv.length !== 4) {
 if (process.platform !== "linux") {
   throw new Error("Linux packages must be verified on Linux");
 }
+const productName = process.env.CODEX_TASKBOARD_RELEASE_VERSION?.includes("-beta.")
+  ? "Codex Taskboard Beta"
+  : "Codex Taskboard";
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -57,7 +60,7 @@ async function assertElfX64(filePath) {
 async function verifyPackageRoot(root, label) {
   const launcherPath = path.join(root, "usr", "bin", "codex-taskboard-launcher");
   const nodePath = path.join(root, "usr", "bin", "codex-taskboard-node");
-  const resourceRoot = path.join(root, "usr", "lib", "Codex Taskboard");
+  const resourceRoot = path.join(root, "usr", "lib", productName);
   const taskctlPath = path.join(resourceRoot, "bin", "taskctl");
   const requiredResources = [
     "app/cli/taskctl.mjs",

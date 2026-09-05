@@ -1,3 +1,4 @@
+import { listenForOutsidePointerDown } from "../menuEvents";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { DragEvent } from "react";
 import { createPortal } from "react-dom";
@@ -67,20 +68,15 @@ export function BoardCardDisplayMenu({
 
   useEffect(() => {
     if (!menuOpen) return;
-    function closeFromOutside(event: PointerEvent) {
-      if (!menuRef.current?.contains(event.target as Node) && !triggerRef.current?.contains(event.target as Node)) {
-        setMenuOpen(false);
-      }
-    }
+    const stopOutside = listenForOutsidePointerDown([menuRef, triggerRef], () => setMenuOpen(false));
     function closeFromEscape(event: KeyboardEvent) {
       if (event.key !== "Escape") return;
       setMenuOpen(false);
       triggerRef.current?.focus();
     }
-    document.addEventListener("pointerdown", closeFromOutside);
     document.addEventListener("keydown", closeFromEscape);
     return () => {
-      document.removeEventListener("pointerdown", closeFromOutside);
+      stopOutside();
       document.removeEventListener("keydown", closeFromEscape);
     };
   }, [menuOpen]);

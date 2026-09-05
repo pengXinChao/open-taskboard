@@ -136,7 +136,6 @@ interface OtherTasksPanelProps {
   tasksByStatus: Record<TaskStatus, Task[]>;
   archivedTasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
-  now: number;
   hasActiveFilters: boolean;
   isDropTarget: boolean;
   draggedTaskId: string | null;
@@ -173,7 +172,6 @@ export function OtherTasksPanel({
   tasksByStatus,
   archivedTasks,
   presentations,
-  now,
   hasActiveFilters,
   isDropTarget,
   draggedTaskId,
@@ -342,7 +340,6 @@ export function OtherTasksPanel({
               task={task}
               variant="sidebar"
               presentation={presentations[task.id]}
-              now={now}
               isDragging={draggedTaskId === task.id}
               dragShift={dragShift}
               isMoving={movingTaskId === task.id}

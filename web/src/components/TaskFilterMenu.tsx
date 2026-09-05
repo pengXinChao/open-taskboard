@@ -1,3 +1,4 @@
+import { listenForOutsidePointerDown, listenForMenuViewportChange } from "../menuEvents";
 import {
   useEffect,
   useLayoutEffect,
@@ -279,25 +280,12 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: Tas
     if (!open) return;
     requestAnimationFrame(() => menuRef.current?.querySelector<HTMLInputElement>(".task-filter-search input")?.focus());
 
-    function closeFromOutside(event: PointerEvent) {
-      if (!menuRef.current?.contains(event.target as Node) && !triggerRef.current?.contains(event.target as Node)) {
-        closeMenu();
-      }
-    }
-    function closeFromViewportChange(event: Event) {
-      if (event.type === "scroll" && menuRef.current?.contains(event.target as Node)) return;
-      closeMenu();
-    }
+    const stopOutside = listenForOutsidePointerDown([menuRef, triggerRef], closeMenu);
+    const stopViewport = listenForMenuViewportChange(menuRef, closeMenu);
 
-    document.addEventListener("pointerdown", closeFromOutside);
-    window.addEventListener("blur", closeFromViewportChange);
-    window.addEventListener("resize", closeFromViewportChange);
-    window.addEventListener("scroll", closeFromViewportChange, true);
     return () => {
-      document.removeEventListener("pointerdown", closeFromOutside);
-      window.removeEventListener("blur", closeFromViewportChange);
-      window.removeEventListener("resize", closeFromViewportChange);
-      window.removeEventListener("scroll", closeFromViewportChange, true);
+      stopOutside();
+      stopViewport();
     };
   }, [open]);
 

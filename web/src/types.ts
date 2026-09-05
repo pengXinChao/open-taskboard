@@ -534,14 +534,3 @@ export interface TaskDraft {
   dueDate: string | null;
   recurrence: Recurrence | null;
 }
-
-export interface TaskEvent {
-  type: string;
-  projectId?: string;
-  taskId?: string;
-  task?: Task;
-  comment?: Comment;
-  attachment?: Attachment;
-  project?: Project;
-  at: string;
-}

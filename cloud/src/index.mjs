@@ -1,23 +1,45 @@
+import {
+  parseThreadBinding, parseMove, parseVersionMutation, parseRelationMutation,
+  parseCommentCreate, parseCommentPatch, parseTaskCreate,
+} from "../../shared/task-input.mjs";
+import {
+  commentConversationTitle,
+  threadBindingFromRow,
+  legacyLocalThreadIdFromRow,
+  storedThreadBinding,
+  attachTaskActivity,
+  taskActivityFromRow,
+  taskFieldChanges,
+  taskTreeNode,
+  projectReadmeAttachmentFromRow,
+  projectPrefix,
+} from "../../shared/task-records.mjs";
+import {
+  ApiError,
+  parseVersion,
+  validateProjectId,
+  assertPlainObject,
+  assertAllowedKeys,
+  stringField,
+  parseDueDate,
+  parseRecurrence,
+  parseLabels,
+  parseStatus,
+  parsePriority,
+  slugify,
+  parseProjectLabel,
+  parseThreadId,
+  parseAssigneeTarget,
+} from "../../shared/api-fields.mjs";
 import { DurableObject } from "cloudflare:workers";
 
-import { DEFAULT_LABEL_NAMES } from "../../shared/domain.mjs";
+import { DEFAULT_LABEL_NAMES, TASK_STATUSES, TASK_PRIORITIES } from "../../shared/domain.mjs";
 
 const JSON_BODY_LIMIT = 1024 * 1024;
 const PROJECT_README_BODY_LIMIT = 3 * 1024 * 1024;
 const ATTACHMENT_BODY_LIMIT = 25 * 1024 * 1024;
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
-const PROJECT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX = "taskboard.project-board-display-settings.v3.";
-const TASK_STATUSES = [
-  "backlog",
-  "todo",
-  "in_progress",
-  "in_review",
-  "blocked",
-  "done",
-  "canceled",
-];
-const TASK_PRIORITIES = ["none", "urgent", "high", "medium", "low"];
 const INLINE_ATTACHMENT_TYPES = new Set([
   "application/pdf",
   "image/avif",
@@ -92,15 +114,6 @@ export class RealtimeHub extends DurableObject {
   }
 }
 
-class ApiError extends Error {
-  constructor(status, code, message, details) {
-    super(message);
-    this.status = status;
-    this.code = code;
-    this.details = details;
-  }
-}
-
 function json(status, value, headers = {}) {
   return new Response(JSON.stringify(value), {
     status,
@@ -123,151 +136,6 @@ function methodNotAllowed(allowed) {
   throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", {
     allowed,
   });
-}
-
-function assertPlainObject(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new ApiError(400, "INVALID_BODY", "Request body must be a JSON object");
-  }
-}
-
-function assertAllowedKeys(value, allowed) {
-  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
-  if (unknown.length > 0) {
-    throw new ApiError(
-      400,
-      "UNKNOWN_FIELD",
-      `Unknown field${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`,
-    );
-  }
-}
-
-function stringField(value, name, {
-  required = false,
-  nullable = false,
-  maxLength,
-} = {}) {
-  if (value === undefined) {
-    if (required) {
-      throw new ApiError(400, "INVALID_FIELD", `'${name}' is required`);
-    }
-    return undefined;
-  }
-  if (nullable && value === null) return null;
-  if (typeof value !== "string") {
-    throw new ApiError(
-      400,
-      "INVALID_FIELD",
-      `'${name}' must be a string${nullable ? " or null" : ""}`,
-    );
-  }
-  const normalized = value.trim();
-  if (required && normalized.length === 0) {
-    throw new ApiError(400, "INVALID_FIELD", `'${name}' cannot be empty`);
-  }
-  if (normalized.length > maxLength) {
-    throw new ApiError(400, "INVALID_FIELD", `'${name}' cannot exceed ${maxLength} characters`);
-  }
-  return normalized;
-}
-
-function parseVersion(value, { allowZero = false } = {}) {
-  if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1)) {
-    throw new ApiError(
-      400,
-      "INVALID_FIELD",
-      `'version' must be a ${allowZero ? "non-negative" : "positive"} integer`,
-    );
-  }
-  return value;
-}
-
-function parseStatus(value, fallback) {
-  const status = value ?? fallback;
-  if (!TASK_STATUSES.includes(status)) {
-    throw new ApiError(
-      400,
-      "INVALID_FIELD",
-      `'status' must be one of: ${TASK_STATUSES.join(", ")}`,
-    );
-  }
-  return status;
-}
-
-function parsePriority(value, fallback) {
-  const priority = value ?? fallback;
-  if (!TASK_PRIORITIES.includes(priority)) {
-    throw new ApiError(
-      400,
-      "INVALID_FIELD",
-      "'priority' must be none, urgent, high, medium, or low",
-    );
-  }
-  return priority;
-}
-
-function parseLabels(value) {
-  if (!Array.isArray(value) || value.length > 20) {
-    throw new ApiError(400, "INVALID_FIELD", "'labels' must be an array with at most 20 entries");
-  }
-  const labels = value.map((label) => {
-    if (typeof label !== "string") {
-      throw new ApiError(400, "INVALID_FIELD", "Every label must be a string");
-    }
-    const normalized = label.trim();
-    if (normalized.length === 0 || normalized.length > 64) {
-      throw new ApiError(400, "INVALID_FIELD", "Labels must contain 1 to 64 characters");
-    }
-    return normalized;
-  });
-  if (new Set(labels).size !== labels.length) {
-    throw new ApiError(400, "INVALID_FIELD", "Labels must be unique");
-  }
-  return labels;
-}
-
-function parseSortOrder(value) {
-  if (
-    typeof value !== "number"
-    || !Number.isFinite(value)
-    || Math.abs(value) > 1_000_000_000_000
-  ) {
-    throw new ApiError(
-      400,
-      "INVALID_FIELD",
-      "'sortOrder' must be a finite number between -1000000000000 and 1000000000000",
-    );
-  }
-  return value;
-}
-
-function parseDueDate(value, name = "dueDate") {
-  const date = stringField(value, name, { nullable: true, maxLength: 10 });
-  if (date !== null && date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    throw new ApiError(400, "INVALID_FIELD", `'${name}' must use YYYY-MM-DD`);
-  }
-  return date;
-}
-
-function parseRecurrence(value) {
-  if (value === null) return null;
-  assertPlainObject(value);
-  assertAllowedKeys(value, new Set(["interval", "unit"]));
-  if (!Number.isSafeInteger(value.interval) || value.interval < 1 || value.interval > 365) {
-    throw new ApiError(
-      400,
-      "INVALID_FIELD",
-      "'recurrence.interval' must be an integer from 1 to 365",
-    );
-  }
-  if (!["day", "week", "month", "year"].includes(value.unit)) {
-    throw new ApiError(
-      400,
-      "INVALID_FIELD",
-      "'recurrence.unit' must be day, week, month, or year",
-    );
-  }
-  return { interval: value.interval, unit: value.unit };
 }
 
 function parseDevelopmentContext(value) {
@@ -309,100 +177,6 @@ function parseDevelopmentContext(value) {
     "INVALID_FIELD",
     "'developmentContext.type' must be branch or worktree",
   );
-}
-
-function parseThreadId(value) {
-  if (value === undefined) return undefined;
-  return stringField(value, "threadId", { required: true, maxLength: 256 });
-}
-
-function parseThreadBinding(value) {
-  if (value === undefined || value === null) return value;
-  assertPlainObject(value);
-  assertAllowedKeys(value, new Set([
-    "threadId",
-    "codexProjectId",
-    "codexProjectKind",
-    "codexHostId",
-    "workspacePath",
-  ]));
-  const threadId = stringField(value.threadId, "threadBinding.threadId", {
-    required: true,
-    maxLength: 256,
-  });
-  const identityFields = [
-    value.codexProjectId,
-    value.codexProjectKind,
-    value.codexHostId,
-    value.workspacePath,
-  ];
-  if (identityFields.every((field) => field === undefined)) return { threadId };
-  if (identityFields.some((field) => field === undefined)) {
-    throw new ApiError(400, "INVALID_FIELD", "Thread identity must include project, kind, host, and workspace");
-  }
-  const codexProjectId = stringField(value.codexProjectId, "threadBinding.codexProjectId", {
-    required: true,
-    maxLength: 256,
-  });
-  const codexProjectKind = value.codexProjectKind;
-  const codexHostId = stringField(value.codexHostId, "threadBinding.codexHostId", {
-    required: true,
-    maxLength: 256,
-  });
-  const workspacePath = stringField(value.workspacePath, "threadBinding.workspacePath", {
-    required: true,
-    maxLength: 4096,
-  });
-  if (
-    (codexProjectKind !== "local" && codexProjectKind !== "remote")
-    || (codexProjectKind === "local" && codexHostId !== "local")
-    || (codexProjectKind === "remote" && codexHostId === "local")
-    || workspacePath.includes("\0")
-  ) {
-    throw new ApiError(400, "INVALID_FIELD", "Thread project identity is invalid");
-  }
-  return { threadId, codexProjectId, codexProjectKind, codexHostId, workspacePath };
-}
-
-function parseAssigneeTarget(value) {
-  if (value === undefined) return undefined;
-  if (!["current-user", "codex-agent"].includes(value)) {
-    throw new ApiError(
-      400,
-      "INVALID_FIELD",
-      "'assigneeTarget' must be current-user or codex-agent",
-    );
-  }
-  return value;
-}
-
-function slugify(value) {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 64);
-}
-
-function validateProjectId(value) {
-  const id = stringField(value, "id", { required: true, maxLength: 64 });
-  if (!PROJECT_ID_PATTERN.test(id)) {
-    throw new ApiError(
-      400,
-      "INVALID_FIELD",
-      "'id' must be a lowercase slug containing letters, numbers, or hyphens",
-    );
-  }
-  return id;
-}
-
-function projectPrefix(project) {
-  const idPrefix = project.id.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 12) || "TASK";
-  const existingPrefix = project.first_identifier?.replace(/-\d+$/, "");
-  if (existingPrefix && /^[A-Z0-9]+$/i.test(existingPrefix) && existingPrefix !== idPrefix) return existingPrefix;
-  if (idPrefix.length <= 5) return idPrefix;
-  const namePrefix = project.name.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 3);
-  return namePrefix || idPrefix.slice(0, 3);
 }
 
 function now() {
@@ -695,57 +469,6 @@ function developmentContextFromRow(row) {
   return null;
 }
 
-function commentConversationTitle(body) {
-  const firstLine = String(body ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean);
-  if (!firstLine) return "评论";
-  const compact = firstLine.replace(/\s+/g, " ");
-  return compact.length > 80 ? `${compact.slice(0, 77)}…` : compact;
-}
-
-function threadBindingFromRow(row) {
-  if (
-    !row.thread_id
-    || !row.thread_codex_project_id
-    || !row.thread_codex_project_kind
-    || !row.thread_codex_host_id
-    || !row.thread_workspace_path
-  ) return null;
-  return {
-    threadId: row.thread_id,
-    codexProjectId: row.thread_codex_project_id,
-    codexProjectKind: row.thread_codex_project_kind,
-    codexHostId: row.thread_codex_host_id,
-    workspacePath: row.thread_workspace_path,
-  };
-}
-
-function legacyLocalThreadIdFromRow(row) {
-  if (!row.thread_id) return null;
-  return [
-    row.thread_codex_project_id,
-    row.thread_codex_project_kind,
-    row.thread_codex_host_id,
-    row.thread_workspace_path,
-  ].every((value) => value == null)
-    ? row.thread_id
-    : null;
-}
-
-function storedThreadBinding(threadBinding, threadId) {
-  if (threadBinding === undefined && (threadId === undefined || threadId === null)) return undefined;
-  const binding = threadBinding === undefined ? { threadId } : threadBinding;
-  return [
-    binding?.threadId ?? null,
-    binding?.codexProjectId ?? null,
-    binding?.codexProjectKind ?? null,
-    binding?.codexHostId ?? null,
-    binding?.workspacePath ?? null,
-  ];
-}
-
 function storedThreadBindingForExisting(current, threadBinding, threadId) {
   const currentBinding = threadBindingFromRow(current);
   if (
@@ -756,113 +479,6 @@ function storedThreadBindingForExisting(current, threadBinding, threadId) {
     return storedThreadBinding(currentBinding, threadId);
   }
   return storedThreadBinding(threadBinding, threadId);
-}
-
-function attachTaskActivity(task, comments, activities, previewImage = null) {
-  const orderedComments = [...comments].sort((left, right) => left.id.localeCompare(right.id));
-  const orderedActivities = [...activities].sort((left, right) => left.id.localeCompare(right.id));
-  const participants = [];
-  const participantIds = new Set();
-  const addParticipant = (actor) => {
-    const key = `${actor.type}:${actor.id}`;
-    if (participantIds.has(key)) return;
-    participantIds.add(key);
-    participants.push(actor);
-  };
-  addParticipant({
-    type: task.creatorType,
-    id: task.creatorId,
-    name: task.creatorName,
-    avatarUrl: task.creatorAvatarUrl,
-  });
-  addParticipant(task.assignee);
-  for (const comment of orderedComments) {
-    addParticipant({
-      type: comment.author_type,
-      id: comment.author_id,
-      name: comment.author_name,
-      avatarUrl: comment.author_avatar_url,
-    });
-  }
-  for (const activity of orderedActivities) {
-    addParticipant({
-      type: activity.actor_type,
-      id: activity.actor_id,
-      name: activity.actor_name,
-      avatarUrl: activity.actor_avatar_url,
-    });
-  }
-  const conversationRefs = [];
-  if (task.threadBinding) {
-    conversationRefs.push({
-      ...task.threadBinding,
-      source: "task",
-      sourceId: task.id,
-      title: task.title,
-      updatedAt: task.updatedAt,
-    });
-  } else if (task.legacyLocalThreadId) {
-    conversationRefs.push({
-      threadId: task.legacyLocalThreadId,
-      legacyLocal: true,
-      source: "task",
-      sourceId: task.id,
-      title: task.title,
-      updatedAt: task.updatedAt,
-    });
-  }
-  for (const comment of orderedComments) {
-    const threadBinding = threadBindingFromRow(comment);
-    const legacyLocalThreadId = legacyLocalThreadIdFromRow(comment);
-    if (threadBinding || legacyLocalThreadId) {
-      conversationRefs.push({
-        ...(threadBinding ?? { threadId: legacyLocalThreadId, legacyLocal: true }),
-        source: "comment",
-        sourceId: comment.id,
-        title: commentConversationTitle(comment.body),
-        updatedAt: comment.updated_at,
-      });
-    }
-  }
-  task.conversationRefs = conversationRefs;
-  task.participants = participants;
-  task.previewImage = previewImage;
-  task.activityKey = JSON.stringify({
-    version: 1,
-    task: [task.id, task.version, task.updatedAt],
-    comments: orderedComments.map((comment) => [comment.id, comment.version, comment.updated_at]),
-    changes: orderedActivities.map((activity) => [activity.id, activity.created_at]),
-  });
-  task.activityUpdatedAt = [...orderedComments, ...orderedActivities].reduce(
-    (latest, activity) => {
-      const updatedAt = activity.updated_at ?? activity.created_at;
-      return updatedAt > latest ? updatedAt : latest;
-    },
-    task.updatedAt,
-  );
-  return task;
-}
-
-function taskActivityFromRow(row) {
-  return {
-    id: row.id,
-    taskId: row.task_id,
-    actorType: row.actor_type,
-    actorId: row.actor_id,
-    actorName: row.actor_name,
-    actorAvatarUrl: row.actor_avatar_url,
-    changes: JSON.parse(row.changes),
-    createdAt: row.created_at,
-  };
-}
-
-function taskFieldChanges(task, changes) {
-  return Object.entries(changes).flatMap(([field, after]) => {
-    const before = task[field];
-    return JSON.stringify(before) === JSON.stringify(after)
-      ? []
-      : [{ field, before, after }];
-  });
 }
 
 function relationActivityValue(type, task) {
@@ -928,22 +544,6 @@ function taskRelationSummaryFromRow(row) {
   };
 }
 
-function taskTreeNode(row, parentId, depth, path) {
-  return {
-    id: row.id,
-    parentId,
-    depth,
-    path,
-    summary: {
-      identifier: row.identifier,
-      title: row.title,
-      status: row.status,
-      priority: row.priority,
-      archivedAt: row.archived_at,
-    },
-  };
-}
-
 function commentFromRow(row, attachments = []) {
   return {
     id: row.id,
@@ -969,18 +569,6 @@ function attachmentFromRow(row) {
     taskId: row.task_id,
     commentId: row.comment_id,
     kind: row.kind,
-    filename: row.filename,
-    contentType: row.content_type,
-    size: row.size,
-    createdAt: row.created_at,
-  };
-}
-
-function projectReadmeAttachmentFromRow(row) {
-  return {
-    id: row.id,
-    projectId: row.project_id,
-    kind: "inline",
     filename: row.filename,
     contentType: row.content_type,
     size: row.size,
@@ -1317,52 +905,6 @@ function parseClientStorageUpdate(body) {
   };
 }
 
-function parseProjectLabel(body) {
-  assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["label"]));
-  return stringField(body.label, "label", { required: true, maxLength: 64 });
-}
-
-function parseTaskCreate(body) {
-  assertPlainObject(body);
-  assertAllowedKeys(body, new Set([
-    "projectId",
-    "title",
-    "description",
-    "status",
-    "priority",
-    "labels",
-    "sortOrder",
-    "threadId",
-    "threadBinding",
-    "assigneeTarget",
-    "developmentContext",
-    "startDate",
-    "dueDate",
-    "recurrence",
-  ]));
-  const input = {
-    projectId: validateProjectId(body.projectId ?? "local"),
-    title: stringField(body.title, "title", { required: true, maxLength: 240 }),
-    description: stringField(body.description ?? "", "description", { maxLength: 100_000 }),
-    status: parseStatus(body.status, "backlog"),
-    priority: parsePriority(body.priority, "none"),
-    labels: body.labels === undefined ? [] : parseLabels(body.labels),
-    sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
-    threadId: parseThreadId(body.threadId),
-    threadBinding: parseThreadBinding(body.threadBinding),
-    assigneeTarget: parseAssigneeTarget(body.assigneeTarget),
-    developmentContext: parseDevelopmentContext(body.developmentContext ?? null),
-    startDate: parseDueDate(body.startDate ?? null, "startDate"),
-    dueDate: parseDueDate(body.dueDate ?? null),
-    recurrence: parseRecurrence(body.recurrence ?? null),
-  };
-  if (input.recurrence && !input.dueDate) {
-    throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires 'dueDate'");
-  }
-  return input;
-}
-
 function parseTaskPatch(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
@@ -1408,71 +950,6 @@ function parseTaskPatch(body) {
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
     assigneeTarget,
-  };
-}
-
-function parseMove(body) {
-  assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "status", "sortOrder", "threadId", "threadBinding"]));
-  return {
-    version: parseVersion(body.version),
-    status: parseStatus(body.status),
-    sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
-    threadId: parseThreadId(body.threadId),
-    threadBinding: parseThreadBinding(body.threadBinding),
-  };
-}
-
-function parseVersionMutation(body) {
-  assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding"]));
-  return {
-    version: parseVersion(body.version),
-    threadId: parseThreadId(body.threadId),
-    threadBinding: parseThreadBinding(body.threadBinding),
-  };
-}
-
-function parseRelationOrigin(value) {
-  if (value === undefined) return undefined;
-  if (value !== "manual" && value !== "mention") {
-    throw new ApiError(400, "INVALID_FIELD", "'origin' must be manual or mention");
-  }
-  return value;
-}
-
-function parseRelationMutation(body) {
-  assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding", "origin"]));
-  return {
-    version: parseVersion(body.version),
-    threadId: parseThreadId(body.threadId),
-    threadBinding: parseThreadBinding(body.threadBinding),
-    origin: parseRelationOrigin(body.origin),
-  };
-}
-
-function parseCommentCreate(body) {
-  assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["body", "threadId", "threadBinding"]));
-  return {
-    body: stringField(body.body ?? "", "body", { maxLength: 100_000 }),
-    threadId: parseThreadId(body.threadId),
-    threadBinding: parseThreadBinding(body.threadBinding),
-  };
-}
-
-function parseCommentPatch(body) {
-  assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "body", "threadId", "threadBinding"]));
-  if (body.body === undefined) {
-    throw new ApiError(400, "INVALID_FIELD", "'body' is required");
-  }
-  return {
-    version: parseVersion(body.version),
-    body: stringField(body.body, "body", { maxLength: 100_000 }),
-    threadId: parseThreadId(body.threadId),
-    threadBinding: parseThreadBinding(body.threadBinding),
   };
 }
 
@@ -3255,7 +2732,7 @@ async function routeApi(request, env, actor, url) {
     }
     if (request.method === "POST") {
       return json(201, {
-        task: await createTask(env, parseTaskCreate(await readJson(request)), actor),
+        task: await createTask(env, parseTaskCreate(await readJson(request), parseDevelopmentContext), actor),
       });
     }
     methodNotAllowed(["GET", "POST"]);

@@ -1,3 +1,4 @@
+import { resolveInlineAttachments } from "../inlineAttachments";
 import { useEffect, useRef, useState } from "react";
 import {
   ApiError,
@@ -12,7 +13,6 @@ import {
   createInlineMediaSegments,
   InlineMediaComposer,
   inlineMediaImages,
-  resolveInlineMediaMarkdown,
   serializeInlineMedia,
   type InlineMediaComposerHandle,
   type InlineMediaSegment,
@@ -115,7 +115,7 @@ export function ProjectReadmeView({
       const uploaded = await Promise.all(
         inlineImages.map((image) => uploadProjectReadmeAttachment(project.id, image.file)),
       );
-      const resolvedContent = resolveInlineMediaMarkdown(
+      const resolvedContent = resolveInlineAttachments(
         draftContent,
         inlineImages,
         uploaded,

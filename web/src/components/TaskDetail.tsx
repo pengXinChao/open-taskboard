@@ -1,3 +1,4 @@
+import { resolveInlineAttachments, uploadInlineAttachments } from "../inlineAttachments";
 import {
   useCallback,
   useEffect,
@@ -79,8 +80,6 @@ import {
   inlineMediaFiles,
   inlineMediaImages,
   inlineMediaText,
-  resolveInlineAttachmentMarkdown,
-  resolveInlineMediaMarkdown,
   serializeInlineMedia,
   type InlineMediaComposerHandle,
   type InlineMediaSegment,
@@ -434,6 +433,7 @@ export function TaskDetail({
   const editingComposerRef = useRef<InlineMediaComposerHandle>(null);
   const editingCommentScrollPositionRef = useRef<{ element: HTMLElement; top: number } | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const descriptionAttachmentPickerOpenRef = useRef(false);
   const commentAttachmentInputRef = useRef<HTMLInputElement>(null);
   const editCommentAttachmentInputRef = useRef<HTMLInputElement>(null);
   const editingUploadedAttachmentsRef = useRef<Map<string, Attachment>>(new Map());
@@ -774,20 +774,13 @@ export function TaskDetail({
     setSavingProperty("description");
     onError(null);
     try {
-      const uploadedImages = await Promise.all(
-        inlineImages.map((image) => uploadAttachment(currentTask.id, image.file, "inline")),
-      );
-      const uploadedFiles = await Promise.all(
-        inlineFiles.map((file) => uploadAttachment(currentTask.id, file.file, "attachment")),
-      );
-      const resolvedDescription = resolveInlineAttachmentMarkdown(
-        resolveInlineMediaMarkdown(
-          draftDescription,
-          inlineImages,
-          uploadedImages,
-        ),
-        inlineFiles,
-        uploadedFiles,
+      const upload = (file: File, kind: Attachment["kind"]) => uploadAttachment(currentTask.id, file, kind);
+      const uploadedImages = await uploadInlineAttachments(inlineImages, upload);
+      const uploadedFiles = await uploadInlineAttachments(inlineFiles, upload);
+      const resolvedDescription = resolveInlineAttachments(
+        draftDescription,
+        [...inlineImages, ...inlineFiles],
+        [...uploadedImages, ...uploadedFiles],
       ).trim();
       const saved = await onUpdate(currentTask, { description: resolvedDescription }).catch((error) => {
         onError(issueMessageFor(error));
@@ -828,23 +821,12 @@ export function TaskDetail({
     setCommentsError(null);
     try {
       const comment = await createComment(task.id, body);
-      const [inlineAttachments, fileAttachments] = await Promise.all([
-        Promise.all(
-          commentInlineImages.map((image) => uploadCommentAttachment(comment.id, image.file, "inline")),
-        ),
-        Promise.all(
-          commentInlineFiles.map((file) => uploadCommentAttachment(comment.id, file.file, "attachment")),
-        ),
-      ]);
-      const nextComment = commentInlineImages.length > 0 || commentInlineFiles.length > 0
-        ? await updateComment(
-            comment,
-            resolveInlineAttachmentMarkdown(
-              resolveInlineMediaMarkdown(body, commentInlineImages, inlineAttachments),
-              commentInlineFiles,
-              fileAttachments,
-            ),
-          )
+      const pending = [...commentInlineImages, ...commentInlineFiles];
+      const uploaded = await uploadInlineAttachments(
+        pending, (file, kind) => uploadCommentAttachment(comment.id, file, kind),
+      );
+      const nextComment = pending.length > 0
+        ? await updateComment(comment, resolveInlineAttachments(body, pending, uploaded))
         : comment;
       setComments((current) => [...current, nextComment]);
       setCommentSegments(createInlineMediaSegments());
@@ -907,31 +889,20 @@ export function TaskDetail({
     setSavingCommentId(comment.id);
     setCommentsError(null);
     try {
-      const uploadedImages: Attachment[] = [];
-      for (const image of editingInlineImages) {
-        let attachment = editingUploadedAttachmentsRef.current.get(image.id);
+      const pending = [...editingInlineImages, ...editingInlineFiles];
+      const uploaded: Attachment[] = [];
+      for (const item of pending) {
+        let attachment = editingUploadedAttachmentsRef.current.get(item.id);
         if (!attachment) {
-          attachment = await uploadCommentAttachment(comment.id, image.file, "inline");
-          editingUploadedAttachmentsRef.current.set(image.id, attachment);
+          attachment = await uploadCommentAttachment(
+            comment.id, item.file, item.type === "pending-image" ? "inline" : "attachment",
+          );
+          editingUploadedAttachmentsRef.current.set(item.id, attachment);
         }
-        uploadedImages.push(attachment);
-      }
-      const uploadedFiles: Attachment[] = [];
-      for (const file of editingInlineFiles) {
-        let attachment = editingUploadedAttachmentsRef.current.get(file.id);
-        if (!attachment) {
-          attachment = await uploadCommentAttachment(comment.id, file.file, "attachment");
-          editingUploadedAttachmentsRef.current.set(file.id, attachment);
-        }
-        uploadedFiles.push(attachment);
+        uploaded.push(attachment);
       }
       const updated = await updateComment(
-        comment,
-        resolveInlineAttachmentMarkdown(
-          resolveInlineMediaMarkdown(body, editingInlineImages, uploadedImages),
-          editingInlineFiles,
-          uploadedFiles,
-        ).trim(),
+        comment, resolveInlineAttachments(body, pending, uploaded).trim(),
       );
       setComments((current) => current.map((item) => item.id === updated.id ? updated : item));
       const relationAnchor = await getTask(currentTask.id);
@@ -1055,7 +1026,16 @@ export function TaskDetail({
                 {editingDescription ? (
                   <div
                     className="issue-description-composer"
+                    onMouseDownCapture={(event) => {
+                      if (
+                        event.target instanceof Element
+                        && event.target.closest(
+                          ".inline-media-image > button, .inline-media-attachment > button, .issue-description-attach-button",
+                        )
+                      ) event.preventDefault();
+                    }}
                     onBlur={(event) => {
+                      if (descriptionAttachmentPickerOpenRef.current) return;
                       if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
                       void saveDescription();
                     }}
@@ -1094,20 +1074,34 @@ export function TaskDetail({
                       disabled={savingProperty === "description"}
                       aria-label={text("添加描述附件", "Add description attachments")}
                       title={text("添加附件", "Add attachments")}
-                      onClick={() => attachmentInputRef.current?.click()}
+                      onClick={() => {
+                        const input = attachmentInputRef.current;
+                        if (!input) return;
+                        descriptionAttachmentPickerOpenRef.current = true;
+                        input.click();
+                      }}
                     >
                       <AttachmentIcon color="currentColor" />
                     </button>
                     <input
-                      ref={attachmentInputRef}
+                      ref={(input) => {
+                        attachmentInputRef.current = input;
+                        if (!input) return;
+                        input.oncancel = () => {
+                          descriptionAttachmentPickerOpenRef.current = false;
+                          requestAnimationFrame(() => descriptionComposerRef.current?.focus());
+                        };
+                      }}
                       type="file"
                       multiple
                       hidden
                       onChange={(event) => {
+                        descriptionAttachmentPickerOpenRef.current = false;
                         if (event.currentTarget.files) {
                           descriptionComposerRef.current?.addFiles(event.currentTarget.files);
                         }
                         event.currentTarget.value = "";
+                        requestAnimationFrame(() => descriptionComposerRef.current?.focus());
                       }}
                     />
                   </div>

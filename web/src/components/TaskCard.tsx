@@ -31,7 +31,6 @@ interface TaskCardProps {
   task: Task;
   variant?: "main" | "sidebar";
   presentation: TaskCardPresentation;
-  now: number;
   isDragging: boolean;
   dragShift: number;
   isMoving: boolean;
@@ -195,26 +194,38 @@ function ProcessingProgress({
   );
 }
 
+function ProcessingLabel({ processing }: { processing: TaskCardPresentation["processing"] }) {
+  const { text } = useTaskboardI18n();
+  const { running, startedAt } = processing;
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    if (!running || !startedAt) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [running, startedAt]);
+  const elapsed = elapsedTime(startedAt, now);
+  return (
+    <span className="task-processing-label">
+      {running
+        ? (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
+        : text("暂停处理", "Processing paused")}
+    </span>
+  );
+}
+
 function ProcessingStatusRow({
   presentation,
-  now,
   onOpenConversation,
 }: {
   presentation: TaskCardPresentation;
-  now: number;
   onOpenConversation: (conversation: TaskConversationItem) => void;
 }) {
-  const { text } = useTaskboardI18n();
-  const elapsed = elapsedTime(presentation.processing.startedAt, now);
   const running = presentation.processing.running;
   return (
     <div className={`task-processing-row${running ? " is-running" : " is-paused"}`}>
       {running && <img className="task-processing-glyph" src={processingAnimation} alt="" aria-hidden="true" />}
-      <span className="task-processing-label">
-        {running
-          ? (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
-          : text("暂停处理", "Processing paused")}
-      </span>
+      <ProcessingLabel processing={presentation.processing} />
       <span className="task-processing-spacer" aria-hidden="true" />
       {presentation.conversations.length > 0 && (
         <TaskConversationMenu
@@ -392,7 +403,6 @@ export function TaskCard({
   task,
   variant = "main",
   presentation,
-  now,
   isDragging,
   dragShift,
   isMoving,
@@ -596,7 +606,6 @@ export function TaskCard({
           <ProcessingProgress presentation={presentation} />
           <ProcessingStatusRow
             presentation={presentation}
-            now={now}
             onOpenConversation={onOpenConversation}
           />
         </>

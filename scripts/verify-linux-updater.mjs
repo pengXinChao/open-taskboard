@@ -23,12 +23,18 @@ const tauriConfig = JSON.parse(await readFile(
   path.join(projectRoot, "src-tauri", "tauri.conf.json"),
   "utf8",
 ));
-if (releaseTag !== `v${packageJson.version}`) {
+const stableTag = `v${packageJson.version}`;
+const betaPrefix = `${stableTag}-beta.`;
+const betaNumber = releaseTag.startsWith(betaPrefix)
+  ? releaseTag.slice(betaPrefix.length)
+  : "";
+if (releaseTag !== stableTag && !/^[1-9]\d*$/.test(betaNumber)) {
   throw new Error("Release tag does not match package.json version");
 }
+const releaseVersion = releaseTag.slice(1);
 
 const latest = JSON.parse(await readFile(latestPath, "utf8"));
-if (latest.version !== packageJson.version) throw new Error("latest.json version is incorrect");
+if (latest.version !== releaseVersion) throw new Error("latest.json version is incorrect");
 if (latest.platforms?.["linux-x86_64"]) {
   throw new Error("latest.json must use installer-specific Linux updater entries");
 }

@@ -221,38 +221,6 @@ export async function getTaskboardRevision(
   return request<{ changed: boolean; revision: number }>(`/api/revisions?${query}`, { signal });
 }
 
-export async function getHostRuntime(signal?: AbortSignal): Promise<HostContext | null> {
-  const data = await request<{
-    runtime: (Pick<HostContext, "threadId" | "threadRunning" | "threadTodoProgress"> & {
-      codexProjectId: string | null;
-      codexProjectKind: "local" | "remote" | null;
-      codexHostId: string | null;
-      workspacePath: string | null;
-      updatedAt: number;
-    }) | null;
-  }>("/api/local/host-runtime", { signal });
-  if (!data.runtime) return null;
-  const { codexProjectId, codexProjectKind, codexHostId, workspacePath } = data.runtime;
-  return {
-    threadId: data.runtime.threadId,
-    threadRunning: data.runtime.threadRunning,
-    threadTodoProgress: data.runtime.threadTodoProgress,
-    ...(codexProjectId && codexProjectKind && codexHostId && workspacePath
-      ? {
-          projectId: codexProjectId,
-          workspacePath,
-          projects: [{
-            id: codexProjectId,
-            name: codexProjectId,
-            projectKind: codexProjectKind,
-            workspacePath,
-            hostId: codexHostId,
-          }],
-        }
-      : {}),
-  };
-}
-
 export async function getCodexThreadProgress(
   threadIds: string[],
   signal?: AbortSignal,
@@ -803,17 +771,11 @@ export async function uploadCommentAttachment(
   return data.attachment;
 }
 
-export async function deleteAttachment(attachment: Attachment): Promise<void> {
-  await request(`/api/attachments/${encodeURIComponent(attachment.id)}`, {
-    method: "DELETE",
-  });
-}
-
 export function attachmentContentUrl(attachment: { id: string }): string {
   return `api/attachments/${encodeURIComponent(attachment.id)}/content`;
 }
 
-export function attachmentDownloadUrl(attachment: Attachment): string {
+export function attachmentDownloadUrl(attachment: { id: string }): string {
   return `api/attachments/${encodeURIComponent(attachment.id)}/download`;
 }
 

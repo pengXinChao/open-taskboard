@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { signalProcessTree } from "../shared/process-tree.mjs";
-import { ApiError } from "./database.mjs";
+import { ApiError } from "../shared/api-fields.mjs";
 import {
   ComposerCatalog,
   discoverAppServerAiCatalog,

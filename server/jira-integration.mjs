@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { JIRA_PROJECT_ID } from "../shared/domain.mjs";
-import { ApiError } from "./database.mjs";
+import { ApiError } from "../shared/api-fields.mjs";
 
 const JIRA_FIELDS = [
   "summary",

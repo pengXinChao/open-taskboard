@@ -3,10 +3,8 @@ import type {
   AiChatThread,
   AiChatTodoProgress,
   CodexThreadBinding,
-  ComposerPersistedDocument,
   Task,
 } from "./types";
-import type { InlineMediaSegment } from "./components/InlineMediaComposer";
 
 export interface TaskConversationItem {
   key: string;
@@ -36,46 +34,6 @@ export interface TaskCardPresentation {
   unread: boolean;
 }
 
-export function buildPersistedTaskComposerDocument(
-  beforeDescription: string,
-  descriptionSegments: InlineMediaSegment[],
-  afterDescription: string,
-): ComposerPersistedDocument {
-  const nodes: ComposerPersistedDocument["nodes"] = [];
-  const appendText = (value: string) => {
-    if (!value) return;
-    const previous = nodes.at(-1);
-    if (previous?.type === "text") previous.text += value;
-    else nodes.push({ type: "text", text: value });
-  };
-
-  appendText(beforeDescription);
-  for (const segment of descriptionSegments) {
-    if (segment.type === "skill-reference" || segment.type === "agent-reference") {
-      nodes.push({
-        type: "persistedReference",
-        referenceKind: segment.type === "skill-reference" ? "skill" : "agent",
-        referenceKey: segment.referenceKey,
-        label: segment.label,
-      });
-    } else if (segment.type === "unsupported-reference") {
-      nodes.push({
-        type: "unsupportedReference",
-        referenceUri: segment.referenceUri,
-        label: segment.label,
-      });
-    } else if (segment.type === "text") {
-      appendText(segment.text);
-    } else if (segment.type === "pending-image" || segment.type === "pending-attachment") {
-      appendText(segment.token);
-    } else {
-      appendText(segment.markdown);
-    }
-  }
-  appendText(afterDescription);
-  return { version: 1, nodes };
-}
-
 export function normalizeCodexThreadId(value: string | null | undefined) {
   const trimmed = value?.trim() ?? "";
   return trimmed.replace(/^(?:local|cloud):/i, "").trim();
@@ -83,6 +41,18 @@ export function normalizeCodexThreadId(value: string | null | undefined) {
 
 function newerTimestamp(left: string, right: string) {
   return left > right ? left : right;
+}
+
+export function indexAiThreadsByTask(aiThreads: AiChatThread[]) {
+  const index = new Map<string, AiChatThread[]>();
+  for (const thread of aiThreads) {
+    const taskId = thread.origin.issueId;
+    if (!taskId) continue;
+    const threads = index.get(taskId);
+    if (threads) threads.push(thread);
+    else index.set(taskId, [thread]);
+  }
+  return index;
 }
 
 export function taskConversations(task: Task, aiThreads: AiChatThread[]) {
@@ -173,11 +143,13 @@ export function taskCardPresentation(
   } | null | undefined = undefined,
 ): TaskCardPresentation {
   const conversations = taskConversations(task, aiThreads);
-  const runningAi = conversations
-    .filter((conversation) => conversation.currentRun?.status === "running")
-    .sort((left, right) => (
-      (right.currentRun?.startedAt ?? "").localeCompare(left.currentRun?.startedAt ?? "")
-    ))[0];
+  let runningAi: TaskConversationItem | undefined;
+  for (const conversation of conversations) {
+    if (conversation.currentRun?.status !== "running") continue;
+    if (!runningAi || (conversation.currentRun.startedAt ?? "").localeCompare(
+      runningAi.currentRun?.startedAt ?? "",
+    ) > 0) runningAi = conversation;
+  }
   const normalizedRunningNativeThreadId = normalizeCodexThreadId(runningNativeThreadId);
   const runningNative = task.status === "in_progress" && normalizedRunningNativeThreadId
     ? conversations.find((conversation) => (

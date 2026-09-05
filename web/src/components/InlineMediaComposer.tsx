@@ -1,3 +1,4 @@
+import { encodeComposerReferenceKey, readComposerReferenceId } from "../../../shared/composer-reference.mjs";
 import {
   forwardRef,
   useEffect,
@@ -55,7 +56,6 @@ import {
 import { useTaskboardI18n } from "../i18n";
 import { readIssueIdentifier } from "../issueRoute";
 import { STATUS_DETAILS } from "./BoardColumn";
-import { fileKey, MAX_ATTACHMENT_SIZE } from "./PendingAttachments";
 import { LinearIcon } from "./LinearIcon";
 import { MermaidDiagram } from "./MarkdownDocument";
 import {
@@ -117,6 +117,12 @@ interface IssueReferenceSegment {
   identifier: string;
   projectId: string;
   taskId: string | null;
+}
+
+const MAX_ATTACHMENT_SIZE = 25 * 1024 * 1024;
+
+function fileKey(file: File): string {
+  return `${file.name}:${file.size}:${file.lastModified}`;
 }
 
 export interface InlineComposerReferenceSegment {
@@ -274,39 +280,12 @@ const COMPOSER_REFERENCE_URL = /^taskboard:\/\/composer-reference\/v1\/(skill|ag
 const COMPOSER_REFERENCE_NAMESPACE_URL = /^taskboard:\/\/composer-reference\/([^/]+)\/([^/]+)\/([A-Za-z0-9_-]+)$/;
 const PENDING_IMAGE_COMPOSER_REFERENCE_URL = /^taskboard:\/\/composer-reference\/v1\/pending-image\/([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/;
 
-function encodedComposerReferenceKey(value: string): string {
-  return btoa(String.fromCharCode(...new TextEncoder().encode(value)))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-function decodedComposerReferenceKey(value: string): string | null {
-  if (!value || value.length % 4 === 1) return null;
-  try {
-    const padded = `${value.replace(/-/g, "+").replace(/_/g, "/")}${"=".repeat((4 - value.length % 4) % 4)}`;
-    const bytes = Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
-    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    return decoded && encodedComposerReferenceKey(decoded) === value ? decoded : null;
-  } catch {
-    return null;
-  }
-}
-
-function base64UrlReferenceKey(
-  value: string,
-  requireNfc: boolean,
-): string | null {
-  const decoded = decodedComposerReferenceKey(value);
-  return decoded && (!requireNfc || decoded === decoded.normalize("NFC")) ? value : null;
-}
-
 function pendingImageComposerReference(
   url: string,
   name: string,
 ): { file: File; dataUrl: string } | null {
   const match = PENDING_IMAGE_COMPOSER_REFERENCE_URL.exec(url);
-  const type = match ? decodedComposerReferenceKey(match[1]) : null;
+  const type = match ? readComposerReferenceId(match[1]) : null;
   if (!match || !type?.startsWith("image/")) return null;
   try {
     const base64 = `${match[2].replace(/-/g, "+").replace(/_/g, "/")}${"=".repeat((4 - match[2].length % 4) % 4)}`;
@@ -343,7 +322,7 @@ function composerReferenceFromNode(
 ) & { start: number; end: number } | null {
   if (node.type !== "link" || !node.url) return null;
   const namespaceMatch = COMPOSER_REFERENCE_NAMESPACE_URL.exec(node.url);
-  if (!namespaceMatch || !base64UrlReferenceKey(namespaceMatch[3], namespaceMatch[2] === "skill")) return null;
+  if (!namespaceMatch || !readComposerReferenceId(namespaceMatch[3], namespaceMatch[2])) return null;
   const label = markdownNodeText(node);
   const markdown = source.slice(node.position.start.offset, node.position.end.offset);
   if (
@@ -363,7 +342,7 @@ function composerReferenceFromNode(
     };
   }
   const kind = urlMatch[1] as "skill" | "agent";
-  const referenceKey = base64UrlReferenceKey(urlMatch[2], kind === "skill")!;
+  const referenceKey = urlMatch[2];
   return {
     type: `${kind}-reference`,
     start: node.position.start.offset,
@@ -588,18 +567,6 @@ export function inlineMediaFiles(segments: InlineMediaSegment[]): PendingInlineA
   ));
 }
 
-export function inlineMediaComposerReferences(
-  segments: InlineMediaSegment[],
-): Array<InlineComposerReferenceSegment | InlineUnsupportedComposerReferenceSegment> {
-  return segments.filter((segment): segment is (
-    InlineComposerReferenceSegment | InlineUnsupportedComposerReferenceSegment
-  ) => (
-    segment.type === "skill-reference"
-    || segment.type === "agent-reference"
-    || segment.type === "unsupported-reference"
-  ));
-}
-
 export function inlineMediaText(segments: InlineMediaSegment[]): string {
   return segments.map((segment) => {
     if (segment.type === "text") return segment.text;
@@ -667,38 +634,6 @@ export function serializeInlineMedia(segments: InlineMediaSegment[]): string {
   ));
 }
 
-export function resolveInlineMediaMarkdown(
-  value: string,
-  images: PendingInlineImage[],
-  attachments: Array<{ id: string }>,
-): string {
-  return images.reduce((markdown, image, index) => {
-    const attachment = attachments[index];
-    if (!attachment) return markdown;
-    const alt = image.file.name.replace(/[\\[\]]/g, "\\$&");
-    return markdown.replace(
-      image.token,
-      `![${alt}](${attachmentContentUrl(attachment)})`,
-    );
-  }, value);
-}
-
-export function resolveInlineAttachmentMarkdown(
-  value: string,
-  files: PendingInlineAttachment[],
-  attachments: Attachment[],
-): string {
-  return files.reduce((markdown, file, index) => {
-    const attachment = attachments[index];
-    if (!attachment) return markdown;
-    const filename = file.file.name.replace(/[\\[\]]/g, "\\$&");
-    return markdown.replace(
-      file.token,
-      `[${filename}](${attachmentDownloadUrl(attachment)})`,
-    );
-  }, value);
-}
-
 function normalizeSegments(segments: InlineMediaSegment[]): InlineMediaSegment[] {
   const normalized: InlineMediaSegment[] = [];
   for (const segment of segments) {
@@ -748,7 +683,7 @@ function inlineMediaClipboardText(segments: InlineMediaSegment[]): string {
 function pendingImageClipboardMarkdown(segment: InlineImageSegment): string | null {
   const match = segment.dataUrl?.match(/^data:([^;,]+);base64,(.+)$/);
   if (!match) return null;
-  const typeKey = encodedComposerReferenceKey(match[1]);
+  const typeKey = encodeComposerReferenceKey(match[1]);
   const dataKey = match[2].replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const alt = segment.file.name.replace(/[\\[\]]/g, "\\$&");
   return `![${alt}](taskboard://composer-reference/v1/pending-image/${typeKey}.${dataKey})`;
@@ -2143,6 +2078,12 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
         transaction = transaction.setSelection(TextSelection.near(transaction.doc.resolve(position)));
       }
       transaction = transaction.replaceSelection(new Slice(Fragment.fromArray(nodes), 0, 0));
+      if (transaction.selection instanceof NodeSelection) {
+        const paragraphPosition = transaction.selection.to;
+        transaction = transaction
+          .insert(paragraphPosition, composerSchema.nodes.paragraph.create())
+          .setSelection(TextSelection.create(transaction.doc, paragraphPosition + 1));
+      }
       onErrorRef.current(null);
       view.dispatch(transaction.scrollIntoView());
       view.focus();
