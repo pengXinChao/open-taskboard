@@ -193,3 +193,7 @@ A requested batch is complete only when:
 - any requested release is published and verified.
 
 Record-only and explicitly waiting issues are excluded from active implementation counts, but they must be reported accurately in the batch summary.
+
+## Repository-specific Git commit rule
+
+本仓库提交代码时不需要遵循 `gtech-git-commit` 技能的 Jira 编号和提交信息格式要求；按本仓库实际变更使用清晰、简洁的普通 Git 提交信息即可。

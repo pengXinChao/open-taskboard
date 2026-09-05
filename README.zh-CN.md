@@ -109,7 +109,7 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 npm run app:build
 ```
 
-从 Finder 打开 `src-tauri/target/universal-apple-darwin/release/bundle/macos/Codex Harness.app`。DMG 位于 `src-tauri/target/universal-apple-darwin/release/bundle/dmg/`。本地源码构建版命名为 Codex Harness，用于与稳定版区分。如果只需安装稳定版，请从 [GitHub Releases](https://github.com/chuspeeism/dashi-taskboard/releases/latest) 下载当前 DMG。
+从 Finder 打开 `src-tauri/target/universal-apple-darwin/release/bundle/macos/Codex Taskboard.app`。DMG 位于 `src-tauri/target/universal-apple-darwin/release/bundle/dmg/`。如果只需安装稳定版，请从 [GitHub Releases](https://github.com/chuspeeism/dashi-taskboard/releases/latest) 下载当前 DMG。
 
 该 App 包含自己的 Node 运行时、Taskboard 服务、构建后的 Web UI、Skill、CLI 包装器和注入脚本。它会启动服务，复用已打开且有可用 CDP 渲染器的 Codex；普通 Codex 没有 CDP 时，它会在该实例的原生浏览面板中打开 Taskboard；没有打开 Codex 时，它会启动官方 Codex App。有可用 CDP 时，它会等待渲染器并注入侧边栏入口，然后在不显示终端窗口的情况下打开面板。该 App 可以复制到本检出目录之外；目标 Mac 只需安装官方 Codex App，不需要此仓库、系统 Node 安装或单独的 Codex CLI 安装。Taskboard 数据存储在 `~/Library/Application Support/Codex Taskboard`，启动器输出写入 `~/Library/Logs/Codex Taskboard/codex-taskboard-launcher.log`。
 
