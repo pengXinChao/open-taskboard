@@ -197,3 +197,30 @@ Record-only and explicitly waiting issues are excluded from active implementatio
 ## Repository-specific Git commit rule
 
 本仓库提交代码时不需要遵循 `gtech-git-commit` 技能的 Jira 编号和提交信息格式要求；按本仓库实际变更使用清晰、简洁的普通 Git 提交信息即可。
+
+## macOS 构建与产物清理规则
+
+在 `gtech-taskboard` 分支及其后续开发中，macOS 打包必须遵守以下流程：
+
+1. 使用仓库定义的命令构建 Universal macOS App 和 DMG：
+   ```bash
+   npm run app:build
+   ```
+2. 构建完成后，先确认以下产物生成成功：
+   - `src-tauri/target/universal-apple-darwin/release/bundle/macos/Codex Taskboard.app`
+   - `src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg`
+3. 将需要保留的 DMG 复制到仓库外的目录，例如：
+   ```bash
+   mkdir -p ~/Desktop/codex-taskboard-builds
+   cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg \
+     ~/Desktop/codex-taskboard-builds/
+   ```
+4. 确认复制成功后，清理仓库内的大型构建产物：
+   ```bash
+   rm -rf src-tauri/target
+   rm -rf web/dist
+   ```
+5. 默认保留 `node_modules/` 和用户目录下的 Cargo 缓存，避免重复下载依赖；除非用户明确要求，否则不得清理这些可复用缓存。
+6. 最后检查 `git status --short --branch`，确保构建和清理没有修改或删除源代码。
+
+不得长期保留 `src-tauri/target`；每次 macOS 打包完成并保存 DMG 后，都必须执行上述清理流程并在结果中报告 DMG 路径、构建验证结果和清理结果。
