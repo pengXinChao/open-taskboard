@@ -9,6 +9,7 @@ import {
   type MouseEvent,
 } from "react";
 import { taskboardStorage } from "../storage";
+import { jiraDescriptionMarkdown } from "../jiraDescription";
 import {
   ApiError,
   attachmentDownloadUrl,
@@ -1190,7 +1191,9 @@ export function TaskDetail({
                   >
                     {description
                       ? <DescriptionDocument
-                          value={description}
+                          value={currentTask.source === "jira"
+                            ? jiraDescriptionMarkdown(description, attachments)
+                            : description}
                           referenceTasks={referenceTasks}
                           onOpenTask={onOpenTask}
                           attachments={attachments}
@@ -1215,9 +1218,7 @@ export function TaskDetail({
                             {isImage && (
                               <img
                                 className="task-attachment-preview"
-                                src={isRemoteOnly && attachment.remoteUrl
-                                  ? attachment.remoteUrl
-                                  : resolveTaskboardUrl(`/api/attachments/${encodeURIComponent(attachment.id)}/content`)}
+                                src={resolveTaskboardUrl(`/api/attachments/${encodeURIComponent(attachment.id)}/content`)}
                                 alt={attachment.filename}
                               />
                             )}
