@@ -498,6 +498,10 @@ export interface Attachment {
   contentType: string;
   size: number;
   createdAt: string;
+  source?: "local" | "jira";
+  remoteId?: string | null;
+  remoteUrl?: string | null;
+  localAvailable?: boolean;
 }
 
 export interface HostContext {

@@ -131,7 +131,15 @@ function normalizeIssue(issue, config, index = 0) {
         filename: filename.slice(0, 255),
         contentType: String(attachment?.mimeType ?? "application/octet-stream").slice(0, 240),
         size: Number.isFinite(Number(attachment?.size)) ? Math.max(0, Number(attachment.size)) : 0,
-        remoteUrl: String(attachment?.content ?? "").trim() || `${config.baseUrl}/secure/attachment/${encodeURIComponent(remoteId)}/${encodeURIComponent(filename)}`,
+        remoteUrl: (() => {
+          const content = String(attachment?.content ?? "").trim();
+          // Jira 可能返回相对路径；统一保存为绝对地址，任务附件 API 才能稳定提供远端查看入口。
+          try {
+            return new URL(content || `/secure/attachment/${encodeURIComponent(remoteId)}/${encodeURIComponent(filename)}`, `${config.baseUrl}/`).toString();
+          } catch {
+            return `${config.baseUrl}/secure/attachment/${encodeURIComponent(remoteId)}/${encodeURIComponent(filename)}`;
+          }
+        })(),
         createdAt: typeof attachment?.created === "string" ? attachment.created : new Date().toISOString(),
       }];
     }) : [],

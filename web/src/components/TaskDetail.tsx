@@ -165,6 +165,20 @@ function exactTime(value: string, locale: string): string {
   }).format(new Date(value));
 }
 
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  if (value < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB"];
+  let size = value;
+  let unit = "B";
+  for (const candidate of units) {
+    size /= 1024;
+    unit = candidate;
+    if (size < 1024 || candidate === "GB") break;
+  }
+  return `${size >= 10 ? Math.round(size) : size.toFixed(1)} ${unit}`;
+}
+
 function relativeTime(value: string, locale: string): string {
   const seconds = Math.round((new Date(value).getTime() - Date.now()) / 1000);
   const formatter = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
@@ -1186,6 +1200,58 @@ export function TaskDetail({
                       : text("添加描述…", "Add description…")}
                   </div>
                 )}
+                {attachments.length > 0 && (
+                  <section className="task-attachments" aria-labelledby="task-attachments-heading">
+                    <header className="task-attachments-heading">
+                      <h2 id="task-attachments-heading">{text("附件", "Attachments")}</h2>
+                      <span>{attachments.length}</span>
+                    </header>
+                    <div className="task-attachments-list">
+                      {attachments.map((attachment) => {
+                        const isRemoteOnly = attachment.source === "jira" && attachment.localAvailable === false;
+                        const isImage = attachment.contentType.startsWith("image/");
+                        return (
+                          <div className="task-attachment-item" key={attachment.id}>
+                            {isImage && !isRemoteOnly && (
+                              <img
+                                className="task-attachment-preview"
+                                src={resolveTaskboardUrl(`/api/attachments/${encodeURIComponent(attachment.id)}/content`)}
+                                alt={attachment.filename}
+                              />
+                            )}
+                            <div className="task-attachment-info">
+                              <strong title={attachment.filename}>{attachment.filename}</strong>
+                              <span>{attachment.contentType} · {formatBytes(attachment.size)}</span>
+                            </div>
+                            {isRemoteOnly && currentTask.externalUrl ? (
+                              <a
+                                className="button secondary task-attachment-action"
+                                href={currentTask.externalUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                {text("在 Jira 中查看", "View in Jira")} ↗
+                              </a>
+                            ) : (
+                              <button
+                                className="button secondary task-attachment-action"
+                                type="button"
+                                onClick={() => {
+                                  void downloadAttachmentFile(attachment).catch((error) => {
+                                    setAttachmentsError(messageFor(error));
+                                  });
+                                }}
+                              >
+                                {text("打开", "Open")}
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                )}
+
                 {(currentTask.threadBinding || currentTask.legacyLocalThreadId) && (
                   <div
                     className="issue-conversation-list"

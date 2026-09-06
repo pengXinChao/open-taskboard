@@ -92,6 +92,11 @@ export function IssueListView({
                       >
                         <span className="issue-list-title-cell">
                           <small>{displayIdentifier}</small>
+                          {task.source === "jira" && task.issueType && (
+                            <span className="issue-list-jira-type" title={task.issueType}>
+                              {task.issueType}
+                            </span>
+                          )}
                           <strong>{task.title}</strong>
                           {presentations[task.id]?.unread && <span className="task-unread-dot" aria-label={text("有未读更新", "Unread updates")} />}
                         </span>

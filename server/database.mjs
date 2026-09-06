@@ -2516,6 +2516,7 @@ export class TaskboardDatabase {
 
   upsertJiraAttachments(taskId, attachments) {
     const task = this.#requireTask(taskId);
+    if (!Array.isArray(attachments) || attachments.length === 0) return this.listAttachments(task.id);
     const changeRevision = this.#nextCommentAttachmentRevision();
     const statement = this.database.prepare(`
       INSERT INTO attachments (
@@ -2527,13 +2528,21 @@ export class TaskboardDatabase {
         remote_id = excluded.remote_id, remote_url = excluded.remote_url,
         change_revision = excluded.change_revision
     `);
-    for (const attachment of attachments) {
-      statement.run(
-        attachment.id, task.id, attachment.kind ?? (attachment.contentType.startsWith("image/") ? "inline" : "attachment"),
-        attachment.filename, attachment.contentType, attachment.size, attachment.createdAt, changeRevision,
-        attachment.remoteId, attachment.remoteUrl,
-        this.getAttachment(attachment.id)?.localAvailable ? 1 : 0,
-      );
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const attachment of attachments) {
+        const existing = this.getAttachment(attachment.id);
+        statement.run(
+          attachment.id, task.id, attachment.kind ?? (attachment.contentType.startsWith("image/") ? "inline" : "attachment"),
+          attachment.filename, attachment.contentType, attachment.size, attachment.createdAt, changeRevision,
+          attachment.remoteId, attachment.remoteUrl,
+          existing?.localAvailable ? 1 : 0,
+        );
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
     }
     return this.listAttachments(task.id);
   }

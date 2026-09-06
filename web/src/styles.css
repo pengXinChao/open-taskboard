@@ -8965,6 +8965,24 @@ kbd {
   font-variant-numeric: tabular-nums;
 }
 
+.issue-list-jira-type {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  max-width: 72px;
+  height: 18px;
+  padding: 0 6px;
+  overflow: hidden;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-weight: 520;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .issue-list-title-cell strong {
   min-width: 0;
   overflow: hidden;
@@ -9765,4 +9783,79 @@ kbd {
 @media (max-width: 520px) {
   .codex-launch-dialog { width: calc(100vw - 20px); }
   .codex-launch-header, .codex-launch-body, .codex-launch-footer { padding-left: 16px; padding-right: 16px; }
+}
+
+.task-attachments {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: var(--border-hairline) solid var(--border-subtle);
+}
+
+.task-attachments-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 9px;
+}
+
+.task-attachments-heading h2 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.task-attachments-heading span {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.task-attachments-list {
+  display: grid;
+  gap: 7px;
+}
+
+.task-attachment-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 8px 9px;
+  border: var(--border-hairline) solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--surface-raised);
+}
+
+.task-attachment-preview {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 5px;
+  object-fit: cover;
+}
+
+.task-attachment-info {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: 2px;
+}
+
+.task-attachment-info strong {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 520;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-attachment-info span {
+  color: var(--text-tertiary);
+  font-size: 9px;
+}
+
+.task-attachment-action {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
