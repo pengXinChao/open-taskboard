@@ -139,7 +139,6 @@ interface TaskDetailProps {
   onOpenInThread: (task: Task) => void;
   onCopy: (text: string, announcement: string) => void;
   openingThread: boolean;
-  openLaunchDialog?: boolean;
   onError: (message: TaskDetailError | null) => void;
 }
 
@@ -400,7 +399,6 @@ export function TaskDetail({
   onOpenInThread,
   onCopy,
   openingThread,
-  openLaunchDialog = false,
   onError,
 }: TaskDetailProps) {
   const { language, locale, text } = useTaskboardI18n();
@@ -415,13 +413,6 @@ export function TaskDetail({
     "status" | "priority" | "assignee" | "labels" | "development" | "recurrence" | null
   >(null);
   const [savingProperty, setSavingProperty] = useState<string | null>(null);
-  const [launchDialogOpen, setLaunchDialogOpen] = useState(false);
-  const [launchContext, setLaunchContext] = useState<DevelopmentContext | null>(
-    task.developmentContext,
-  );
-  useEffect(() => {
-    if (openLaunchDialog) setLaunchDialogOpen(true);
-  }, [openLaunchDialog]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attachmentsError, setAttachmentsError] = useState<TaskDetailError | null>(null);
   const [comments, setComments] = useState<Comment[]>([]);
@@ -981,14 +972,6 @@ export function TaskDetail({
   ) {
     developmentOptions.unshift(currentTask.developmentContext);
   }
-  const launchWorkspaceOptions = workspaceOptions.length > 0
-    ? workspaceOptions
-    : developmentOptions.flatMap((context) => {
-      const workspacePath = context.type === "worktree" ? context.path : developmentScan.workspacePath;
-      return workspacePath
-        ? [{ id: workspacePath, name: workspacePath.split("/").pop() || workspacePath, workspacePath, projectKind: "local" as const, hostId: null }]
-        : [];
-    });
   const displayAssignee = currentTask.assignee.type === currentUser.type
     && currentTask.assignee.id === currentUser.id
     ? currentUser
@@ -1606,10 +1589,7 @@ export function TaskDetail({
                 className="detail-open-thread-action"
                 type="button"
                 disabled={openingThread}
-                onClick={() => {
-                  setLaunchContext(currentTask.developmentContext);
-                  setLaunchDialogOpen(true);
-                }}
+                onClick={() => onOpenInThread(currentTask)}
               >
                 <NewConversationIcon color="currentColor" />
                 <span>{openingThread
@@ -1878,80 +1858,6 @@ export function TaskDetail({
                 `Updated ${exactTime(currentTask.updatedAt, locale)}`,
               )}</span>}
             </div>
-            <dialog
-              className="codex-launch-dialog"
-              open={launchDialogOpen}
-              aria-labelledby="codex-launch-dialog-title"
-            >
-              <div className="codex-launch-card">
-                <header className="codex-launch-header">
-                  <div>
-                    <span className="codex-launch-kicker">{text("开始处理任务", "Start working")}</span>
-                    <h2 id="codex-launch-dialog-title">{text("在 Codex 中开始处理", "Start in Codex")}</h2>
-                    <p>{currentTask.externalKey ?? currentTask.identifier} · {currentTask.title}</p>
-                  </div>
-                  <button
-                    className="icon-button dialog-close"
-                    type="button"
-                    aria-label={text("关闭", "Close")}
-                    onClick={() => setLaunchDialogOpen(false)}
-                  >×</button>
-                </header>
-                <div className="codex-launch-body">
-                  <label className="codex-launch-field">
-                    <span>{text("工作空间", "Workspace")}</span>
-                    <select
-                      value={launchContext?.type === "worktree" ? launchContext.path : ""}
-                      onChange={(event) => {
-                        const selected = launchWorkspaceOptions.find((option) => option.workspacePath === event.target.value);
-                        if (!selected) { setLaunchContext(null); return; }
-                        const existing = developmentOptions.find((option) => (
-                          option.type === "worktree" && option.path === selected.workspacePath
-                        ));
-                        setLaunchContext(existing ?? { type: "worktree", path: selected.workspacePath, branch: null });
-                      }}
-                    >
-                      <option value="">{developmentScanLoading && launchWorkspaceOptions.length === 0 ? text("正在扫描…", "Scanning…") : text("请选择工作空间", "Choose a workspace")}</option>
-                      {launchWorkspaceOptions.map((option) => (
-                        <option key={option.id} value={option.workspacePath}>
-                          {option.name} · {option.projectKind === "remote" ? text("远程", "Remote") : text("本机", "Local")}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  {launchContext?.type === "worktree" && (
-                    <p className="codex-launch-hint">{text("已选择 Git Worktree，Codex 将在这个独立工作目录中开始。", "A Git worktree is selected. Codex will start in this isolated working directory.")}</p>
-                  )}
-                  {launchContext?.type === "branch" && (
-                    <p className="codex-launch-hint">{text("已默认选择当前分支。你可以在 Codex 中继续编辑提示词。", "The current branch is selected by default. You can continue editing the prompt in Codex.")}</p>
-                  )}
-                  <div className="codex-launch-note">
-                    <NewConversationIcon color="currentColor" />
-                    <span>{text("会话会在你发送第一条消息后与任务绑定。", "The conversation will be linked after you send the first message.")}</span>
-                  </div>
-                </div>
-                <footer className="codex-launch-footer">
-                  <button className="button" type="button" onClick={() => setLaunchDialogOpen(false)}>
-                    {text("取消", "Cancel")}
-                  </button>
-                  <button
-                    className="button primary"
-                    type="button"
-                    disabled={!launchContext || openingThread}
-                    onClick={() => {
-                      if (!launchContext) return;
-                      setLaunchDialogOpen(false);
-                      void onUpdate(currentTask, { developmentContext: launchContext }).then((updated) => {
-                        setCurrentTask(updated);
-                        onOpenInThread(updated);
-                      });
-                    }}
-                  >
-                    {openingThread ? text("正在打开…", "Opening…") : text("在新会话中开始", "Start new conversation")}
-                  </button>
-                </footer>
-              </div>
-            </dialog>
           </aside>
         </div>
       </div>

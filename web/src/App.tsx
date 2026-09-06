@@ -3759,7 +3759,6 @@ export function App() {
             onOpenInThread={requestTaskLaunch}
             onCopy={(text, message) => void copyText(text, message)}
             openingThread={openingThreadTaskId === detailTask.id}
-            openLaunchDialog={false}
             onError={setActionError}
           />
         ) : boardView !== "readme"
