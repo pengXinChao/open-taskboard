@@ -492,7 +492,7 @@ export function TaskCard({
       <div className="card-topline">
         <span className="card-reference">
           <span className="task-identifier">ID: {displayIdentifier}</span>
-          {task.source === "jira" && task.issueType && (
+          {task.issueType && (
             <span className="task-card-jira-type" title={task.issueType}>
               {task.issueType}
             </span>

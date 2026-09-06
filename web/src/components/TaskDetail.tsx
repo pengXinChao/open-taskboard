@@ -1212,10 +1212,12 @@ export function TaskDetail({
                         const isImage = attachment.contentType.startsWith("image/");
                         return (
                           <div className="task-attachment-item" key={attachment.id}>
-                            {isImage && !isRemoteOnly && (
+                            {isImage && (
                               <img
                                 className="task-attachment-preview"
-                                src={resolveTaskboardUrl(`/api/attachments/${encodeURIComponent(attachment.id)}/content`)}
+                                src={isRemoteOnly && attachment.remoteUrl
+                                  ? attachment.remoteUrl
+                                  : resolveTaskboardUrl(`/api/attachments/${encodeURIComponent(attachment.id)}/content`)}
                                 alt={attachment.filename}
                               />
                             )}

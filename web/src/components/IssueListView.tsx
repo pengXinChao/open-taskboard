@@ -92,7 +92,7 @@ export function IssueListView({
                       >
                         <span className="issue-list-title-cell">
                           <small>{displayIdentifier}</small>
-                          {task.source === "jira" && task.issueType && (
+                          {task.issueType && (
                             <span className="issue-list-jira-type" title={task.issueType}>
                               {task.issueType}
                             </span>
