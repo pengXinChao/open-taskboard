@@ -2866,7 +2866,26 @@ export function createTaskboardServer(options = {}) {
         }
         const attachment = database.getAttachment(id) ?? database.getProjectReadmeAttachment(id);
         if (!attachment) throw new ApiError(404, "ATTACHMENT_NOT_FOUND", `Attachment '${id}' does not exist`);
-        const body = await readFile(path.join(resolved.attachmentsDirectory, attachment.id));
+        let body;
+        if (attachment.source === "jira" && !attachment.localAvailable) {
+          const downloaded = await jira.downloadAttachment(attachment);
+          body = downloaded.body;
+          await mkdir(resolved.attachmentsDirectory, { recursive: true });
+          await writeFile(path.join(resolved.attachmentsDirectory, attachment.id), body, { flag: "w" });
+          database.markAttachmentAvailable(attachment.id);
+        } else {
+          try {
+            body = await readFile(path.join(resolved.attachmentsDirectory, attachment.id));
+          } catch (error) {
+            if (error.code === "ENOENT" && attachment.source === "jira") {
+              const downloaded = await jira.downloadAttachment(attachment);
+              body = downloaded.body;
+              await mkdir(resolved.attachmentsDirectory, { recursive: true });
+              await writeFile(path.join(resolved.attachmentsDirectory, attachment.id), body, { flag: "w" });
+              database.markAttachmentAvailable(attachment.id);
+            } else throw error;
+          }
+        }
         const encodedFilename = encodeURIComponent(attachment.filename).replace(/['()*]/g, (character) => (
           `%${character.charCodeAt(0).toString(16).toUpperCase()}`
         ));
@@ -3015,6 +3034,18 @@ export function createTaskboardServer(options = {}) {
             throw error;
           }
           events.emit("task.updated", { task });
+          if (current.status !== "done" && task.status === "done") {
+            // 本地完成是附件清理边界；只删除二进制，保留 Jira 元数据和远端下载入口。
+            const attachments = database.listAttachments(task.id);
+            for (const attachment of attachments) {
+              try {
+                await unlink(path.join(resolved.attachmentsDirectory, attachment.id));
+              } catch (error) {
+                if (error.code !== "ENOENT") throw error;
+              }
+            }
+            database.markTaskAttachmentsUnavailable(task.id);
+          }
           return sendJson(response, 200, { task });
         }
         if (!action && request.method === "DELETE") {

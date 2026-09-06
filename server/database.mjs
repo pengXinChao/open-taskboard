@@ -160,6 +160,10 @@ function attachmentFromRow(row) {
     filename: row.filename,
     contentType: row.content_type,
     size: row.size,
+    source: row.source ?? "local",
+    remoteId: row.remote_id ?? null,
+    remoteUrl: row.remote_url ?? null,
+    localAvailable: row.local_available !== 0,
     createdAt: row.created_at,
   };
   Object.defineProperty(attachment, "changeRevision", { value: row.change_revision });
@@ -362,7 +366,11 @@ export class TaskboardDatabase {
         content_type TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size >= 0),
         created_at TEXT NOT NULL,
-        change_revision INTEGER NOT NULL DEFAULT 0
+        change_revision INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL DEFAULT 'local' CHECK (source IN ('local', 'jira')),
+        remote_id TEXT,
+        remote_url TEXT,
+        local_available INTEGER NOT NULL DEFAULT 1 CHECK (local_available IN (0, 1))
       );
 
       CREATE INDEX IF NOT EXISTS attachments_task_created
@@ -778,6 +786,18 @@ export class TaskboardDatabase {
     }
     if (!attachmentColumns.some((column) => column.name === "change_revision")) {
       this.database.exec("ALTER TABLE attachments ADD COLUMN change_revision INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!attachmentColumns.some((column) => column.name === "source")) {
+      this.database.exec("ALTER TABLE attachments ADD COLUMN source TEXT NOT NULL DEFAULT 'local'");
+    }
+    if (!attachmentColumns.some((column) => column.name === "remote_id")) {
+      this.database.exec("ALTER TABLE attachments ADD COLUMN remote_id TEXT");
+    }
+    if (!attachmentColumns.some((column) => column.name === "remote_url")) {
+      this.database.exec("ALTER TABLE attachments ADD COLUMN remote_url TEXT");
+    }
+    if (!attachmentColumns.some((column) => column.name === "local_available")) {
+      this.database.exec("ALTER TABLE attachments ADD COLUMN local_available INTEGER NOT NULL DEFAULT 1");
     }
     this.database.exec("CREATE INDEX IF NOT EXISTS comments_task_change_revision ON comments(task_id, change_revision)");
     this.database.exec("CREATE INDEX IF NOT EXISTS attachments_comment_created ON attachments(comment_id, created_at, id)");
@@ -2459,8 +2479,9 @@ export class TaskboardDatabase {
       const changeRevision = this.#nextCommentAttachmentRevision();
       this.database.prepare(`
         INSERT INTO attachments (
-          id, task_id, comment_id, kind, filename, content_type, size, created_at, change_revision
-        ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+          id, task_id, comment_id, kind, filename, content_type, size, created_at, change_revision,
+          source, remote_id, remote_url, local_available
+        ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         input.id,
         task.id,
@@ -2470,6 +2491,10 @@ export class TaskboardDatabase {
         input.size,
         now(),
         changeRevision,
+        input.source ?? "local",
+        input.remoteId ?? null,
+        input.remoteUrl ?? null,
+        input.localAvailable === false ? 0 : 1,
       );
       this.database.exec("COMMIT");
     } catch (error) {
@@ -2477,6 +2502,43 @@ export class TaskboardDatabase {
       throw error;
     }
     return this.getAttachment(input.id);
+  }
+
+  upsertJiraAttachments(taskId, attachments) {
+    const task = this.#requireTask(taskId);
+    const changeRevision = this.#nextCommentAttachmentRevision();
+    const statement = this.database.prepare(`
+      INSERT INTO attachments (
+        id, task_id, comment_id, kind, filename, content_type, size, created_at, change_revision,
+        source, remote_id, remote_url, local_available
+      ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'jira', ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        filename = excluded.filename, content_type = excluded.content_type, size = excluded.size,
+        remote_id = excluded.remote_id, remote_url = excluded.remote_url,
+        change_revision = excluded.change_revision
+    `);
+    for (const attachment of attachments) {
+      statement.run(
+        attachment.id, task.id, attachment.kind ?? (attachment.contentType.startsWith("image/") ? "inline" : "attachment"),
+        attachment.filename, attachment.contentType, attachment.size, attachment.createdAt, changeRevision,
+        attachment.remoteId, attachment.remoteUrl,
+        this.getAttachment(attachment.id)?.localAvailable ? 1 : 0,
+      );
+    }
+    return this.listAttachments(task.id);
+  }
+
+  markTaskAttachmentsUnavailable(taskId) {
+    this.#requireTask(taskId);
+    this.database.prepare(`
+      UPDATE attachments SET local_available = 0
+      WHERE task_id = ? AND comment_id IS NULL
+    `).run(taskId);
+  }
+
+  markAttachmentAvailable(id) {
+    this.database.prepare("UPDATE attachments SET local_available = 1 WHERE id = ?").run(id);
+    return this.getAttachment(id);
   }
 
   listCommentAttachments(commentId, after = null) {

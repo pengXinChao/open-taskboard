@@ -14,6 +14,7 @@ const JIRA_FIELDS = [
   "reporter",
   "created",
   "updated",
+  "attachment",
 ];
 const SYNC_INTERVAL_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -118,6 +119,20 @@ function normalizeIssue(issue, config, index = 0) {
     externalId,
     externalKey,
     externalUrl: `${config.baseUrl}/browse/${encodeURIComponent(externalKey)}`,
+    jiraAttachments: Array.isArray(fields.attachment) ? fields.attachment.flatMap((attachment) => {
+      const remoteId = String(attachment?.id ?? "").trim();
+      const filename = String(attachment?.filename ?? "").trim();
+      if (!remoteId || !filename) return [];
+      return [{
+        id: `JIRAATTACH:${createHash("sha256").update(`${config.originId}:${externalId}:${remoteId}`).digest("hex")}`,
+        remoteId,
+        filename: filename.slice(0, 255),
+        contentType: String(attachment?.mimeType ?? "application/octet-stream").slice(0, 240),
+        size: Number.isFinite(Number(attachment?.size)) ? Math.max(0, Number(attachment.size)) : 0,
+        remoteUrl: String(attachment?.content ?? "").trim() || `${config.baseUrl}/secure/attachment/${encodeURIComponent(remoteId)}/${encodeURIComponent(filename)}`,
+        createdAt: typeof attachment?.created === "string" ? attachment.created : new Date().toISOString(),
+      }];
+    }) : [],
     createdAt: typeof fields.created === "string" ? fields.created : new Date().toISOString(),
     updatedAt: typeof fields.updated === "string" ? fields.updated : new Date().toISOString(),
   };
@@ -203,6 +218,25 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
     }
   }
 
+  async function requestBinary(config, remoteUrl) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    timeout.unref?.();
+    try {
+      const response = await fetchImplementation(remoteUrl, {
+        redirect: "manual", signal: controller.signal,
+        headers: { authorization: `Basic ${Buffer.from(`${config.username}:${config.password}`, "utf8").toString("base64")}` },
+      });
+      if (!response.ok) throw new ApiError(response.status >= 500 ? 502 : 409, "JIRA_ATTACHMENT_DOWNLOAD_FAILED", `Jira 附件下载失败（HTTP ${response.status}）`);
+      return { body: Buffer.from(await response.arrayBuffer()), contentType: response.headers.get("content-type") || "application/octet-stream" };
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(502, "JIRA_ATTACHMENT_DOWNLOAD_FAILED", "无法下载 Jira 附件");
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   async function fetchAssignedIssues(config) {
     const issues = [];
     let startAt = 0;
@@ -261,10 +295,14 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       await assertLiveOrigin(config);
       issues = await fetchAssignedIssues(config);
     }
+    const normalizedIssues = issues.map((issue, index) => normalizeIssue(issue, config, index));
     database.syncJiraTasks(
-      issues.map((issue, index) => normalizeIssue(issue, config, index)),
+      normalizedIssues,
       { archiveMissing, projectName: `Jira · ${config.displayName}`, legacyIdentity },
     );
+    for (const issue of normalizedIssues) {
+      database.upsertJiraAttachments(issue.id, issue.jiraAttachments);
+    }
     if (storedConfig.version === 1) config = await configStore.save(config);
     lastSyncedAt = new Date().toISOString();
     return safeConfig(config, lastSyncedAt);
@@ -337,7 +375,24 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
     return { id: String(match.id) };
   }
 
+  async function downloadAttachment(attachment) {
+    const config = await configStore.read();
+    if (!config || attachment.source !== "jira" || !attachment.remoteUrl) {
+      throw new ApiError(409, "ATTACHMENT_DOWNLOAD_UNAVAILABLE", "附件没有可用的 Jira 下载入口");
+    }
+    let remoteUrl;
+    try {
+      remoteUrl = new URL(attachment.remoteUrl);
+      if (remoteUrl.origin !== new URL(config.baseUrl).origin) throw new Error("origin mismatch");
+    } catch {
+      throw new ApiError(409, "ATTACHMENT_DOWNLOAD_UNAVAILABLE", "Jira 附件地址无效");
+    }
+    await assertLiveOrigin(config);
+    return requestBinary(config, remoteUrl.toString());
+  }
+
   return {
+    downloadAttachment,
     async status() {
       return safeConfig(await configStore.read(), lastSyncedAt);
     },
