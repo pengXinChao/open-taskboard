@@ -436,14 +436,19 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       const legacyIdentity = current?.version === 1
         ? { urlHash: legacyJiraOriginId(current.baseUrl), originId: config.originId }
         : null;
+      const normalizedIssues = issues.map((issue, index) => normalizeIssue(issue, config, index));
       database.syncJiraTasks(
-        issues.map((issue, index) => normalizeIssue(issue, config, index)),
+        normalizedIssues,
         {
           archiveMissing: true,
           projectName: `Jira · ${config.displayName}`,
           legacyIdentity,
         },
       );
+      // 配置/重新连接也会同步已有任务，必须同时回填 Jira 附件元数据。
+      for (const issue of normalizedIssues) {
+        database.upsertJiraAttachments(issue.id, issue.jiraAttachments);
+      }
       const savedConfig = await configStore.save(config);
       lastSyncedAt = new Date().toISOString();
       return safeConfig(savedConfig, lastSyncedAt);

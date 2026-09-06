@@ -9859,3 +9859,21 @@ kbd {
   flex: 0 0 auto;
   white-space: nowrap;
 }
+
+.task-card-jira-type {
+  display: inline-flex;
+  align-items: center;
+  max-width: 72px;
+  height: 17px;
+  margin-left: 6px;
+  padding: 0 5px;
+  overflow: hidden;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-weight: 520;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

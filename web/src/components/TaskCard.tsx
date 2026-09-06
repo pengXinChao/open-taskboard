@@ -492,6 +492,11 @@ export function TaskCard({
       <div className="card-topline">
         <span className="card-reference">
           <span className="task-identifier">ID: {displayIdentifier}</span>
+          {task.source === "jira" && task.issueType && (
+            <span className="task-card-jira-type" title={task.issueType}>
+              {task.issueType}
+            </span>
+          )}
         </span>
         {presentation.unread && <span className="task-unread-dot" aria-label={text("有未读更新", "Unread updates")} />}
         {task.status === "in_review" && onComplete && (
