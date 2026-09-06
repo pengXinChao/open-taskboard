@@ -78,7 +78,8 @@ import {
 import { ProjectAutomationMenu } from "./components/ProjectAutomationMenu";
 import { TaskboardIcon } from "./components/TaskboardIcon";
 import { TaskContextMenu } from "./components/TaskContextMenu";
-import { TaskDetail } from "./components/TaskDetail";
+import { TaskDetail, type CodexWorkspaceOption } from "./components/TaskDetail";
+import { CodexLaunchDialog } from "./components/CodexLaunchDialog";
 import {
   TaskEditor,
   type NewTaskCreateOptions,
@@ -131,6 +132,7 @@ import {
   type CodexThreadBinding,
   type DevelopmentScan,
   type HostContext,
+  type DevelopmentContext,
   type IssueRelationOrigin,
   type IssueRelationType,
   type JiraConnection,
@@ -816,6 +818,8 @@ export function App() {
   const [settlingTaskId, setSettlingTaskId] = useState<string | null>(null);
   const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
   const [openingThreadTaskId, setOpeningThreadTaskId] = useState<string | null>(null);
+  const [launchTaskId, setLaunchTaskId] = useState<string | null>(null);
+  const [pendingThreadBindingTaskId, setPendingThreadBindingTaskId] = useState<string | null>(null);
   const [projectMenuOpen, setProjectMenuOpen] = useState(
     () => taskboardStorage.getItem(FIRST_USE_COMPLETE_KEY) === null,
   );
@@ -1007,6 +1011,32 @@ export function App() {
   useLayoutEffect(() => {
     if (selectedProject) rememberProjectOpen(selectedProject.id);
   }, [rememberProjectOpen, selectedProject]);
+  const codexWorkspaceOptions = useMemo<CodexWorkspaceOption[]>(() => {
+    const options = new Map<string, CodexWorkspaceOption>();
+    for (const project of hostContext?.projects ?? []) {
+      if (!project.workspacePath) continue;
+      options.set(`${project.projectKind ?? "local"}:${project.hostId ?? "local"}:${project.id}:${project.workspacePath}`, {
+        id: project.id,
+        name: project.name,
+        workspacePath: project.workspacePath,
+        projectKind: project.projectKind ?? "local",
+        hostId: project.hostId ?? null,
+      });
+    }
+    for (const [id, workspacePath] of Object.entries(deviceWorkspacePaths)) {
+      if (!workspacePath) continue;
+      if ([...options.values()].some((option) => option.workspacePath === workspacePath)) continue;
+      options.set(`local:local:${id}:${workspacePath}`, {
+        id,
+        name: workspacePath.split("/").pop() || workspacePath,
+        workspacePath,
+        projectKind: "local",
+        hostId: null,
+      });
+    }
+    return [...options.values()];
+  }, [deviceWorkspacePaths, hostContext?.projects]);
+
   const currentUser = hostContext?.user ?? {
     ...DEFAULT_USER_ACTOR,
     name: text("本地用户", "Local user"),
@@ -1551,6 +1581,17 @@ export function App() {
     drainQueuedAutomationSaves,
   ]);
 
+  function requestTaskLaunch(task: Task) {
+    setLaunchTaskId(task.id);
+  }
+
+  function startTaskLaunch(task: Task, context: DevelopmentContext) {
+    setLaunchTaskId(null);
+    void updateTaskProperties(task, { developmentContext: context }).then((updated) => {
+      openTaskInThread(updated);
+    });
+  }
+
   function openTaskDetail(task: Pick<Task, "identifier" | "projectId">) {
     const fullTask = tasksRef.current.find((candidate) => candidate.identifier === task.identifier);
     if (fullTask) markTaskRead(fullTask);
@@ -1792,6 +1833,7 @@ export function App() {
 
       if (message.type === "taskboard:thread-create-error" && message.payload) {
         const payload = message.payload as { error?: unknown };
+        setPendingThreadBindingTaskId(null);
         setOpeningThreadTaskId(null);
         setActionError(typeof payload.error === "string"
           ? payload.error
@@ -2022,6 +2064,26 @@ export function App() {
     }, 60_000);
     return () => window.clearInterval(timer);
   }, [isJiraProject, jiraConnection?.configured, refreshTasks, taskScopeProjectId]);
+
+  useEffect(() => {
+    const pendingTaskId = pendingThreadBindingTaskId;
+    const threadId = hostContext?.threadId?.trim();
+    if (!pendingTaskId || !threadId || hostContext?.threadRunning !== true) return;
+    const task = tasksRef.current.find((candidate) => candidate.id === pendingTaskId);
+    if (!task || task.threadId) {
+      setPendingThreadBindingTaskId(null);
+      return;
+    }
+    setPendingThreadBindingTaskId(null);
+    // 只有 Codex 已确认真实运行首条消息后，才把会话写回任务。
+    void updateTaskRequest(task, taskToDraft(task), threadId).then((boundTask) => {
+      setTasks((current) => sortTasks(current.map((candidate) => (
+        candidate.id === boundTask.id ? boundTask : candidate
+      ))));
+    }).catch((error) => {
+      setActionError(errorMessage(error));
+    });
+  }, [hostContext?.threadId, hostContext?.threadRunning, pendingThreadBindingTaskId]);
 
   useEffect(() => {
     const standalone = !embedded || window.parent === window;
@@ -3083,6 +3145,7 @@ export function App() {
       return;
     }
     setOpeningThreadTaskId(task.id);
+    setPendingThreadBindingTaskId(task.id);
     setActionError(null);
     postEmbeddedHostMessage({
       type: "taskboard:create-thread",
@@ -3678,6 +3741,7 @@ export function App() {
             availableLabels={availableLabels}
             developmentScan={developmentScan}
             developmentScanLoading={developmentScanLoading}
+            workspaceOptions={codexWorkspaceOptions}
             commentsRevision={commentsRevision}
             attachmentsRevision={attachmentsRevision}
             onCreateLabel={persistProjectLabel}
@@ -3692,9 +3756,10 @@ export function App() {
             )}
             onOpenThread={openThread}
             onOpenLegacyLocalThread={openLegacyLocalThread}
-            onOpenInThread={openTaskInThread}
+            onOpenInThread={requestTaskLaunch}
             onCopy={(text, message) => void copyText(text, message)}
             openingThread={openingThreadTaskId === detailTask.id}
+            openLaunchDialog={false}
             onError={setActionError}
           />
         ) : boardView !== "readme"
@@ -4164,10 +4229,24 @@ export function App() {
           onDuplicate={(task) => void duplicateTask(task)}
           onCopy={(text, message) => void copyText(text, message)}
           openInThreadDisabled={developmentScanLoading}
-          onOpenInThread={openTaskInThread}
+          onOpenInThread={requestTaskLaunch}
           onArchive={(task) => void archiveTask(task)}
         />
       )}
+
+      <CodexLaunchDialog
+        task={launchTaskId
+          ? tasks.find((task) => task.id === launchTaskId)
+            ?? archivedTasks.find((task) => task.id === launchTaskId)
+            ?? null
+          : null}
+        workspaceOptions={codexWorkspaceOptions}
+        developmentOptions={developmentScan.contexts}
+        developmentScanLoading={developmentScanLoading}
+        opening={Boolean(openingThreadTaskId)}
+        onClose={() => setLaunchTaskId(null)}
+        onStart={startTaskLaunch}
+      />
 
       {localAiChatAvailable && !isAllProjects && (
         <Suspense fallback={null}>

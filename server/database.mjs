@@ -76,6 +76,7 @@ function taskFromRow(row) {
     identifier: row.identifier,
     projectId: row.project_id,
     title: row.title,
+    issueType: row.issue_type ?? null,
     description: row.description,
     status: row.status,
     priority: row.priority,
@@ -280,6 +281,7 @@ export class TaskboardDatabase {
         identifier TEXT NOT NULL UNIQUE,
         project_id TEXT NOT NULL REFERENCES projects(id),
         title TEXT NOT NULL,
+        issue_type TEXT,
         description TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL CHECK (status IN (
           'backlog', 'todo', 'in_progress', 'in_review', 'blocked', 'done', 'canceled'
@@ -534,6 +536,10 @@ export class TaskboardDatabase {
     }
     if (!taskColumns.some((column) => column.name === "recurrence_unit")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN recurrence_unit TEXT");
+    }
+    // 状态迁移会复制整张 tasks 表，因此新增字段必须先加入旧表，避免迁移查询引用不存在的列。
+    if (!taskColumns.some((column) => column.name === "issue_type")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN issue_type TEXT");
     }
     this.#migrateTaskStatuses();
     const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
@@ -854,6 +860,7 @@ export class TaskboardDatabase {
           identifier TEXT NOT NULL UNIQUE,
           project_id TEXT NOT NULL REFERENCES projects(id),
           title TEXT NOT NULL,
+          issue_type TEXT,
           description TEXT NOT NULL DEFAULT '',
           status TEXT NOT NULL CHECK (status IN (
             'backlog', 'todo', 'in_progress', 'in_review', 'blocked', 'done', 'canceled'
@@ -880,14 +887,14 @@ export class TaskboardDatabase {
         );
 
         INSERT INTO tasks_status_migration (
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, issue_type, description, status, priority, labels,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path, git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
           archived_at, version, created_at, updated_at
         )
         SELECT
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, issue_type, description, status, priority, labels,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path, git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
@@ -1030,7 +1037,7 @@ export class TaskboardDatabase {
       }
       const insertTask = this.database.prepare(`
         INSERT INTO tasks (
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, issue_type, description, status, priority, labels,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
           creator_type, creator_id, creator_name, creator_avatar_url,
@@ -1040,8 +1047,8 @@ export class TaskboardDatabase {
           external_source, external_origin, external_id, external_key, external_url,
           archived_at, version, created_at, updated_at
         ) VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, NULL, NULL, NULL, NULL, NULL,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          NULL, NULL, NULL, NULL, NULL,
           ?, ?, ?, ?,
           ?, ?, ?, ?,
           NULL, NULL, NULL,
@@ -1052,7 +1059,7 @@ export class TaskboardDatabase {
       `);
       const updateTask = this.database.prepare(`
         UPDATE tasks SET
-          identifier = ?, title = ?, description = ?, status = ?, priority = ?, labels = ?,
+          identifier = ?, title = ?, issue_type = ?, description = ?, status = ?, priority = ?, labels = ?,
           sort_order = ?, creator_type = ?, creator_id = ?, creator_name = ?, creator_avatar_url = ?,
           assignee_type = ?, assignee_id = ?, assignee_name = ?, assignee_avatar_url = ?,
           due_date = ?, external_origin = ?, external_id = ?, external_key = ?, external_url = ?,
@@ -1071,6 +1078,7 @@ export class TaskboardDatabase {
             issue.identifier,
             JIRA_PROJECT_ID,
             issue.title,
+            issue.issueType ?? null,
             issue.description,
             issue.status,
             issue.priority,
@@ -1097,6 +1105,7 @@ export class TaskboardDatabase {
 
         const changed = existing.identifier !== issue.identifier
           || existing.title !== issue.title
+          || existing.issue_type !== (issue.issueType ?? null)
           || existing.description !== issue.description
           || existing.status !== issue.status
           || existing.priority !== issue.priority
@@ -1120,6 +1129,7 @@ export class TaskboardDatabase {
         updateTask.run(
           issue.identifier,
           issue.title,
+          issue.issueType ?? null,
           issue.description,
           issue.status,
           issue.priority,

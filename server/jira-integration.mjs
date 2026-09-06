@@ -5,6 +5,7 @@ import { ApiError } from "../shared/api-fields.mjs";
 
 const JIRA_FIELDS = [
   "summary",
+  "issuetype",
   "description",
   "status",
   "priority",
@@ -107,6 +108,7 @@ function normalizeIssue(issue, config, index = 0) {
     id: internalId,
     identifier: internalId,
     title: limitedString(fields.summary, externalKey, 240),
+    issueType: typeof fields.issuetype?.name === "string" ? fields.issuetype.name.trim().slice(0, 120) || null : null,
     description: typeof fields.description === "string" ? fields.description.slice(0, 100_000) : "",
     status: taskStatusFromJira(fields.status),
     priority: taskPriorityFromJira(fields.priority),

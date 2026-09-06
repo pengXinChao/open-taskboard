@@ -9661,3 +9661,108 @@ kbd {
   .dashboard-metric { border-top: var(--border-hairline) solid var(--border); }
   .dashboard-metric:first-child { border-top: 0; }
 }
+
+/* 启动卡片使用独立的实体背景，保证独立 Web 端和内嵌端都清晰可读。 */
+.codex-launch-dialog {
+  display: block;
+  position: fixed;
+  inset: 50% auto auto 50%;
+  z-index: 1000;
+  width: min(520px, calc(100vw - 32px));
+  margin: 0;
+  transform: translate(-50%, -50%);
+  overflow: hidden;
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 18px;
+  color: var(--text-primary, #172033);
+  background: var(--surface-raised, #fff);
+  box-shadow: 0 24px 80px rgb(15 23 42 / 22%);
+}
+.codex-launch-dialog::backdrop { background: rgb(15 23 42 / 48%); }
+.codex-launch-card { overflow: hidden; background: #fff; }
+.codex-launch-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 22px 16px;
+  background: linear-gradient(135deg, #f7fbff 0%, #fff 72%);
+  border-bottom: 1px solid #edf1f7;
+}
+.codex-launch-header > div:first-child { min-width: 0; flex: 1; }
+.codex-launch-kicker {
+  color: var(--accent, #317cff);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+}
+.codex-launch-header h2 {
+  overflow: hidden;
+  margin: 6px 0 8px;
+  color: #172033;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.35;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.codex-launch-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  color: #64748b;
+  font-size: 12px;
+}
+.codex-launch-jira-link { color: var(--accent, #317cff); font-weight: 600; text-decoration: none; }
+.codex-launch-jira-link:hover { text-decoration: underline; }
+.codex-launch-body { display: grid; gap: 14px; padding: 18px 22px 20px; }
+.codex-launch-description {
+  padding: 12px 14px;
+  border: 1px solid #e7edf5;
+  border-radius: 12px;
+  background: #f8fafc;
+}
+.codex-launch-section-label {
+  margin-bottom: 6px;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+}
+.codex-launch-description p {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  color: #334155;
+  font-size: 12px;
+  line-height: 1.55;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+.codex-launch-field { display: grid; gap: 7px; font-size: 12px; font-weight: 700; }
+.codex-launch-field > span { color: #334155; }
+.codex-launch-field select {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid #dbe3ee;
+  border-radius: 10px;
+  color: #172033;
+  background: #f8fafc;
+  font: inherit;
+}
+.codex-launch-field select:focus { outline: 2px solid rgb(49 124 255 / 28%); outline-offset: 1px; }
+.codex-launch-hint { margin: 0; color: #64748b; font-size: 12px; line-height: 1.5; }
+.codex-launch-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 14px 22px 18px;
+  border-top: 1px solid #edf1f7;
+  background: #fcfdff;
+}
+@media (max-width: 520px) {
+  .codex-launch-dialog { width: calc(100vw - 20px); }
+  .codex-launch-header, .codex-launch-body, .codex-launch-footer { padding-left: 16px; padding-right: 16px; }
+}

@@ -410,6 +410,7 @@ export interface Task {
   identifier: string;
   projectId: string;
   title: string;
+  issueType?: string | null;
   description: string;
   status: TaskStatus;
   priority: TaskPriority;
