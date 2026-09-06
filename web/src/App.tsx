@@ -337,7 +337,21 @@ function readProjectBoardDisplaySettings(): Record<string, BoardDisplaySettings>
     try {
       const value = JSON.parse(storedValue);
       if (value && typeof value === "object" && !Array.isArray(value)) {
-        settings[projectId] = value as BoardDisplaySettings;
+        const parsed = value as BoardDisplaySettings;
+        // 将旧版本把 blocked 放入 hidden 的默认布局迁移到主看板；用户仍可通过显示设置再次隐藏。
+        if (
+          parsed.hiddenStatuses?.includes("blocked")
+          && !parsed.mainStatuses?.includes("blocked")
+          && !parsed.sidebarStatuses?.includes("blocked")
+        ) {
+          settings[projectId] = {
+            ...parsed,
+            mainStatuses: [...(parsed.mainStatuses ?? []), "blocked"],
+            hiddenStatuses: parsed.hiddenStatuses.filter((status) => status !== "blocked"),
+          };
+        } else {
+          settings[projectId] = parsed;
+        }
       }
     } catch {
       // Ignore malformed display settings without affecting other projects.

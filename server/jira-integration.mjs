@@ -296,12 +296,8 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       taskboardStatus: taskStatusFromJira(candidate.to),
     }));
     if (matches.length === 0) {
-      throw new ApiError(
-        409,
-        "JIRA_TRANSITION_UNAVAILABLE",
-        `Jira 当前工作流不能将 ${issueKey} 移到目标状态`,
-        { availableStatuses },
-      );
+      // Jira 工作流没有对应映射时，保留 Taskboard 本地状态；不要发送一个无效的 transition。
+      return null;
     }
     if (matches.length > 1) {
       throw new ApiError(
@@ -459,7 +455,9 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       }
       await assertLiveOrigin(config);
       const transition = await resolveTransition(config, task.externalKey, status);
-      await applyTransition(config, task.externalKey, transition);
+      if (transition) {
+        await applyTransition(config, task.externalKey, transition);
+      }
     },
   };
 }

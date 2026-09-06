@@ -307,7 +307,7 @@ export function BoardCardDisplayMenu({
                       <span>{status === "archived"
                         ? text("已归档", "Archived")
                         : status === "blocked"
-                          ? text("遇到阻碍（默认隐藏）", "Blocked (hidden by default)")
+                          ? text("遇到阻碍", "Blocked")
                         : taskStatusLabel(language, status)}</span>
                     </div>
                   );
