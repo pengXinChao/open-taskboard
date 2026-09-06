@@ -3083,10 +3083,16 @@ export function App() {
         : codexProjectContext?.workspacePath
           ?? deviceWorkspacePaths[task.projectId]
           ?? taskboardProject?.workspacePath;
-    const embeddedInstruction = text(
-      `[$manage-taskboard](${manageTaskboardSkillPath}) 议题 ID：${task.identifier}`,
-      `[$manage-taskboard](${manageTaskboardSkillPath}) Issue ID: ${task.identifier}`,
-    );
+    // Jira 地址仅用于提示词展示；会话绑定仍使用独立传递的内部任务 ID。
+    const embeddedInstruction = task.source === "jira" && task.externalUrl
+      ? text(
+        `[$manage-taskboard](${manageTaskboardSkillPath}) Jira 地址：${task.externalUrl}`,
+        `[$manage-taskboard](${manageTaskboardSkillPath}) Jira URL: ${task.externalUrl}`,
+      )
+      : text(
+        `[$manage-taskboard](${manageTaskboardSkillPath}) 议题 ID：${task.identifier}`,
+        `[$manage-taskboard](${manageTaskboardSkillPath}) Issue ID: ${task.identifier}`,
+      );
 
     if (
       !projectless
