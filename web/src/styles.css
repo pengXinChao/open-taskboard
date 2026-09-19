@@ -1287,6 +1287,7 @@ kbd {
 
 .task-filter-item {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   width: 100%;
   min-width: 0;
@@ -1348,10 +1349,6 @@ kbd {
   color: var(--text-tertiary);
   font-size: 11px;
   text-overflow: ellipsis;
-}
-
-.task-filter-category.is-active .task-filter-item-summary {
-  color: var(--accent);
 }
 
 .task-filter-chevron {
@@ -1419,6 +1416,7 @@ kbd {
 }
 
 .task-filter-section-label {
+  flex-shrink: 0;
   height: 27px;
   margin: 5px -6px 0;
   padding: 7px 13px 0;
@@ -1429,6 +1427,7 @@ kbd {
 }
 
 .task-filter-unmatched {
+  flex-shrink: 0;
   opacity: 0.56;
 }
 
@@ -1814,6 +1813,10 @@ kbd {
   overflow: visible;
 }
 
+.task-card.is-property-menu-open > .card-properties {
+  z-index: 3;
+}
+
 .card-property-control {
   position: relative;
   cursor: pointer;
@@ -1845,11 +1848,18 @@ kbd {
   min-width: 0;
 }
 
+.card-properties .task-property-picker {
+  flex-shrink: 0;
+}
+
 .card-label-trigger {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
   min-width: 0;
+  max-width: 100%;
   height: 20px;
+  overflow: hidden;
   gap: 4px;
   padding: 0;
   border: 0;
@@ -1857,6 +1867,11 @@ kbd {
   background: transparent;
   color: inherit;
   cursor: pointer;
+}
+
+.card-label-trigger .label-chip {
+  flex: 0 0 auto;
+  max-width: 100%;
 }
 
 .card-label-picker .label-popover {
@@ -1880,6 +1895,14 @@ kbd {
   background: transparent;
   color: inherit;
   cursor: pointer;
+}
+
+.task-card-created-at {
+  display: block;
+  margin-top: 8px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 18px;
 }
 
 .card-topline {
@@ -2378,7 +2401,7 @@ kbd {
 .issue-description-document input[type="checkbox"] {
   width: 14px;
   height: 14px;
-  margin: 4px 0 0;
+  margin: calc((1lh - 14px) / 2) 0 0;
   accent-color: var(--accent);
   pointer-events: none;
 }
@@ -2622,6 +2645,16 @@ kbd {
   font-weight: 600;
 }
 
+.issue-conversation-session-id {
+  min-width: 0;
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  user-select: text;
+}
+
 .issue-conversation-copy {
   display: inline-flex;
   align-items: center;
@@ -2672,6 +2705,14 @@ kbd {
   min-height: 30px;
   gap: 12px;
   margin-bottom: 5px;
+}
+
+.issue-sub-issue-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .issue-sub-issues > header > div:first-child,
@@ -3018,6 +3059,71 @@ kbd {
   transition: border-color 100ms ease, background 100ms ease;
 }
 
+.document-attachment-preview {
+  position: relative;
+  display: block;
+}
+
+.attachment-local-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 6px;
+}
+
+.attachment-local-actions > .icon-button {
+  position: relative;
+}
+
+.attachment-local-actions > .icon-button:hover {
+  background: color-mix(in srgb, var(--text-primary) 9%, transparent);
+}
+
+.attachment-action-tooltip {
+  position: absolute;
+  z-index: 40;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  display: none;
+  width: max-content;
+  padding: 5px 8px;
+  border: var(--border-hairline) solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14);
+  font-size: 11px;
+  line-height: 16px;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.attachment-local-actions > .icon-button:hover .attachment-action-tooltip,
+.attachment-local-actions > .icon-button:focus-visible .attachment-action-tooltip {
+  display: block;
+}
+
+.document-attachment-preview > .attachment-local-actions {
+  visibility: hidden;
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  transform: translateY(-50%);
+}
+
+.document-attachment-preview:hover > .attachment-local-actions {
+  visibility: visible;
+}
+
+.document-attachment-preview:has(> .attachment-local-actions) .document-attachment-card {
+  padding-right: 80px;
+}
+
+.issue-description-document .document-attachment-preview + br {
+  display: none;
+}
+
+.document-attachment-preview:hover .document-attachment-card,
 .document-attachment-card:hover,
 .issue-description-document a.issue-reference-link:focus-visible > .document-attachment-card,
 .inline-media-attachment:hover,
@@ -3052,6 +3158,7 @@ kbd {
   flex-direction: column;
   min-width: 0;
   gap: 2px;
+  line-height: 1.4;
 }
 
 .attachment-copy strong {
@@ -7865,10 +7972,6 @@ kbd {
   white-space: normal;
 }
 
-.card-properties {
-  flex-wrap: wrap;
-}
-
 .card-properties:empty {
   display: none;
 }
@@ -8151,7 +8254,8 @@ kbd {
   margin-left: -5px;
 }
 
-.task-card .actor-avatar-agent {
+.task-card .actor-avatar-agent,
+.dashboard-role-row .actor-avatar-agent {
   box-sizing: border-box;
   overflow: hidden;
   padding: 1px;
@@ -8162,7 +8266,8 @@ kbd {
   box-shadow: none;
 }
 
-.task-card .actor-avatar-agent-image {
+.task-card .actor-avatar-agent-image,
+.dashboard-role-row .actor-avatar-agent-image {
   border-radius: 50%;
 }
 
@@ -8190,7 +8295,7 @@ kbd {
   pointer-events: auto;
 }
 
-.task-conversation-trigger:not(.is-multiple) {
+.task-conversation-trigger:not(.is-multiple):not(.is-agent-session) {
   width: 20px;
   min-width: 20px;
   padding: 0;
@@ -8217,6 +8322,8 @@ kbd {
   position: fixed;
   z-index: 1600;
   width: min(286px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   padding: 6px;
   border: var(--border-hairline) solid var(--border-strong);
   border-radius: 12px;
