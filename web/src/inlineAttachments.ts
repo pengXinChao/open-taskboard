@@ -1,6 +1,6 @@
 import { attachmentContentUrl, attachmentDownloadUrl } from "./api";
 import type { Attachment } from "./types";
-import type { PendingInlineAttachment, PendingInlineImage } from "./components/InlineMediaComposer";
+import { referencedAttachmentIds, type PendingInlineAttachment, type PendingInlineImage } from "./documentModel";
 
 type PendingAttachment = PendingInlineImage | PendingInlineAttachment;
 
@@ -26,4 +26,22 @@ export function resolveInlineAttachments(
     const url = image ? attachmentContentUrl(attachment) : attachmentDownloadUrl(attachment);
     return markdown.replace(item.token, `${image ? "!" : ""}[${label}](${url})`);
   }, value);
+}
+
+// Legacy uploads belong to the document, not a separate attachment list. Once
+// its owner saves a complete body, persistence consumes the fallback eligibility.
+export function appendUnreferencedAttachments(value: string, attachments: readonly Attachment[]): string {
+  const referenced = referencedAttachmentIds(value);
+  const missing: string[] = [];
+  for (const attachment of attachments) {
+    if (!attachment.bodyFallback || referenced.has(attachment.id)) continue;
+    referenced.add(attachment.id);
+    const label = attachment.filename.replace(/[\\[\]]/g, "\\$&");
+    const image = attachment.contentType.startsWith("image/");
+    const url = image ? attachmentContentUrl(attachment) : attachmentDownloadUrl(attachment);
+    missing.push(`${image ? "!" : ""}[${label}](${url})`);
+  }
+  return missing.length > 0
+    ? `${value}${value ? "\n\n" : ""}${missing.join("\n\n")}`
+    : value;
 }

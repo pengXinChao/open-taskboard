@@ -41,6 +41,7 @@ interface TaskCardProps {
   currentUser: ActorIdentity;
   showCover: boolean;
   showBody: boolean;
+  showCreatedAt: boolean;
   onCreateLabel: (label: string) => Promise<void>;
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
@@ -88,7 +89,7 @@ function calendarDate(value: string, locale: string) {
 }
 
 function createdDate(value: string, locale: string, text: (chinese: string, english: string) => string) {
-  const formatted = new Intl.DateTimeFormat(locale, { month: "numeric", day: "numeric" })
+  const formatted = new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" })
     .format(new Date(value));
   return text(`${formatted}创建`, `Created ${formatted}`);
 }
@@ -413,6 +414,7 @@ export function TaskCard({
   currentUser,
   showCover,
   showBody,
+  showCreatedAt,
   onCreateLabel,
   onEdit,
   onUpdate,
@@ -526,7 +528,6 @@ export function TaskCard({
               onOpenChange={(open) => setPropertyMenu(open ? "assignee" : null)}
               onChange={(assigneeTarget) => updateProperty({ assigneeTarget }, "assignee")}
             />
-            <span>{createdDate(task.createdAt, locale, text)}</span>
           </span>
         )}
       </div>
@@ -609,6 +610,11 @@ export function TaskCard({
             onOpenConversation={onOpenConversation}
           />
         </>
+      )}
+      {showCreatedAt && (
+        <time className="task-card-created-at" dateTime={task.createdAt}>
+          {createdDate(task.createdAt, locale, text)}
+        </time>
       )}
     </article>
   );

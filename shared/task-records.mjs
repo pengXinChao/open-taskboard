@@ -8,6 +8,10 @@ export function commentConversationTitle(body) {
   return compact.length > 80 ? `${compact.slice(0, 77)}…` : compact;
 }
 
+export function agentSessionFromRow(row) {
+  return row.agent_session == null ? null : JSON.parse(row.agent_session);
+}
+
 export function threadBindingFromRow(row) {
   if (
     !row.thread_id
@@ -88,6 +92,15 @@ export function attachTaskActivity(task, comments, activities, previewImage = nu
     });
   }
   const conversationRefs = [];
+  if (task.agentSession) {
+    conversationRefs.push({
+      agentSession: task.agentSession,
+      source: "task",
+      sourceId: task.id,
+      title: task.title,
+      updatedAt: task.updatedAt,
+    });
+  }
   if (task.threadBinding) {
     conversationRefs.push({
       ...task.threadBinding,
@@ -107,6 +120,16 @@ export function attachTaskActivity(task, comments, activities, previewImage = nu
     });
   }
   for (const comment of orderedComments) {
+    const agentSession = agentSessionFromRow(comment);
+    if (agentSession) {
+      conversationRefs.push({
+        agentSession,
+        source: "comment",
+        sourceId: comment.id,
+        title: commentConversationTitle(comment.body),
+        updatedAt: comment.updated_at,
+      });
+    }
     const threadBinding = threadBindingFromRow(comment);
     const legacyLocalThreadId = legacyLocalThreadIdFromRow(comment);
     if (threadBinding || legacyLocalThreadId) {

@@ -1,6 +1,8 @@
 import { ApiError } from "../shared/api-fields.mjs";
+import { taskRelationsQuery, taskRelationsFromRows } from "../shared/task-relations.mjs";
 import {
   commentConversationTitle,
+  agentSessionFromRow,
   threadBindingFromRow,
   legacyLocalThreadIdFromRow,
   storedThreadBinding,
@@ -84,6 +86,7 @@ function taskFromRow(row) {
     threadId: row.thread_id,
     threadBinding: threadBindingFromRow(row),
     legacyLocalThreadId: legacyLocalThreadIdFromRow(row),
+    agentSession: agentSessionFromRow(row),
     creatorType: row.creator_type,
     creatorId: row.creator_id,
     creatorName: row.creator_name,
@@ -138,6 +141,7 @@ function commentFromRow(row) {
     threadId: row.thread_id,
     threadBinding: threadBindingFromRow(row),
     legacyLocalThreadId: legacyLocalThreadIdFromRow(row),
+    agentSession: agentSessionFromRow(row),
     authorType: row.author_type,
     authorId: row.author_id,
     authorName: row.author_name,
@@ -157,6 +161,7 @@ function attachmentFromRow(row) {
     taskId: row.task_id,
     commentId: row.comment_id,
     kind: row.kind,
+    bodyFallback: row.body_fallback === 1,
     filename: row.filename,
     contentType: row.content_type,
     size: row.size,
@@ -358,6 +363,7 @@ export class TaskboardDatabase {
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         comment_id TEXT REFERENCES comments(id) ON DELETE CASCADE,
         kind TEXT NOT NULL CHECK (kind IN ('inline', 'attachment')),
+        body_fallback INTEGER NOT NULL DEFAULT 1 CHECK (body_fallback IN (0, 1)),
         filename TEXT NOT NULL,
         content_type TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size >= 0),
@@ -529,6 +535,9 @@ export class TaskboardDatabase {
     }
     this.#migrateTaskStatuses();
     const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
+    if (!migratedTaskColumns.some((column) => column.name === "agent_session")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN agent_session TEXT");
+    }
     if (!migratedTaskColumns.some((column) => column.name === "creator_type")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN creator_type TEXT NOT NULL DEFAULT 'user'");
     }
@@ -689,6 +698,9 @@ export class TaskboardDatabase {
     }
 
     const commentColumns = this.database.prepare("PRAGMA table_info(comments)").all();
+    if (!commentColumns.some((column) => column.name === "agent_session")) {
+      this.database.exec("ALTER TABLE comments ADD COLUMN agent_session TEXT");
+    }
     if (!commentColumns.some((column) => column.name === "thread_id")) {
       this.database.exec("ALTER TABLE comments ADD COLUMN thread_id TEXT");
     }
@@ -775,6 +787,9 @@ export class TaskboardDatabase {
             )
           )
       `);
+    }
+    if (!attachmentColumns.some((column) => column.name === "body_fallback")) {
+      this.database.exec("ALTER TABLE attachments ADD COLUMN body_fallback INTEGER NOT NULL DEFAULT 1 CHECK (body_fallback IN (0, 1))");
     }
     if (!attachmentColumns.some((column) => column.name === "change_revision")) {
       this.database.exec("ALTER TABLE attachments ADD COLUMN change_revision INTEGER NOT NULL DEFAULT 0");
@@ -1697,15 +1712,23 @@ export class TaskboardDatabase {
         id
     `;
     const rows = this.database.prepare(sql).all(...values);
+    const relationsByTask = this.#taskRelationsForTasks(rows.map((row) => row.id));
     const commentsByTask = this.#commentsForTaskActivity(rows.map((row) => row.id));
     const activitiesByTask = this.#activitiesForTasks(rows.map((row) => row.id));
     const previewImagesByTask = this.#taskPreviewImages(rows.map((row) => row.id));
     return rows.map((row) => attachTaskActivity(
-      this.#taskWithRelations(row),
+      this.#taskWithRelations(row, relationsByTask.get(row.id)),
       commentsByTask.get(row.id) ?? [],
       activitiesByTask.get(row.id) ?? [],
       previewImagesByTask.get(row.id) ?? null,
     ));
+  }
+
+  getTaskSource(id) {
+    const row = this.database.prepare(
+      "SELECT external_source FROM tasks WHERE id = ? OR identifier = ?",
+    ).get(id, id);
+    return row ? (row.external_source === "jira" ? "jira" : "local") : null;
   }
 
   getTask(id) {
@@ -1842,8 +1865,8 @@ export class TaskboardDatabase {
           assignee_type, assignee_id, assignee_name, assignee_avatar_url,
           git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
-          archived_at, version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+          archived_at, version, created_at, updated_at, agent_session
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?, ?)
       `).run(
         id,
         identifier,
@@ -1872,6 +1895,7 @@ export class TaskboardDatabase {
         input.recurrence?.unit ?? null,
         timestamp,
         timestamp,
+        input.agentSession ? JSON.stringify(input.agentSession) : null,
       );
       this.database.exec("COMMIT");
       return this.getTask(id);
@@ -1881,8 +1905,8 @@ export class TaskboardDatabase {
     }
   }
 
-  updateTask(id, version, changes, threadId, threadBinding, actor) {
-    const current = this.#requireTask(id);
+  updateTask(id, version, changes, threadId, threadBinding, actor, agentSession) {
+    const current = this.#requireTaskRecord(id);
     this.#requireVersion(current, version);
     const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
@@ -1981,6 +2005,10 @@ export class TaskboardDatabase {
       );
       values.push(...storedBinding);
     }
+    if (agentSession !== undefined) {
+      assignments.push("agent_session = ?");
+      values.push(agentSession ? JSON.stringify(agentSession) : null);
+    }
     assignments.push("version = version + 1", "updated_at = ?");
     const timestamp = now();
     values.push(timestamp, current.id, version);
@@ -1992,6 +2020,9 @@ export class TaskboardDatabase {
       `).run(...values);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
+      }
+      if (Object.hasOwn(changes, "description")) {
+        this.#consumeAttachmentBodyFallback(current.id, null);
       }
       if (projectChanged) {
         this.database.prepare(`
@@ -2019,7 +2050,7 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
-  moveTask(id, version, status, sortOrder, threadId, threadBinding, actor) {
+  moveTask(id, version, status, sortOrder, threadId, threadBinding, actor, agentSession) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     if (current.archivedAt !== null) {
@@ -2043,6 +2074,8 @@ export class TaskboardDatabase {
 
     const timestamp = now();
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
+    const sessionAssignment = agentSession === undefined ? "" : "agent_session = ?,";
+    const sessionValues = agentSession === undefined ? [] : [agentSession ? JSON.stringify(agentSession) : null];
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2051,9 +2084,9 @@ export class TaskboardDatabase {
     try {
       const result = this.database.prepare(`
         UPDATE tasks
-        SET status = ?, sort_order = ?, ${threadAssignment} version = version + 1, updated_at = ?
+        SET status = ?, sort_order = ?, ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
-      `).run(status, sortOrder, ...(storedBinding ?? []), timestamp, current.id, version);
+      `).run(status, sortOrder, ...(storedBinding ?? []), ...sessionValues, timestamp, current.id, version);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
@@ -2071,11 +2104,13 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
-  archiveTask(id, version, threadId, threadBinding, actor) {
+  archiveTask(id, version, threadId, threadBinding, actor, agentSession) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     const timestamp = now();
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
+    const sessionAssignment = agentSession === undefined ? "" : "agent_session = ?,";
+    const sessionValues = agentSession === undefined ? [] : [agentSession ? JSON.stringify(agentSession) : null];
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2084,9 +2119,9 @@ export class TaskboardDatabase {
     try {
       const result = this.database.prepare(`
         UPDATE tasks
-        SET archived_at = ?, ${threadAssignment} version = version + 1, updated_at = ?
+        SET archived_at = ?, ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
-      `).run(timestamp, ...(storedBinding ?? []), timestamp, current.id, version);
+      `).run(timestamp, ...(storedBinding ?? []), ...sessionValues, timestamp, current.id, version);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
@@ -2104,7 +2139,7 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
-  restoreTask(id, version, threadId, threadBinding, actor) {
+  restoreTask(id, version, threadId, threadBinding, actor, agentSession) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     if (current.archivedAt === null) {
@@ -2112,6 +2147,8 @@ export class TaskboardDatabase {
     }
     const timestamp = now();
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
+    const sessionAssignment = agentSession === undefined ? "" : "agent_session = ?,";
+    const sessionValues = agentSession === undefined ? [] : [agentSession ? JSON.stringify(agentSession) : null];
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2120,9 +2157,9 @@ export class TaskboardDatabase {
     try {
       const result = this.database.prepare(`
         UPDATE tasks
-        SET archived_at = NULL, ${threadAssignment} version = version + 1, updated_at = ?
+        SET archived_at = NULL, ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
-      `).run(...(storedBinding ?? []), timestamp, current.id, version);
+      `).run(...(storedBinding ?? []), ...sessionValues, timestamp, current.id, version);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
@@ -2163,7 +2200,7 @@ export class TaskboardDatabase {
     }
   }
 
-  addTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin = "manual") {
+  addTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin = "manual", agentSession) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
@@ -2212,7 +2249,7 @@ export class TaskboardDatabase {
           relation_type, source_task_id, target_task_id, origin, created_at
         ) VALUES (?, ?, ?, ?, ?)
       `).run(relationType, sourceTaskId, targetTaskId, origin, timestamp);
-      this.#touchTask(task.id, version, threadId, threadBinding, timestamp);
+      this.#touchTask(task.id, version, threadId, threadBinding, timestamp, agentSession);
       this.#recordTaskActivity(task.id, actor, [{
         field: "relation",
         before: previousRelation,
@@ -2229,7 +2266,7 @@ export class TaskboardDatabase {
     }
   }
 
-  removeTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin) {
+  removeTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin, agentSession) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
@@ -2309,7 +2346,7 @@ export class TaskboardDatabase {
         };
       }
       const timestamp = now();
-      this.#touchTask(task.id, version, threadId, threadBinding, timestamp);
+      this.#touchTask(task.id, version, threadId, threadBinding, timestamp, agentSession);
       this.#recordTaskActivity(task.id, actor, [{
         field: "relation",
         before: relationActivityValue(type, relatedTask),
@@ -2336,23 +2373,24 @@ export class TaskboardDatabase {
   }
 
   listComments(taskId) {
-    const task = this.#requireTask(taskId);
-    return this.database.prepare(`
+    const task = this.#requireTaskRecord(taskId);
+    const rows = this.database.prepare(`
       SELECT * FROM comments
       WHERE task_id = ?
       ORDER BY created_at, id
-    `).all(task.id).map((row) => this.#commentWithAttachments(row));
+    `).all(task.id);
+    return this.#commentsWithAttachments(rows);
   }
 
   listCommentsAfter(taskId, after) {
-    const task = this.#requireTask(taskId);
-    return this.database.prepare(`
+    const task = this.#requireTaskRecord(taskId);
+    const rows = this.database.prepare(`
       SELECT * FROM comments
       WHERE task_id = ?
         AND change_revision > ?
       ORDER BY change_revision
-    `).all(task.id, after.revision)
-      .map((row) => this.#commentWithAttachments(row));
+    `).all(task.id, after.revision);
+    return this.#commentsWithAttachments(rows);
   }
 
   createComment(taskId, input) {
@@ -2367,8 +2405,8 @@ export class TaskboardDatabase {
           id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
           author_type, author_id, author_name, author_avatar_url,
-          version, created_at, updated_at, change_revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+          version, created_at, updated_at, change_revision, agent_session
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
       `).run(
         id,
         task.id,
@@ -2381,6 +2419,7 @@ export class TaskboardDatabase {
         timestamp,
         timestamp,
         changeRevision,
+        input.agentSession ? JSON.stringify(input.agentSession) : null,
       );
       this.database.exec("COMMIT");
     } catch (error) {
@@ -2395,8 +2434,10 @@ export class TaskboardDatabase {
     return row ? this.#commentWithAttachments(row) : null;
   }
 
-  updateComment(id, version, body, threadId, threadBinding) {
+  updateComment(id, version, body, threadId, threadBinding, agentSession) {
     const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const sessionAssignment = agentSession === undefined ? "" : "agent_session = ?,";
+    const sessionValues = agentSession === undefined ? [] : [agentSession ? JSON.stringify(agentSession) : null];
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2408,13 +2449,14 @@ export class TaskboardDatabase {
       const changeRevision = this.#nextCommentAttachmentRevision();
       const result = this.database.prepare(`
         UPDATE comments
-        SET body = ?, ${threadAssignment} version = version + 1, updated_at = ?,
+        SET body = ?, ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?,
           change_revision = ?
         WHERE id = ? AND version = ?
-      `).run(body, ...(storedBinding ?? []), now(), changeRevision, id, version);
+      `).run(body, ...(storedBinding ?? []), ...sessionValues, now(), changeRevision, id, version);
       if (result.changes !== 1) {
         this.#throwMissingCommentOrConflict(id, version);
       }
+      this.#consumeAttachmentBodyFallback(current.taskId, current.id);
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");
@@ -2529,10 +2571,28 @@ export class TaskboardDatabase {
     return attachment;
   }
 
-  #commentWithAttachments(row) {
+  #commentWithAttachments(row, attachments = this.#attachmentsForComment(row.id)) {
     const comment = commentFromRow(row);
-    comment.attachments = this.#attachmentsForComment(comment.id);
+    comment.attachments = attachments;
     return comment;
+  }
+
+  #commentsWithAttachments(rows) {
+    const attachmentsByComment = new Map(rows.map((row) => [row.id, []]));
+    const commentIds = rows.map((row) => row.id);
+    for (let offset = 0; offset < commentIds.length; offset += 400) {
+      const chunk = commentIds.slice(offset, offset + 400);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const attachments = this.database.prepare(`
+        SELECT * FROM attachments
+        WHERE comment_id IN (${placeholders})
+        ORDER BY comment_id, created_at, id
+      `).all(...chunk);
+      for (const attachment of attachments) {
+        attachmentsByComment.get(attachment.comment_id).push(attachmentFromRow(attachment));
+      }
+    }
+    return rows.map((row) => this.#commentWithAttachments(row, attachmentsByComment.get(row.id)));
   }
 
   #aiChatThreadWithCurrentRun(row) {
@@ -2566,9 +2626,9 @@ export class TaskboardDatabase {
       const rows = this.database.prepare(`
         SELECT
           id, task_id,
-          CASE WHEN thread_id IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
+          CASE WHEN thread_id IS NULL AND agent_session IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
           thread_id, thread_codex_project_id, thread_codex_project_kind,
-          thread_codex_host_id, thread_workspace_path,
+          thread_codex_host_id, thread_workspace_path, agent_session,
           author_type, author_id, author_name,
           author_avatar_url, version, updated_at
         FROM comments
@@ -2637,6 +2697,19 @@ export class TaskboardDatabase {
     `).all(commentId).map(attachmentFromRow);
   }
 
+  #consumeAttachmentBodyFallback(taskId, commentId) {
+    const candidates = this.database.prepare(`
+      SELECT id FROM attachments
+      WHERE task_id = ? AND comment_id IS ? AND body_fallback = 1
+    `).all(taskId, commentId);
+    const update = this.database.prepare(`
+      UPDATE attachments SET body_fallback = 0, change_revision = ? WHERE id = ?
+    `);
+    for (const attachment of candidates) {
+      update.run(this.#nextCommentAttachmentRevision(), attachment.id);
+    }
+  }
+
   #nextCommentAttachmentRevision() {
     return this.database.prepare(`
       UPDATE comment_attachment_revision
@@ -2646,60 +2719,22 @@ export class TaskboardDatabase {
     `).get().value;
   }
 
-  #taskWithRelations(row) {
+  #taskRelationsForTasks(taskIds) {
+    const relationsByTask = new Map();
+    for (let offset = 0; offset < taskIds.length; offset += 400) {
+      const chunk = taskIds.slice(offset, offset + 400);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.database.prepare(taskRelationsQuery(placeholders)).all(...chunk);
+      for (const [taskId, relations] of taskRelationsFromRows(chunk, rows, taskRelationSummaryFromRow)) {
+        relationsByTask.set(taskId, relations);
+      }
+    }
+    return relationsByTask;
+  }
+
+  #taskWithRelations(row, relations = this.#taskRelationsForTasks([row.id]).get(row.id)) {
     const task = taskFromRow(row);
-    const parent = this.database.prepare(`
-      SELECT tasks.*
-      FROM task_relations
-      JOIN tasks ON tasks.id = task_relations.source_task_id
-      WHERE task_relations.relation_type = 'parent'
-        AND task_relations.target_task_id = ?
-    `).get(task.id);
-    const subIssues = this.database.prepare(`
-      SELECT tasks.*
-      FROM task_relations
-      JOIN tasks ON tasks.id = task_relations.target_task_id
-      WHERE task_relations.relation_type = 'parent'
-        AND task_relations.source_task_id = ?
-      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
-    `).all(task.id);
-    const blockedBy = this.database.prepare(`
-      SELECT tasks.*
-      FROM task_relations
-      JOIN tasks ON tasks.id = task_relations.source_task_id
-      WHERE task_relations.relation_type = 'blocks'
-        AND task_relations.target_task_id = ?
-      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
-    `).all(task.id);
-    const blocks = this.database.prepare(`
-      SELECT tasks.*
-      FROM task_relations
-      JOIN tasks ON tasks.id = task_relations.target_task_id
-      WHERE task_relations.relation_type = 'blocks'
-        AND task_relations.source_task_id = ?
-      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
-    `).all(task.id);
-    const related = this.database.prepare(`
-      SELECT tasks.*
-      FROM task_relations
-      JOIN tasks ON tasks.id = CASE
-        WHEN task_relations.source_task_id = ? THEN task_relations.target_task_id
-        ELSE task_relations.source_task_id
-      END
-      WHERE task_relations.relation_type = 'related'
-        AND (
-          task_relations.source_task_id = ?
-          OR task_relations.target_task_id = ?
-        )
-      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
-    `).all(task.id, task.id, task.id);
-    task.relations = {
-      parent: parent ? taskRelationSummaryFromRow(parent) : null,
-      subIssues: subIssues.map(taskRelationSummaryFromRow),
-      blockedBy: blockedBy.map(taskRelationSummaryFromRow),
-      blocks: blocks.map(taskRelationSummaryFromRow),
-      related: related.map(taskRelationSummaryFromRow),
-    };
+    task.relations = relations;
     return task;
   }
 
@@ -2775,21 +2810,31 @@ export class TaskboardDatabase {
     );
   }
 
-  #touchTask(id, version, threadId, threadBinding, timestamp) {
+  #touchTask(id, version, threadId, threadBinding, timestamp, agentSession) {
     const current = this.#requireTask(id);
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
+    const sessionAssignment = agentSession === undefined ? "" : "agent_session = ?,";
+    const sessionValues = agentSession === undefined ? [] : [agentSession ? JSON.stringify(agentSession) : null];
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
       : "";
     const result = this.database.prepare(`
       UPDATE tasks
-      SET ${threadAssignment} version = version + 1, updated_at = ?
+      SET ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?
       WHERE id = ? AND version = ?
-    `).run(...(storedBinding ?? []), timestamp, id, version);
+    `).run(...(storedBinding ?? []), ...sessionValues, timestamp, id, version);
     if (result.changes !== 1) {
       this.#throwMissingOrConflict(id, version);
     }
+  }
+
+  #requireTaskRecord(id) {
+    const row = this.database.prepare("SELECT * FROM tasks WHERE id = ? OR identifier = ?").get(id, id);
+    if (!row) {
+      throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+    }
+    return taskFromRow(row);
   }
 
   #requireTask(id) {
@@ -2827,10 +2872,7 @@ export class TaskboardDatabase {
   }
 
   #throwMissingOrConflict(id, expectedVersion) {
-    const task = this.getTask(id);
-    if (!task) {
-      throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
-    }
+    const task = this.#requireTaskRecord(id);
     throw new ApiError(409, "VERSION_CONFLICT", "Task was changed by another client", {
       expectedVersion,
       actualVersion: task.version,

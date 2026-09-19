@@ -1,8 +1,14 @@
-import { resolveInlineAttachments, uploadInlineAttachments } from "../inlineAttachments";
+import { agentPlatformLabel, sessionResumeCommand } from "../agentSessions";
+import {
+  appendUnreferencedAttachments,
+  resolveInlineAttachments,
+  uploadInlineAttachments,
+} from "../inlineAttachments";
 import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
@@ -32,6 +38,7 @@ import {
 import { TASK_PRIORITIES, TASK_STATUSES } from "../types";
 import type {
   ActorIdentity,
+  AgentPlatform,
   Attachment,
   Comment,
   CodexThreadBinding,
@@ -76,14 +83,13 @@ import {
 } from "./SemanticIcons";
 import {
   createInlineMediaSegments,
-  InlineMediaComposer,
   inlineMediaFiles,
   inlineMediaImages,
   inlineMediaText,
   serializeInlineMedia,
-  type InlineMediaComposerHandle,
   type InlineMediaSegment,
-} from "./InlineMediaComposer";
+} from "../documentModel";
+import { InlineMediaComposer, type InlineMediaComposerHandle } from "./InlineMediaComposer";
 import {
   IssueParentLink,
   IssueRelationSidebar,
@@ -111,6 +117,7 @@ interface TaskDetailProps {
   attachmentsRevision: number;
   onCreateLabel: (label: string) => Promise<void>;
   onDeleteLabel: (label: string) => Promise<void>;
+  onCreateChild: (parent: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onOpenTask: (task: TaskRelationSummary) => void;
   onAddRelation: (
@@ -333,35 +340,53 @@ function ActivityChangeIcon({ field, before, after }: {
 
 function ConversationLink({
   threadId,
+  agentPlatform,
   onOpen,
   onCopy,
 }: {
   threadId: string;
-  onOpen: () => void;
+  agentPlatform?: AgentPlatform;
+  onOpen?: () => void;
   onCopy: (text: string, announcement: string) => void;
 }) {
   const { text } = useTaskboardI18n();
+  const platform = agentPlatform ?? "codex";
+  const label = agentPlatformLabel(platform);
+  const command = sessionResumeCommand(platform, threadId);
   return (
     <div className="issue-conversation-actions">
-      <button
-        className="issue-conversation-link"
-        type="button"
-        title={text("查看对话", "View conversation")}
-        onClick={onOpen}
-      >
-        <ConversationIcon color="currentColor" size={16} />
-        <strong>{text("查看对话", "View conversation")}</strong>
-      </button>
+      {agentPlatform ? (
+        <span className="issue-conversation-link" title={`${label}: ${threadId}`}>
+          <ConversationIcon color="currentColor" size={16} />
+          <strong>{label}</strong>
+          <span className="issue-conversation-session-id">{threadId}</span>
+        </span>
+      ) : (
+        <button
+          className="issue-conversation-link"
+          type="button"
+          title={text("查看对话", "View conversation")}
+          onClick={onOpen}
+        >
+          <ConversationIcon color="currentColor" size={16} />
+          <strong>{text("查看对话", "View conversation")}</strong>
+        </button>
+      )}
       <button
         className="issue-conversation-copy"
         type="button"
-        title={text("复制终端命令", "Copy terminal command")}
+        title={`${text("复制恢复命令（POSIX shell）", "Copy resume command (POSIX shell)")}: ${command}`}
+        aria-label={agentPlatform
+          ? text(`复制 ${label} 恢复命令`, `Copy ${label} resume command`)
+          : undefined}
         onClick={() => onCopy(
-          `codex resume ${threadId}`,
-          text("Codex 恢复命令已复制。", "Codex resume command copied."),
+          command,
+          text(`${label} 恢复命令已复制。`, `${label} resume command copied.`),
         )}
       >
-        <CodexResumeIcon />
+        {agentPlatform
+          ? <img src={copyIdIcon} width={16} height={16} alt="" />
+          : <CodexResumeIcon />}
         <span>{text("复制终端命令", "Copy terminal command")}</span>
       </button>
     </div>
@@ -380,6 +405,7 @@ export function TaskDetail({
   attachmentsRevision,
   onCreateLabel,
   onDeleteLabel,
+  onCreateChild,
   onUpdate,
   onOpenTask,
   onAddRelation,
@@ -404,6 +430,14 @@ export function TaskDetail({
   >(null);
   const [savingProperty, setSavingProperty] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const descriptionAttachments = useMemo(
+    () => attachments.filter((attachment) => attachment.taskId === currentTask.id),
+    [attachments, currentTask.id],
+  );
+  const descriptionDocument = useMemo(
+    () => appendUnreferencedAttachments(description, descriptionAttachments),
+    [description, descriptionAttachments],
+  );
   const [attachmentsError, setAttachmentsError] = useState<TaskDetailError | null>(null);
   const [comments, setComments] = useState<Comment[]>([]);
   const [taskActivities, setTaskActivities] = useState<TaskChangeActivity[]>([]);
@@ -436,7 +470,15 @@ export function TaskDetail({
   const descriptionAttachmentPickerOpenRef = useRef(false);
   const commentAttachmentInputRef = useRef<HTMLInputElement>(null);
   const editCommentAttachmentInputRef = useRef<HTMLInputElement>(null);
+  const pendingCommentRef = useRef<{
+    comment: Comment;
+    uploadedAttachments: Map<string, Attachment>;
+  } | null>(null);
   const editingUploadedAttachmentsRef = useRef<Map<string, Attachment>>(new Map());
+  // A removed fallback can leave text equal to the stored body but different
+  // from the document the user started editing. That still needs a body PATCH.
+  const descriptionEditValueRef = useRef("");
+  const commentEditValueRef = useRef("");
   const draft = serializeInlineMedia(commentSegments);
   const commentInlineImages = inlineMediaImages(commentSegments);
   const commentInlineFiles = inlineMediaFiles(commentSegments);
@@ -753,6 +795,15 @@ export function TaskDetail({
     await saveTask({ title: normalized }, "title");
   }
 
+  function beginDescriptionEdit() {
+    const segments = createInlineMediaSegments(
+      descriptionDocument, referenceTasks, descriptionAttachments,
+    );
+    descriptionEditValueRef.current = serializeInlineMedia(segments).trim();
+    setDescriptionSegments(segments);
+    setEditingDescription(true);
+  }
+
   async function saveDescription() {
     if (savingProperty === "description") return;
     const draftDescription = serializeInlineMedia(descriptionSegments).trim();
@@ -760,6 +811,7 @@ export function TaskDetail({
     const inlineFiles = inlineMediaFiles(descriptionSegments);
     if (
       draftDescription === currentTask.description
+      && draftDescription === descriptionEditValueRef.current
       && inlineImages.length === 0
       && inlineFiles.length === 0
     ) {
@@ -787,6 +839,10 @@ export function TaskDetail({
         return null;
       });
       if (!saved) return;
+      setCurrentTask(saved);
+      setDescription(saved.description);
+      const nextAttachments = await listAttachments(saved.id);
+      setAttachments(nextAttachments);
       const savedWithAddedRelations = await addMentionRelations(saved, descriptionSegments);
       const savedWithRelations = await removeUnreferencedMentionRelations(
         savedWithAddedRelations,
@@ -794,18 +850,11 @@ export function TaskDetail({
       );
       setCurrentTask(savedWithRelations);
       setDescription(savedWithRelations.description);
-      const nextAttachments = [
-        ...attachments,
-        ...[...uploadedImages, ...uploadedFiles].filter((attachment) => (
-          !attachments.some((item) => item.id === attachment.id)
-        )),
-      ];
       setDescriptionSegments(createInlineMediaSegments(
         savedWithRelations.description,
         referenceTasks,
         nextAttachments,
       ));
-      setAttachments(nextAttachments);
       setEditingDescription(false);
     } catch (error) {
       onError(messageFor(error));
@@ -820,15 +869,34 @@ export function TaskDetail({
     setSubmitting(true);
     setCommentsError(null);
     try {
-      const comment = await createComment(task.id, body);
+      if (!pendingCommentRef.current) {
+        pendingCommentRef.current = {
+          comment: await createComment(task.id, body),
+          uploadedAttachments: new Map(),
+        };
+      }
+      const { comment, uploadedAttachments } = pendingCommentRef.current;
       const pending = [...commentInlineImages, ...commentInlineFiles];
-      const uploaded = await uploadInlineAttachments(
-        pending, (file, kind) => uploadCommentAttachment(comment.id, file, kind),
-      );
-      const nextComment = pending.length > 0
-        ? await updateComment(comment, resolveInlineAttachments(body, pending, uploaded))
+      const uploaded: Attachment[] = [];
+      for (const item of pending) {
+        let attachment = uploadedAttachments.get(item.id);
+        if (!attachment) {
+          attachment = await uploadCommentAttachment(
+            comment.id, item.file, item.type === "pending-image" ? "inline" : "attachment",
+          );
+          uploadedAttachments.set(item.id, attachment);
+        }
+        uploaded.push(attachment);
+      }
+      const resolvedBody = resolveInlineAttachments(body, pending, uploaded);
+      const nextComment = resolvedBody !== comment.body
+        ? await updateComment(comment, resolvedBody)
         : comment;
-      setComments((current) => [...current, nextComment]);
+      // This submission is complete before the existing status/mention work.
+      pendingCommentRef.current = null;
+      setComments((current) => current.some((item) => item.id === nextComment.id)
+        ? current.map((item) => item.id === nextComment.id ? nextComment : item)
+        : [...current, nextComment]);
       setCommentSegments(createInlineMediaSegments());
       if (commentAttachmentInputRef.current) commentAttachmentInputRef.current.value = "";
       let relationAnchor = await getTask(currentTask.id);
@@ -863,7 +931,13 @@ export function TaskDetail({
       : null;
     editingUploadedAttachmentsRef.current.clear();
     setEditingId(comment.id);
-    setEditingSegments(createInlineMediaSegments(comment.body, referenceTasks, comment.attachments));
+    const segments = createInlineMediaSegments(
+      appendUnreferencedAttachments(comment.body, comment.attachments),
+      referenceTasks,
+      comment.attachments,
+    );
+    commentEditValueRef.current = serializeInlineMedia(segments).trim();
+    setEditingSegments(segments);
     setActiveMenuId(null);
   }
 
@@ -874,12 +948,13 @@ export function TaskDetail({
 
   async function saveComment(comment: Comment) {
     const body = editingDraft.trim();
-    if (!body || (
+    if (
       body === comment.body
+      && body === commentEditValueRef.current
       && editingInlineImages.length === 0
       && editingInlineFiles.length === 0
-    )) {
-      if (body === comment.body) endCommentEdit();
+    ) {
+      endCommentEdit();
       return;
     }
     const removedMentionIds = removedMentionTaskIds(
@@ -901,9 +976,8 @@ export function TaskDetail({
         }
         uploaded.push(attachment);
       }
-      const updated = await updateComment(
-        comment, resolveInlineAttachments(body, pending, uploaded).trim(),
-      );
+      const resolvedBody = resolveInlineAttachments(body, pending, uploaded).trim();
+      const updated = await updateComment(comment, resolvedBody);
       setComments((current) => current.map((item) => item.id === updated.id ? updated : item));
       const relationAnchor = await getTask(currentTask.id);
       const savedWithAddedRelations = await addMentionRelations(relationAnchor, editingSegments);
@@ -1107,12 +1181,12 @@ export function TaskDetail({
                   </div>
                 ) : (
                   <div
-                    className={`issue-description-read${description ? "" : " empty"}`}
+                    className={`issue-description-read${descriptionDocument ? "" : " empty"}`}
                     role="button"
                     tabIndex={0}
                     aria-label={text("编辑议题描述", "Edit issue description")}
                     onClick={(event) => {
-                      if (event.target instanceof Element && event.target.closest("video")) return;
+                      if (event.target instanceof Element && event.target.closest("a, button, video")) return;
                       if (window.getSelection()?.isCollapsed === false) return;
                       descriptionCaretRef.current = null;
                       const range = event.currentTarget.ownerDocument.caretRangeFromPoint(
@@ -1140,14 +1214,10 @@ export function TaskDetail({
                       descriptionScrollPositionRef.current = scrollContainer
                         ? { element: scrollContainer, top: scrollContainer.scrollTop }
                         : null;
-                      setDescriptionSegments(createInlineMediaSegments(
-                        description,
-                        referenceTasks,
-                        attachments,
-                      ));
-                      setEditingDescription(true);
+                      beginDescriptionEdit();
                     }}
                     onKeyDown={(event) => {
+                      if (event.target !== event.currentTarget) return;
                       if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
                         descriptionCaretRef.current = null;
@@ -1155,39 +1225,44 @@ export function TaskDetail({
                         descriptionScrollPositionRef.current = scrollContainer
                           ? { element: scrollContainer, top: scrollContainer.scrollTop }
                           : null;
-                        setDescriptionSegments(createInlineMediaSegments(
-                          description,
-                          referenceTasks,
-                          attachments,
-                        ));
-                        setEditingDescription(true);
+                        beginDescriptionEdit();
                       }
                     }}
                   >
-                    {description
+                    {descriptionDocument
                       ? <DescriptionDocument
-                          value={description}
+                          value={descriptionDocument}
                           referenceTasks={referenceTasks}
                           onOpenTask={onOpenTask}
-                          attachments={attachments}
+                          attachments={descriptionAttachments}
                           enableImagePreview
                           onOpenAttachment={handleAttachmentDownload}
+                          onCopyAttachmentPath={onCopy}
                         />
                       : text("添加描述…", "Add description…")}
                   </div>
                 )}
-                {(currentTask.threadBinding || currentTask.legacyLocalThreadId) && (
+                {(currentTask.agentSession || currentTask.threadBinding || currentTask.legacyLocalThreadId) && (
                   <div
                     className="issue-conversation-list"
                     aria-label={text("处理此议题的对话", "Conversations for this issue")}
                   >
-                    <ConversationLink
-                      threadId={currentTask.threadBinding?.threadId ?? currentTask.legacyLocalThreadId!}
-                      onOpen={() => currentTask.threadBinding
-                        ? onOpenThread(currentTask.threadBinding)
-                        : onOpenLegacyLocalThread(currentTask.legacyLocalThreadId!)}
-                      onCopy={onCopy}
-                    />
+                    {currentTask.agentSession && (
+                      <ConversationLink
+                        agentPlatform={currentTask.agentSession.platform}
+                        threadId={currentTask.agentSession.sessionId}
+                        onCopy={onCopy}
+                      />
+                    )}
+                    {(currentTask.threadBinding || currentTask.legacyLocalThreadId) && (
+                      <ConversationLink
+                        threadId={currentTask.threadBinding?.threadId ?? currentTask.legacyLocalThreadId!}
+                        onOpen={() => currentTask.threadBinding
+                          ? onOpenThread(currentTask.threadBinding)
+                          : onOpenLegacyLocalThread(currentTask.legacyLocalThreadId!)}
+                        onCopy={onCopy}
+                      />
+                    )}
                   </div>
                 )}
               </div>
@@ -1203,6 +1278,7 @@ export function TaskDetail({
             <IssueSubIssues
               task={currentTask}
               tasks={tasks}
+              onCreateChild={() => onCreateChild(currentTask)}
               onOpenTask={onOpenTask}
               onAddRelation={(anchor, type, relatedTaskId) => applyRelationMutation(
                 () => onAddRelation(anchor, type, relatedTaskId),
@@ -1303,6 +1379,7 @@ export function TaskDetail({
                     );
                   }
                   const comment = item.comment;
+                  const commentBody = appendUnreferencedAttachments(comment.body, comment.attachments);
                   const commentActor: ActorIdentity = comment.authorType === currentUser.type
                     && comment.authorId === currentUser.id
                     ? currentUser
@@ -1443,7 +1520,7 @@ export function TaskDetail({
                               <button
                                 className="button primary"
                                 type="button"
-                                disabled={!editingDraft.trim() || savingCommentId === comment.id}
+                                disabled={savingCommentId === comment.id}
                                 onClick={() => void saveComment(comment)}
                               >
                                 {savingCommentId === comment.id
@@ -1454,28 +1531,38 @@ export function TaskDetail({
                           </div>
                         </div>
                       ) : (
-                        comment.body && (
+                        commentBody && (
                           <div className="comment-body">
                             <DescriptionDocument
-                              value={comment.body}
+                              value={commentBody}
                               referenceTasks={referenceTasks}
                               onOpenTask={onOpenTask}
                               attachments={comment.attachments}
                               enableImagePreview
                               onOpenAttachment={handleAttachmentDownload}
+                              onCopyAttachmentPath={onCopy}
                             />
                           </div>
                         )
                       )}
-                      {(comment.threadBinding || comment.legacyLocalThreadId) && (
+                      {(comment.agentSession || comment.threadBinding || comment.legacyLocalThreadId) && (
                         <div className="comment-conversation-link">
-                          <ConversationLink
-                            threadId={comment.threadBinding?.threadId ?? comment.legacyLocalThreadId!}
-                            onOpen={() => comment.threadBinding
-                              ? onOpenThread(comment.threadBinding)
-                              : onOpenLegacyLocalThread(comment.legacyLocalThreadId!)}
-                            onCopy={onCopy}
-                          />
+                          {comment.agentSession && (
+                            <ConversationLink
+                              agentPlatform={comment.agentSession.platform}
+                              threadId={comment.agentSession.sessionId}
+                              onCopy={onCopy}
+                            />
+                          )}
+                          {(comment.threadBinding || comment.legacyLocalThreadId) && (
+                            <ConversationLink
+                              threadId={comment.threadBinding?.threadId ?? comment.legacyLocalThreadId!}
+                              onOpen={() => comment.threadBinding
+                                ? onOpenThread(comment.threadBinding)
+                                : onOpenLegacyLocalThread(comment.legacyLocalThreadId!)}
+                              onCopy={onCopy}
+                            />
+                          )}
                         </div>
                       )}
                     </div>
@@ -1503,6 +1590,7 @@ export function TaskDetail({
                 <InlineMediaComposer
                   ref={composerRef}
                   className="comment-inline-media"
+                  disabled={submitting}
                   segments={commentSegments}
                   mentionTasks={tasks}
                   referenceTasks={referenceTasks}
