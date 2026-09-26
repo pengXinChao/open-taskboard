@@ -13,7 +13,7 @@ export const STATUS_DETAILS: Record<
   backlog: { label: "待立项", tone: "backlog" },
   todo: { label: "等待认领", tone: "todo" },
   in_progress: { label: "处理中", tone: "progress" },
-  in_review: { label: "等你确认", tone: "review" },
+  in_review: { label: "等待验证", tone: "review" },
   blocked: { label: "遇到阻碍", tone: "blocked" },
   done: { label: "完成", tone: "done" },
   canceled: { label: "取消", tone: "canceled" },

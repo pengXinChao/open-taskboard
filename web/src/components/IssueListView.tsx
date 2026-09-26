@@ -2,6 +2,7 @@ import { useState, type KeyboardEvent, type MouseEvent, type RefObject } from "r
 import { assigneeTargetForActor } from "../actors";
 import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
 import { labelPresentation } from "../labels";
+import { issueTypeClassName } from "../issueType";
 import type { TaskCardPresentation } from "../taskConversations";
 import { TASK_PRIORITIES, TASK_STATUSES, type ActorIdentity, type Task, type TaskDraft, type TaskStatus } from "../types";
 import { ActorAvatar } from "./ActorAvatar";
@@ -93,7 +94,7 @@ export function IssueListView({
                         <span className="issue-list-title-cell">
                           <small>{displayIdentifier}</small>
                           {task.issueType && (
-                            <span className="issue-list-jira-type" title={task.issueType}>
+                            <span className={`issue-list-jira-type ${issueTypeClassName(task.issueType)}`} title={task.issueType}>
                               {task.issueType}
                             </span>
                           )}

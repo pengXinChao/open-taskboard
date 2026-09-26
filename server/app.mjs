@@ -2997,7 +2997,21 @@ export function createTaskboardServer(options = {}) {
             if (current.archivedAt !== null) {
               throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
             }
-            await jira.moveTask(current, move.status);
+            const transitioned = await jira.moveTask(current, move.status);
+            const localStatusOverride = transitioned ? 0 : 1;
+            const task = database.moveTask(
+              id,
+              move.version,
+              move.status,
+              move.sortOrder,
+              move.threadId,
+              move.threadBinding,
+              actorFromRequest(request),
+              move.agentSession,
+              localStatusOverride,
+            );
+            events.emit("task.moved", { task });
+            return sendJson(response, 200, { task });
           }
           const task = database.moveTask(
             id,
@@ -3008,6 +3022,7 @@ export function createTaskboardServer(options = {}) {
             move.threadBinding,
             actorFromRequest(request),
             move.agentSession,
+            0,
           );
           events.emit("task.moved", { task });
           return sendJson(response, 200, { task });

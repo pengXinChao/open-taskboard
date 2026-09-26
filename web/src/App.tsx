@@ -99,6 +99,7 @@ import {
   setEmbeddedFrameChallenge,
 } from "./embeddedHost.mjs";
 import { buildIssueUrl, readIssueIdentifier } from "./issueRoute";
+import { codexThreadNameForTask } from "./jiraThreadName";
 import {
   getTaskboardI18n,
   resolveTaskboardLanguage,
@@ -2157,6 +2158,17 @@ export function App() {
       return;
     }
     setPendingThreadBindingTaskId(null);
+    if (task.source === "jira" && embedded && window.parent !== window) {
+      const project = hostContext?.projects?.find((item) => item.id === hostContext.projectId);
+      postEmbeddedHostMessage({
+        type: "taskboard:set-thread-name",
+        payload: {
+          threadId,
+          name: codexThreadNameForTask(task),
+          hostId: project?.hostId ?? "local",
+        },
+      });
+    }
     // 只有 Codex 已确认真实运行首条消息后，才把会话写回任务。
     void updateTaskRequest(task, taskToDraft(task), threadId).then((boundTask) => {
       setTasks((current) => sortTasks(current.map((candidate) => (
@@ -3162,12 +3174,9 @@ export function App() {
         : codexProjectContext?.workspacePath
           ?? deviceWorkspacePaths[task.projectId]
           ?? taskboardProject?.workspacePath;
-    // Jira 地址仅用于提示词展示；会话绑定仍使用独立传递的内部任务 ID。
+    // 提示词给 Agent 用；会话绑定仍使用独立传递的内部任务 ID。
     const embeddedInstruction = task.source === "jira" && task.externalUrl
-      ? text(
-        `[$manage-taskboard](${manageTaskboardSkillPath}) Jira 地址：${task.externalUrl}`,
-        `[$manage-taskboard](${manageTaskboardSkillPath}) Jira URL: ${task.externalUrl}`,
-      )
+      ? `[$manage-taskboard](${manageTaskboardSkillPath}) Jira:${task.externalUrl}`
       : text(
         `[$manage-taskboard](${manageTaskboardSkillPath}) 议题 ID：${task.identifier}`,
         `[$manage-taskboard](${manageTaskboardSkillPath}) Issue ID: ${task.identifier}`,

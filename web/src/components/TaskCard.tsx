@@ -14,6 +14,7 @@ import {
 import { labelPresentation } from "../labels";
 import { taskPriorityLabel, useTaskboardI18n } from "../i18n";
 import { CODEX_AGENT_ACTOR, actorKey, assigneeTargetForActor } from "../actors";
+import { issueTypeClassName } from "../issueType";
 import type {
   TaskCardPresentation,
   TaskConversationItem,
@@ -495,7 +496,7 @@ export function TaskCard({
         <span className="card-reference">
           <span className="task-identifier">ID: {displayIdentifier}</span>
           {task.issueType && (
-            <span className="task-card-jira-type" title={task.issueType}>
+            <span className={`task-card-jira-type ${issueTypeClassName(task.issueType)}`} title={task.issueType}>
               {task.issueType}
             </span>
           )}

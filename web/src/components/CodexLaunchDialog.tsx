@@ -1,3 +1,4 @@
+import { issueTypeClassName } from "../issueType";
 import { useEffect, useState } from "react";
 import { useTaskboardI18n } from "../i18n";
 import type { DevelopmentContext, Task } from "../types";
@@ -55,7 +56,7 @@ export function CodexLaunchDialog({
             <h2 id="codex-launch-dialog-title" title={task.title}>{task.title}</h2>
             <div className="codex-launch-meta">
               <span>{task.externalKey ?? task.identifier}</span>
-              {task.issueType && <span className="codex-launch-type">{task.issueType}</span>}
+              {task.issueType && <span className={`codex-launch-type ${issueTypeClassName(task.issueType)}`}>{task.issueType}</span>}
               {task.externalUrl && (
                 <a
                   className="codex-launch-jira-link"

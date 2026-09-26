@@ -202,19 +202,19 @@ Record-only and explicitly waiting issues are excluded from active implementatio
 
 ## macOS 构建与产物清理规则
 
-在 `gtech-taskboard` 分支及其后续开发中，macOS 打包必须遵守以下流程：
+在 `gtech-taskboard` 分支及其后续开发中，macOS 打包必须遵守以下流程。**本地打包只构建当前 Apple Silicon 机器所需的 ARM64（`aarch64-apple-darwin`），不要求也不构建 `x86_64-apple-darwin`；只有明确进行发布兼容性构建时才另行构建 Universal：**
 
-1. 使用仓库定义的命令构建 Universal macOS App 和 DMG：
+1. 使用仓库定义的命令构建 ARM64 macOS App 和 DMG：
    ```bash
    npm run app:build
    ```
 2. 构建完成后，先确认以下产物生成成功：
-   - `src-tauri/target/universal-apple-darwin/release/bundle/macos/Codex Taskboard.app`
-   - `src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg`
+   - `src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Codex Taskboard.app`
+   - `src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg`
 3. 将需要保留的 DMG 复制到仓库外的目录，例如：
    ```bash
    mkdir -p ~/Desktop/codex-taskboard-builds
-   cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg \
+   cp src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg \
      ~/Desktop/codex-taskboard-builds/
    ```
 4. 确认复制成功后，清理仓库内的大型构建产物：

@@ -24,6 +24,7 @@
   const HOST_CAPABILITY = window.__CODEX_TASKBOARD_HOST_CAPABILITY__;
   const REATTACH_DELAY_MS = 160;
   const FRAME_READY_TIMEOUT_MS = 12_000;
+  const TASKBOARD_STARTUP_RETRY_DELAYS_MS = [300, 800, 1_500, 2_500];
   const HOST_REQUEST_TIMEOUT_MS = 12_000;
   const HOST_HEARTBEAT_MAX_AGE_MS = 8_000;
   const MACOS_TITLEBAR_SAFE_LEFT = 80;
@@ -1342,6 +1343,83 @@
     input.showPicker();
   }
 
+  function requestCodexAppServer(hostId, method, params, timeoutMs = 10_000) {
+    const bridge = window.electronBridge;
+    if (!bridge || typeof bridge.sendMessageFromView !== "function") {
+      return Promise.reject(new Error(hostText(
+        "当前 Codex 版本没有提供原生对话导航能力",
+        "This Codex version does not provide native conversation navigation",
+      )));
+    }
+    const requestId = `taskboard-thread-${crypto.randomUUID()}`;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (ok, value) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        window.removeEventListener("message", onMessage, true);
+        if (ok) resolve(value);
+        else reject(new Error(value));
+      };
+      const onMessage = (event) => {
+        const message = event.data;
+        if (
+          !message
+          || typeof message !== "object"
+          || message.type !== "mcp-response"
+          || message.hostId !== hostId
+          || message.message?.id !== requestId
+        ) return;
+        event.stopImmediatePropagation();
+        if (message.message.error) {
+          finish(false, message.message.error.message || "Codex App Server request failed");
+          return;
+        }
+        finish(true, message.message.result);
+      };
+      const timeout = window.setTimeout(
+        () => finish(false, "Codex App Server request timed out"),
+        timeoutMs,
+      );
+      window.addEventListener("message", onMessage, true);
+      Promise.resolve(bridge.sendMessageFromView({
+        type: "mcp-request",
+        hostId,
+        request: { id: requestId, method, params },
+        priority: "interactive",
+        source: "taskboard_thread_create",
+        timeoutMs,
+        expiresAtMs: Date.now() + timeoutMs,
+      })).catch((error) => {
+        finish(false, error instanceof Error ? error.message : String(error));
+      });
+    });
+  }
+
+  async function setThreadName(payload) {
+    const threadId = normalizeThreadId(payload?.threadId);
+    const name = typeof payload?.name === "string" ? payload.name.trim() : "";
+    const hostId = typeof payload?.hostId === "string" && payload.hostId.trim()
+      ? payload.hostId.trim()
+      : "local";
+    if (!threadId || !name || name.length > 240) return;
+    const params = { threadId, name };
+    try {
+      await requestCodexAppServer(hostId, "thread/name/set", params);
+    } catch (error) {
+      // 新建会话的 rollout 文件可能尚未落盘，与 CDP 创建路径一样重试一次。
+      const message = error instanceof Error
+        ? error.message.toLowerCase()
+        : String(error).toLowerCase();
+      if (!message.includes("rollout") || !message.includes("is empty")) return;
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      try {
+        await requestCodexAppServer(hostId, "thread/name/set", params);
+      } catch (_) {}
+    }
+  }
+
   function challengeFrameDocument(event) {
     if (!frame || event.currentTarget !== frame) return;
     frameReady = false;
@@ -1405,6 +1483,7 @@
       return;
     }
     if (message.type === "taskboard:create-thread") void createThreadForTask(message.payload);
+    if (message.type === "taskboard:set-thread-name") void setThreadName(message.payload);
   }
 
   function updateDragRegion(payload) {
@@ -1709,7 +1788,7 @@
     if (message.type === HOST_RESPONSE_MESSAGE) onHostResponse(message.response);
   }
 
-  async function prepareTaskboard(generation) {
+  async function prepareTaskboard(generation, retryAttempt = 0) {
     const taskboardUrl = resolveTaskboardUrl();
     const canReuseFrame = Boolean(
       frameReady
@@ -1743,6 +1822,15 @@
       postHostContext();
     } catch (error) {
       if (!active || generation !== openGeneration) return;
+      if (retryAttempt < TASKBOARD_STARTUP_RETRY_DELAYS_MS.length) {
+        showLoading();
+        window.setTimeout(() => {
+          if (active && generation === openGeneration) {
+            void prepareTaskboard(generation, retryAttempt + 1);
+          }
+        }, TASKBOARD_STARTUP_RETRY_DELAYS_MS[retryAttempt]);
+        return;
+      }
       const bindingAvailable = hasLiveHostBinding();
       showLoadError(bindingAvailable
         ? error

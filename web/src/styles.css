@@ -9984,3 +9984,22 @@ kbd {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.task-card-jira-type.issue-type-bug,
+.issue-list-jira-type.issue-type-bug,
+.codex-launch-type.issue-type-bug { color: #d04a4a; border-color: color-mix(in srgb, #d04a4a 42%, var(--border)); background: color-mix(in srgb, #d04a4a 10%, transparent); }
+.task-card-jira-type.issue-type-story,
+.issue-list-jira-type.issue-type-story,
+.codex-launch-type.issue-type-story { color: #39865b; border-color: color-mix(in srgb, #39865b 42%, var(--border)); background: color-mix(in srgb, #39865b 10%, transparent); }
+.task-card-jira-type.issue-type-task,
+.issue-list-jira-type.issue-type-task,
+.codex-launch-type.issue-type-task { color: #3d6fbb; border-color: color-mix(in srgb, #3d6fbb 42%, var(--border)); background: color-mix(in srgb, #3d6fbb 10%, transparent); }
+.task-card-jira-type.issue-type-epic,
+.issue-list-jira-type.issue-type-epic,
+.codex-launch-type.issue-type-epic { color: #8056b3; border-color: color-mix(in srgb, #8056b3 42%, var(--border)); background: color-mix(in srgb, #8056b3 10%, transparent); }
+.task-card-jira-type.issue-type-feature,
+.issue-list-jira-type.issue-type-feature,
+.codex-launch-type.issue-type-feature { color: #a06a2d; border-color: color-mix(in srgb, #a06a2d 42%, var(--border)); background: color-mix(in srgb, #a06a2d 10%, transparent); }
+.task-card-jira-type.issue-type-improvement,
+.issue-list-jira-type.issue-type-improvement,
+.codex-launch-type.issue-type-improvement { color: #267f86; border-color: color-mix(in srgb, #267f86 42%, var(--border)); background: color-mix(in srgb, #267f86 10%, transparent); }

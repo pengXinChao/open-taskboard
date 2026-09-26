@@ -15,6 +15,7 @@ import {
   isTaskPriority,
   isTaskStatus,
 } from "../shared/domain.mjs";
+import { canonicalTaskRef } from "../shared/jira-issue-ref.mjs";
 
 export const SCHEMA_VERSION = 2;
 export const DEFAULT_API_URL = "http://127.0.0.1:47823";
@@ -1006,7 +1007,7 @@ async function mutateIssueRelation(api, action, taskId, options, overrides) {
   const version = await resolveVersion(api, taskId, options["if-version"]);
   return api.request(
     action === "add" ? "POST" : "DELETE",
-    `${taskPath(taskId)}/relations/${type}/${encodeURIComponent(relatedTaskId)}`,
+    `${taskPath(taskId)}/relations/${type}/${encodeURIComponent(canonicalTaskRef(relatedTaskId))}`,
     { ...attribution, version },
   );
 }
@@ -1194,7 +1195,7 @@ function assertPriority(priority) {
 
 function taskPath(taskId) {
   if (!taskId) throw usageError("Missing issue id");
-  return `/api/tasks/${encodeURIComponent(taskId)}`;
+  return `/api/tasks/${encodeURIComponent(canonicalTaskRef(taskId))}`;
 }
 
 function commentPath(commentId) {

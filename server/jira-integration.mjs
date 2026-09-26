@@ -111,6 +111,7 @@ function normalizeIssue(issue, config, index = 0) {
     issueType: typeof fields.issuetype?.name === "string" ? fields.issuetype.name.trim().slice(0, 120) || null : null,
     description: typeof fields.description === "string" ? fields.description.slice(0, 100_000) : "",
     status: taskStatusFromJira(fields.status),
+    externalStatus: String(fields.status?.id ?? fields.status?.name ?? "").trim().slice(0, 120),
     priority: taskPriorityFromJira(fields.priority),
     labels,
     sortOrder: (index + 1) * 1024,
@@ -572,7 +573,9 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       const transition = await resolveTransition(config, task.externalKey, status);
       if (transition) {
         await applyTransition(config, task.externalKey, transition);
+        return true;
       }
+      return false;
     },
   };
 }

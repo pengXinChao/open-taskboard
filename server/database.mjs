@@ -19,6 +19,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
+import { jiraIssueKeyFromRef } from "../shared/jira-issue-ref.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
@@ -319,6 +320,8 @@ export class TaskboardDatabase {
         external_id TEXT,
         external_key TEXT,
         external_url TEXT,
+        external_status TEXT,
+        local_status_override INTEGER NOT NULL DEFAULT 0,
         archived_at TEXT,
         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
         created_at TEXT NOT NULL,
@@ -578,6 +581,12 @@ export class TaskboardDatabase {
     }
     if (!migratedTaskColumns.some((column) => column.name === "external_url")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN external_url TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "external_status")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN external_status TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "local_status_override")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN local_status_override INTEGER NOT NULL DEFAULT 0");
     }
     this.database.exec(`
       DROP INDEX IF EXISTS tasks_external_source_id;
@@ -1060,6 +1069,7 @@ export class TaskboardDatabase {
           git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
           external_source, external_origin, external_id, external_key, external_url,
+          external_status, local_status_override,
           archived_at, version, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -1069,6 +1079,7 @@ export class TaskboardDatabase {
           NULL, NULL, NULL,
           NULL, ?, NULL, NULL,
           'jira', ?, ?, ?, ?,
+          ?, 0,
           NULL, 1, ?, ?
         )
       `);
@@ -1078,6 +1089,7 @@ export class TaskboardDatabase {
           sort_order = ?, creator_type = ?, creator_id = ?, creator_name = ?, creator_avatar_url = ?,
           assignee_type = ?, assignee_id = ?, assignee_name = ?, assignee_avatar_url = ?,
           due_date = ?, external_origin = ?, external_id = ?, external_key = ?, external_url = ?,
+          external_status = ?, local_status_override = ?,
           archived_at = NULL,
           version = version + 1, updated_at = ?
         WHERE id = ?
@@ -1112,6 +1124,7 @@ export class TaskboardDatabase {
             issue.externalId,
             issue.externalKey,
             issue.externalUrl,
+            issue.externalStatus,
             issue.createdAt,
             issue.updatedAt,
           );
@@ -1139,14 +1152,18 @@ export class TaskboardDatabase {
           || existing.external_id !== issue.externalId
           || existing.external_key !== issue.externalKey
           || existing.external_url !== issue.externalUrl
+          || existing.external_status !== issue.externalStatus
           || existing.archived_at !== null;
         if (!changed) continue;
+        const remoteStatusChanged = existing.external_status !== issue.externalStatus;
+        const localStatusOverride = remoteStatusChanged ? 0 : Number(existing.local_status_override ?? 0);
+        const status = localStatusOverride === 1 ? existing.status : issue.status;
         updateTask.run(
           issue.identifier,
           issue.title,
           issue.issueType ?? null,
           issue.description,
-          issue.status,
+          status,
           issue.priority,
           labels,
           issue.sortOrder,
@@ -1163,6 +1180,8 @@ export class TaskboardDatabase {
           issue.externalId,
           issue.externalKey,
           issue.externalUrl,
+          issue.externalStatus,
+          localStatusOverride,
           issue.updatedAt,
           existing.id,
         );
@@ -1761,6 +1780,7 @@ export class TaskboardDatabase {
     return row ? (row.external_source === "jira" ? "jira" : "local") : null;
   }
 
+
   getTaskStatus(id) {
     const row = this.database.prepare(
       "SELECT status FROM tasks WHERE id = ? OR identifier = ?",
@@ -1769,7 +1789,7 @@ export class TaskboardDatabase {
   }
 
   getTask(id) {
-    const row = this.database.prepare("SELECT * FROM tasks WHERE id = ? OR identifier = ?").get(id, id);
+    const row = this.#findTaskRow(id);
     if (!row) return null;
     const task = this.#taskWithRelations(row);
     const comments = this.#commentsForTaskActivity([task.id]).get(task.id) ?? [];
@@ -1779,9 +1799,7 @@ export class TaskboardDatabase {
   }
 
   getTaskTree(id, direction, depth) {
-    const root = this.database.prepare(
-      "SELECT * FROM tasks WHERE id = ? OR identifier = ?",
-    ).get(id, id);
+    const root = this.#findTaskRow(id);
     if (!root) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
 
     const nodes = [taskTreeNode(root, null, 0, [root.id])];
@@ -2087,7 +2105,7 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
-  moveTask(id, version, status, sortOrder, threadId, threadBinding, actor, agentSession) {
+  moveTask(id, version, status, sortOrder, threadId, threadBinding, actor, agentSession, localStatusOverride = false) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     if (current.archivedAt !== null) {
@@ -2121,9 +2139,10 @@ export class TaskboardDatabase {
     try {
       const result = this.database.prepare(`
         UPDATE tasks
-        SET status = ?, sort_order = ?, ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?
+        SET status = ?, local_status_override = CASE WHEN ? THEN 1 ELSE local_status_override END,
+          sort_order = ?, ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
-      `).run(status, sortOrder, ...(storedBinding ?? []), ...sessionValues, timestamp, current.id, version);
+      `).run(status, localStatusOverride, sortOrder, ...(storedBinding ?? []), ...sessionValues, timestamp, current.id, version);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
@@ -2918,11 +2937,42 @@ export class TaskboardDatabase {
   }
 
   #requireTaskRecord(id) {
-    const row = this.database.prepare("SELECT * FROM tasks WHERE id = ? OR identifier = ?").get(id, id);
+    const row = this.#findTaskRow(id);
     if (!row) {
       throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
     }
     return taskFromRow(row);
+  }
+
+  #findTaskRow(id) {
+    const row = this.database.prepare("SELECT * FROM tasks WHERE id = ? OR identifier = ?").get(id, id);
+    if (row) return row;
+    return this.#findJiraTaskRow(id);
+  }
+
+  // 内部 id/identifier 优先，避免本地议题恰好也叫 OMS-123 时被 Jira Key 抢走。
+  #findJiraTaskRow(ref) {
+    if (typeof ref !== "string") return null;
+    const trimmed = ref.trim();
+    if (!trimmed) return null;
+    const key = jiraIssueKeyFromRef(trimmed);
+    if (key) {
+      const byKey = this.database.prepare(`
+        SELECT *
+        FROM tasks
+        WHERE external_source = 'jira' AND upper(external_key) = ?
+        ORDER BY CASE WHEN archived_at IS NULL THEN 0 ELSE 1 END, updated_at DESC, id DESC
+        LIMIT 1
+      `).get(key);
+      if (byKey) return byKey;
+    }
+    return this.database.prepare(`
+      SELECT *
+      FROM tasks
+      WHERE external_source = 'jira' AND external_url = ?
+      ORDER BY CASE WHEN archived_at IS NULL THEN 0 ELSE 1 END, updated_at DESC, id DESC
+      LIMIT 1
+    `).get(trimmed) ?? null;
   }
 
   #requireTask(id) {
