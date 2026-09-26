@@ -212,6 +212,7 @@ interface UndoNotice {
 
 type ProjectAutomationStatus = "ACTIVE" | "PAUSED";
 type AutomationQuotaState = "available" | "blocked" | "unknown" | "unavailable";
+type AutomationIdleReason = "checking-todos" | "waiting-todos";
 type AutomationIntervalMinutes = 5 | 10 | 15 | 30 | 60;
 
 interface AutomationQuotaStatus {
@@ -231,6 +232,7 @@ interface ProjectAutomationRecord {
   enabledByUser: boolean;
   quotaAware: boolean;
   quota?: AutomationQuotaStatus;
+  idleReason?: AutomationIdleReason;
   intervalMinutes: AutomationIntervalMinutes;
   model: string;
   reasoningEffort: string;
@@ -274,6 +276,7 @@ interface AutomationHostResponse {
   item?: AutomationHostItem;
   items?: AutomationHostItem[];
   quota?: AutomationQuotaStatus;
+  idleReason?: AutomationIdleReason;
   policy?: {
     automationId?: string;
     codexProjectId: string;
@@ -465,6 +468,8 @@ function readProjectAutomations(): ProjectAutomations {
         enabledByUser,
         quotaAware,
         ...(quota ? { quota } : {}),
+        ...(candidate.idleReason === "checking-todos" || candidate.idleReason === "waiting-todos"
+          ? { idleReason: candidate.idleReason } : {}),
         intervalMinutes: candidate.intervalMinutes ?? 5,
         model,
         reasoningEffort,
@@ -1308,6 +1313,7 @@ export function App() {
         && current[projectId]?.enabledByUser === record.enabledByUser
         && current[projectId]?.quotaAware === record.quotaAware
         && JSON.stringify(current[projectId]?.quota) === JSON.stringify(record.quota)
+        && current[projectId]?.idleReason === record.idleReason
         && current[projectId]?.intervalMinutes === record.intervalMinutes
         && current[projectId]?.model === record.model
         && current[projectId]?.reasoningEffort === record.reasoningEffort
@@ -1403,6 +1409,7 @@ export function App() {
           enabledByUser: policy.enabledByUser,
           quotaAware: policy.quotaAware,
           ...(response.quota ? { quota: response.quota } : {}),
+          idleReason: response.idleReason,
           intervalMinutes: policy.intervalMinutes,
           model: policy.model,
           reasoningEffort: policy.reasoningEffort,
@@ -1474,6 +1481,7 @@ export function App() {
           enabledByUser: policy.enabledByUser,
           quotaAware: policy.quotaAware,
           ...(response.quota ? { quota: response.quota } : {}),
+          idleReason: response.idleReason,
           intervalMinutes: policy.intervalMinutes,
           model: policy.model,
           reasoningEffort: policy.reasoningEffort,
@@ -1496,6 +1504,7 @@ export function App() {
             enabledByUser: policy?.enabledByUser ?? stored.enabledByUser,
             quotaAware: policy?.quotaAware ?? stored.quotaAware,
             ...(response.quota ? { quota: response.quota } : {}),
+            idleReason: response.idleReason,
             intervalMinutes: policy?.intervalMinutes ?? stored.intervalMinutes,
             model: policy?.model ?? stored.model,
             reasoningEffort: policy?.reasoningEffort ?? stored.reasoningEffort,
@@ -1521,6 +1530,7 @@ export function App() {
               ? { quota: stored.quota }
               : {}
         ),
+        idleReason: response.idleReason,
         intervalMinutes,
         model: policy?.model ?? item.model,
         reasoningEffort: policy?.reasoningEffort ?? item.reasoningEffort,
@@ -1784,6 +1794,20 @@ export function App() {
     setAutomationError(null);
     void reconcileProjectAutomation();
   }, [selectedProjectId, reconcileProjectAutomation]);
+
+  useEffect(() => {
+    if (!selectedProjectAutomation?.enabledByUser || !selectedProjectAutomation.idleReason) return;
+    // The host acknowledges the pause before doing the ephemeral semantic turn.
+    // Refresh that result through the existing list path, including auto-resume.
+    const timer = window.setInterval(() => {
+      void reconcileProjectAutomation();
+    }, selectedProjectAutomation.idleReason === "checking-todos" ? 5_000 : 60_000);
+    return () => window.clearInterval(timer);
+  }, [
+    selectedProjectAutomation?.enabledByUser,
+    selectedProjectAutomation?.idleReason,
+    reconcileProjectAutomation,
+  ]);
 
   useEffect(() => {
     if (!embedded || window.parent === window) return;

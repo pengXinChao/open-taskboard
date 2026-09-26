@@ -1779,11 +1779,67 @@ function remoteAutomationItem(request, status, nextRunAt) {
   };
 }
 
+async function localAutomationTodoInputs(request, tasks) {
+  // Local cron can also continue complete or legacy bindings. Do not use the
+  // remote worker's eligibility filter here, or inspect in_progress workers.
+  const candidates = await Promise.all(tasks.filter((task) => (
+    task.projectId === request.taskboardProjectId
+    && task.status === "todo"
+    && task.archivedAt === null
+    && (task.relations?.blockedBy ?? []).every((dependency) => dependency.status === "done")
+  )).map(async (task) => ({
+    task,
+    comments: (await taskboardRequest(`/api/tasks/${encodeURIComponent(task.id)}/comments`)).comments,
+  })));
+  const snapshot = createHash("sha256").update(JSON.stringify(candidates.map(({ task, comments }) => [
+    task.id, task.version, task.title, task.description,
+    task.threadId, task.threadBinding, task.relations?.blockedBy,
+    comments.at(-1) ?? null,
+  ]))).digest("hex");
+  return { candidates, snapshot };
+}
+
+async function localAutomationTodoGate(request, tasks, previousGate, evaluatedTodoGate) {
+  const { candidates, snapshot } = await localAutomationTodoInputs(request, tasks);
+  // Dependency-only skips retain their existing behavior in the cron prompt.
+  if (candidates.length === 0) return undefined;
+  // Recheck after the ephemeral turn before enabling cron. This is not a claim:
+  // the original prompt still checks fresh task/comments, versions and bindings.
+  if (evaluatedTodoGate?.snapshot === snapshot) {
+    return { snapshot, state: evaluatedTodoGate.state };
+  }
+  return snapshot === previousGate?.snapshot
+    ? previousGate
+    : { snapshot, state: "checking" };
+}
+
+async function evaluateLocalAutomationTodos(record) {
+  const { request, version, todoGate } = record;
+  const stillCurrent = () => quotaPolicyRecords.get(request.taskboardProjectId)?.version === version;
+  const listed = await taskboardRequest(
+    `/api/tasks?projectId=${encodeURIComponent(request.taskboardProjectId)}&status=todo`,
+  );
+  const { candidates, snapshot } = await localAutomationTodoInputs(request, listed.tasks);
+  if (!stillCurrent() || snapshot !== todoGate?.snapshot || todoGate.state !== "checking") return;
+  let state = "wait";
+  for (const { task, comments } of candidates) {
+    if (!stillCurrent()) return;
+    if (await remoteAutomationCanStart(currentQuotaPolicyCdp(), request, task, comments)) {
+      state = "start";
+      break;
+    }
+  }
+  return stillCurrent() ? { version, snapshot, state } : undefined;
+}
+
 async function applyTaskboardAutomationPolicy(
   request,
   rpc,
   stillCurrent = () => true,
-  { explicit = false, previousQuotaState, remoteNextRunAt } = {},
+  {
+    explicit = false, previousQuotaState, remoteNextRunAt,
+    previousTodoGate, evaluatedTodoGate,
+  } = {},
 ) {
   const todoResponse = request.enabledByUser
     ? await fetch(
@@ -1847,20 +1903,34 @@ async function applyTaskboardAutomationPolicy(
         : null
     ) ?? items[0];
   }
-  const operation = taskboardAutomationPolicyOperation(request, {
+  let todoGate = request.enabledByUser && hasTodo ? previousTodoGate : undefined;
+  let operation = taskboardAutomationPolicyOperation(request, {
     explicit,
     hasTodo,
     previousQuotaState,
     quotaState: quota?.state,
     currentStatus: currentItem?.status,
+    idlePaused: todoGate?.state === "checking" || todoGate?.state === "wait",
   });
+  if (operation === "ensure-active") {
+    todoGate = await localAutomationTodoGate(
+      request, todoPayload.tasks, todoGate, evaluatedTodoGate,
+    );
+    if (todoGate && todoGate.state !== "start") operation = "pause";
+  } else if (operation === "list") {
+    todoGate = undefined; // A native/manual pause is not an automatic wait.
+  }
+  if (!stillCurrent()) return { quota, stale: true };
+  const idleReason = todoGate?.state === "checking"
+    ? "checking-todos"
+    : todoGate?.state === "wait" ? "waiting-todos" : undefined;
   const result = operation === "list"
     ? { item: currentItem, items: listed.items }
     : await reconcileTaskboardAutomation({ ...request, operation }, rpc);
   if (result?.error === "not-found") {
-    return { operation, hasTodo, ...(quota ? { quota } : {}) };
+    return { operation, hasTodo, todoGate, idleReason, ...(quota ? { quota } : {}) };
   }
-  return { ...result, operation, hasTodo, ...(quota ? { quota } : {}) };
+  return { ...result, operation, hasTodo, todoGate, idleReason, ...(quota ? { quota } : {}) };
 }
 
 function storedAutomationPolicy(request) {
@@ -1884,7 +1954,7 @@ function storedAutomationPolicy(request) {
 
 function restoredAutomationPolicy(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const { nextRunAt, quota, ...stored } = value;
+  const { nextRunAt, quota, todoGate, ...stored } = value;
   const request = parseTaskboardAutomationHostRequest({
     ...stored,
     id: "restored-policy",
@@ -1896,6 +1966,8 @@ function restoredAutomationPolicy(value) {
     ? {
       request,
       ...(quota ? { quota } : {}),
+      ...(todoGate && typeof todoGate.snapshot === "string"
+        && ["checking", "wait", "start"].includes(todoGate.state) ? { todoGate } : {}),
       ...(Number.isFinite(nextRunAt) ? { nextRunAt } : {}),
     }
     : null;
@@ -1930,6 +2002,7 @@ function persistQuotaPolicies() {
       {
         ...storedAutomationPolicy(record.request),
         ...(record.quota ? { quota: record.quota } : {}),
+        ...(record.todoGate ? { todoGate: record.todoGate } : {}),
         ...(Number.isFinite(record.nextRunAt) ? { nextRunAt: record.nextRunAt } : {}),
       },
     ]),
@@ -1972,12 +2045,15 @@ function scheduleQuotaPolicyCheck(record, result) {
   if (!request.enabledByUser) return;
 
   const nextRunAt = Number(result.item?.nextRunAt);
-  const nextRunDelay = Number.isFinite(nextRunAt) && nextRunAt > Date.now()
-    ? Math.max(
-      1_000,
-      nextRunAt - Date.now() - (request.codexProjectKind === "remote" ? 0 : 15_000),
-    )
-    : 60_000;
+  const checkTodos = result.todoGate?.state === "checking"
+    && (!request.quotaAware || result.quota?.state === "available");
+  const nextRunDelay = checkTodos ? 1_000
+    : Number.isFinite(nextRunAt) && nextRunAt > Date.now()
+      ? Math.max(
+        1_000,
+        nextRunAt - Date.now() - (request.codexProjectKind === "remote" ? 0 : 15_000),
+      )
+      : 60_000;
   const resetDelay = result.quota?.state === "blocked"
     && Number.isFinite(result.quota.resetsAt)
     ? Math.max(1_000, result.quota.resetsAt * 1_000 - Date.now() + 1_000)
@@ -1988,7 +2064,20 @@ function scheduleQuotaPolicyCheck(record, result) {
       if (request.codexProjectKind === "remote" && result.item?.status === "ACTIVE") {
         await runRemoteTaskboardAutomation(record);
       }
-      await enqueueCurrentQuotaPolicy(key);
+      let evaluatedTodoGate;
+      if (request.codexProjectKind === "local" && checkTodos) {
+        // Like remote turns, model work runs outside the mutation queue, after
+        // cron has been paused. UI reads/manual pause must not wait for a turn.
+        if (record.todoCheckInFlight) return;
+        record.todoCheckInFlight = true;
+        try {
+          evaluatedTodoGate = await evaluateLocalAutomationTodos(record);
+        } finally {
+          delete record.todoCheckInFlight;
+        }
+      }
+      if (quotaPolicyRecords.get(key)?.version !== version) return;
+      await enqueueCurrentQuotaPolicy(key, { evaluatedTodoGate });
     } catch (error) {
       console.error(`Taskboard quota policy check failed: ${error.message}`);
       const current = quotaPolicyRecords.get(key);
@@ -2001,7 +2090,7 @@ function scheduleQuotaPolicyCheck(record, result) {
   quotaPolicyTimers.set(key, timer);
 }
 
-function enqueueQuotaPolicyMutation(record, rpc, { explicit = false } = {}) {
+function enqueueQuotaPolicyMutation(record, rpc, { explicit = false, evaluatedTodoGate } = {}) {
   const key = record.request.taskboardProjectId;
   const previous = quotaPolicyQueues.get(key) ?? Promise.resolve();
   const run = previous
@@ -2017,6 +2106,8 @@ function enqueueQuotaPolicyMutation(record, rpc, { explicit = false } = {}) {
           explicit,
           previousQuotaState: current.quota?.state,
           remoteNextRunAt: current.nextRunAt,
+          previousTodoGate: current.todoGate,
+          evaluatedTodoGate: evaluatedTodoGate?.version === current.version ? evaluatedTodoGate : undefined,
         },
       );
       if (result.stale) return result;
@@ -2038,6 +2129,8 @@ function enqueueQuotaPolicyMutation(record, rpc, { explicit = false } = {}) {
           delete current.nextRunAt;
         }
       }
+      if (result.todoGate) current.todoGate = result.todoGate;
+      else delete current.todoGate;
       if (current.request.quotaAware && result.quota) current.quota = result.quota;
       else if (!current.request.quotaAware) delete current.quota;
       await persistQuotaPolicies();
@@ -2110,7 +2203,7 @@ async function reconcileStoredAutomationPolicy(request, rpc) {
   };
 }
 
-async function enqueueCurrentQuotaPolicy(projectId) {
+async function enqueueCurrentQuotaPolicy(projectId, { evaluatedTodoGate } = {}) {
   await ensureQuotaPoliciesLoaded();
   const record = quotaPolicyRecords.get(projectId);
   if (!record) return { stale: true };
@@ -2122,6 +2215,7 @@ async function enqueueCurrentQuotaPolicy(projectId) {
       method,
       body,
     ),
+    { evaluatedTodoGate },
   );
 }
 
@@ -2824,19 +2918,31 @@ async function resolveRunnableCodexExecutable(appPath) {
     return executable;
   }
 
-  const source = await stat(executable);
+  const sourceDirectory = path.dirname(executable);
   const cacheDirectory = path.join(taskboardDataDirectory, "codex-runtime");
   const cachedExecutable = path.join(cacheDirectory, "codex.exe");
-  try {
-    const cached = await stat(cachedExecutable);
-    if (cached.size === source.size && cached.mtimeMs === source.mtimeMs) {
-      return cachedExecutable;
-    }
-  } catch {}
-
   await mkdir(cacheDirectory, { recursive: true });
-  await pipeline(createReadStream(executable), createWriteStream(cachedExecutable));
-  await utimes(cachedExecutable, source.atime, source.mtime);
+  for (const filename of [
+    "codex.exe",
+    "codex-code-mode-host.exe",
+    "codex-command-runner.exe",
+    "codex-windows-sandbox-setup.exe",
+  ]) {
+    const sourcePath = path.join(sourceDirectory, filename);
+    const cachedPath = path.join(cacheDirectory, filename);
+    const source = await stat(sourcePath);
+    try {
+      const cached = await stat(cachedPath);
+      if (cached.size === source.size && cached.mtimeMs === source.mtimeMs) {
+        continue;
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+
+    await pipeline(createReadStream(sourcePath), createWriteStream(cachedPath));
+    await utimes(cachedPath, source.atime, source.mtime);
+  }
   return cachedExecutable;
 }
 
