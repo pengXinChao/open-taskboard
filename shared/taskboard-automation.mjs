@@ -164,12 +164,14 @@ export function taskboardAutomationPolicyOperation(request, {
   previousQuotaState,
   quotaState,
   currentStatus,
+  idlePaused = false,
 }) {
   if (!request.enabledByUser) return "pause";
   if (hasTodo === false) return "pause";
   if (
     !explicit
     && currentStatus === "PAUSED"
+    && !idlePaused
     && (!request.quotaAware || previousQuotaState === "available")
   ) return "list";
   if (request.quotaAware && quotaState !== "available") return "pause";

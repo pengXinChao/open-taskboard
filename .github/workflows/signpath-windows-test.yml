@@ -1,0 +1,175 @@
+name: SignPath Windows test
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: Submit to test-signing (false only builds and uploads unsigned samples)
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  windows-test:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: signpath-windows-test-x64
+          cache-bin: false
+      - run: npm ci
+      - name: Build the existing unsigned Windows target
+        run: npm run app:build:windows
+
+      - name: Stage only the project launcher and outer NSIS installer
+        id: stage
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = 'src-tauri/target/x86_64-pc-windows-msvc/release'
+          $installers = @(Get-ChildItem -LiteralPath "$release/bundle/nsis" -Filter '*-setup.exe' -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS *-setup.exe; found $($installers.Count)."
+          }
+          $unsigned = "$env:RUNNER_TEMP/signpath-windows-test/unsigned"
+          $evidence = "$env:RUNNER_TEMP/signpath-windows-test/evidence"
+          New-Item -ItemType Directory -Path $unsigned, $evidence | Out-Null
+          $sources = [ordered]@{
+            'codex-taskboard-launcher.exe' = "$release/codex-taskboard-launcher.exe"
+            'codex-taskboard-test-setup.exe' = $installers[0].FullName
+          }
+          $files = foreach ($name in $sources.Keys) {
+            $source = (Resolve-Path -LiteralPath $sources[$name]).Path
+            $destination = Join-Path $unsigned $name
+            Copy-Item -LiteralPath $source -Destination $destination
+            $signature = Get-AuthenticodeSignature -LiteralPath $destination
+            if ($signature.Status -ne 'NotSigned') {
+              throw "Expected unsigned input ${name}; got $($signature.Status): $($signature.StatusMessage)"
+            }
+            [ordered]@{
+              source = [IO.Path]::GetRelativePath($env:GITHUB_WORKSPACE, $source).Replace('\', '/')
+              artifact_path = $name
+              sha256 = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+              signature_status = [string]$signature.Status
+            }
+          }
+          [ordered]@{
+            commit = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            scope = 'Standalone launcher and outer NSIS PE only; no nested signing or node.exe re-signing.'
+            files = @($files)
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$evidence/unsigned-sample.json" -Encoding utf8
+          Get-Content -LiteralPath "$evidence/unsigned-sample.json"
+
+      # Upload the directory itself: upload-artifact makes the ONE ZIP layer.
+      - name: Preserve unsigned signing input
+        id: unsigned
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signpath-windows-test-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signpath-windows-test/unsigned/
+          archive: true
+          if-no-files-found: error
+          retention-days: 7
+
+      # Check after the upload so a missing credential never loses the sample.
+      - name: Check test-signing configuration
+        if: inputs.sign
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          EXPECTED_SIGNER_SHA256: ${{ vars.SIGNPATH_TEST_CERTIFICATE_SHA256 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNPATH_API_TOKEN)) {
+            throw 'Set the SIGNPATH_API_TOKEN repository secret, or dispatch with sign=false.'
+          }
+          if ($env:EXPECTED_SIGNER_SHA256 -notmatch '\A[0-9A-Fa-f]{64}\z') {
+            throw 'Set SIGNPATH_TEST_CERTIFICATE_SHA256 to the independently obtained test certificate DER SHA-256 (64 hex characters).'
+          }
+
+      - name: Submit the ZIP to test-signing and download the result
+        id: signpath
+        if: inputs.sign
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: 8322a055-0327-41ec-a602-736063510184
+          project-slug: dashi-taskboard
+          signing-policy-slug: test-signing
+          artifact-configuration-slug: windows-test-zip
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1200
+          output-artifact-directory: ${{ runner.temp }}/signpath-windows-test/signed
+          skip-decompress: false
+
+      - name: Verify integrity and the pinned test signer on the disposable runner
+        id: verify
+        if: inputs.sign
+        env:
+          EXPECTED_SIGNER_SHA256: ${{ vars.SIGNPATH_TEST_CERTIFICATE_SHA256 }}
+        run: >-
+          ./scripts/verify-signpath-windows-test.ps1
+          -ArtifactDirectory "$env:RUNNER_TEMP/signpath-windows-test/signed"
+          -EvidenceDirectory "$env:RUNNER_TEMP/signpath-windows-test/evidence"
+          -ExpectedSignerSha256 "$env:EXPECTED_SIGNER_SHA256"
+
+      - name: Preserve only verified test-signed files
+        if: inputs.sign && steps.verify.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signpath-windows-test-signed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signpath-windows-test/signed/
+          archive: true
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Preserve preparation and verification evidence
+        if: always() && steps.stage.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signpath-windows-test-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signpath-windows-test/evidence/
+          archive: true
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Record test-only result
+        if: always()
+        env:
+          SIGN_REQUESTED: ${{ inputs.sign }}
+          UNSIGNED_ARTIFACT_ID: ${{ steps.unsigned.outputs.artifact-id }}
+          SIGNING_REQUEST_ID: ${{ steps.signpath.outputs.signing-request-id }}
+          SIGNING_OUTCOME: ${{ steps.signpath.outcome }}
+          VERIFICATION_OUTCOME: ${{ steps.verify.outcome }}
+        run: |
+          @"
+          ## SignPath Windows test (not a release)
+          - Commit: $env:GITHUB_SHA
+          - Signing requested: $env:SIGN_REQUESTED
+          - Unsigned GitHub artifact ID: $env:UNSIGNED_ARTIFACT_ID
+          - SignPath request ID: $env:SIGNING_REQUEST_ID
+          - Signing step: $env:SIGNING_OUTCOME
+          - Verification step: $env:VERIFICATION_OUTCOME
+          - Scope: standalone launcher and outer NSIS installer only. Installer contents are not re-signed.
+          - Trust: the pinned test certificate is trusted only temporarily on this disposable runner, not publicly trusted.
+          - sign=false is preparation only; signing/verification must both succeed to count as a signed result.
+          "@ | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8

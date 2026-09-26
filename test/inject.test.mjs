@@ -35,15 +35,15 @@ test("embedded page uses the launcher URL inside an opaque sandbox", () => {
   assert.doesNotMatch(source, /allow-same-origin/);
 });
 
-test("entry clones the native Plugins row and the page covers the complete Codex workspace", () => {
-  assert.match(source, /const PLUGIN_LABELS = \["插件", "plugins", "外掛程式", "プラグイン"\]/);
-  assert.match(source, /if \(plugin\?\.parentElement\) return plugin;/);
+test("entry clones the native Explore rail button and the page covers the complete Codex workspace", () => {
+  assert.match(source, /const EXPLORE_LABELS = \["探索", "explore"\]/);
+  assert.match(source, /document\.querySelector\("nav\[data-app-navigation-rail\]"\)/);
   assert.match(source, /button\.getAttribute\(OWNED_ATTRIBUTE\) !== "true"/);
-  assert.match(source, /rect\.bottom <= sectionTop/);
+
   assert.match(source, /const button = reference\.cloneNode\(true\)/);
-  assert.match(source, /reference\.after\(entry\)/);
+  assert.match(source, /reference\.before\(entry\)/);
   assert.match(source, /document\.querySelector\("\.app-shell-main-content-frame"\)/);
-  assert.match(source, /const surface = viewport\?\.parentElement/);
+  assert.match(source, /const surface = viewport\?\.closest\("\[data-app-shell-workspace-row\]"\)/);
   assert.match(source, /surface\.appendChild\(page\)/);
   assert.match(source, /#\$\{PAGE_ID\} \{[\s\S]*?top: 0;/);
   assert.doesNotMatch(source, /--codex-taskboard-top-offset/);
@@ -54,7 +54,7 @@ test("entry clones the native Plugins row and the page covers the complete Codex
   assert.doesNotMatch(source, /aria-modal/);
 });
 
-test("entry recognizes known Plugins labels and structurally anchors an unenumerated locale", () => {
+test("entry recognizes the Explore rail labels", () => {
   const normalizedLabelSource = source.slice(
     source.indexOf("function normalizedLabel"),
     source.indexOf("\n\n  function hostLanguage"),
@@ -64,48 +64,28 @@ test("entry recognizes known Plugins labels and structurally anchors an unenumer
     source.indexOf("\n\n  function replaceEntryIcon"),
   );
   let currentButtons;
-  let currentSection;
-  const scroll = {
-    querySelector: (selector) => selector === "[data-app-action-sidebar-section]" ? currentSection : null,
+  const rail = {
     querySelectorAll: (selector) => selector === "button" ? currentButtons : [],
   };
   const findReferenceButton = vm.runInNewContext(`(() => {
-    const PLUGIN_LABELS = ["插件", "plugins", "外掛程式", "プラグイン"];
+    const EXPLORE_LABELS = ["探索", "explore"];
     const OWNED_ATTRIBUTE = "data-codex-taskboard-owned";
     ${normalizedLabelSource}
     ${referenceSource}
     return findReferenceButton;
   })()`, {
-    document: { querySelector: () => scroll },
+    document: { querySelector: () => rail },
   });
 
-  for (const textContent of ["插件", "外掛程式", "プラグイン", "Plugins"]) {
+  for (const textContent of ["探索", "Explore"]) {
     const currentButton = {
-      textContent,
+      querySelector: (selector) => selector === ".sr-only" ? { textContent } : null,
       getAttribute: () => null,
       parentElement: {},
     };
     currentButtons = [currentButton];
-    currentSection = null;
     assert.equal(findReferenceButton(), currentButton);
   }
-
-  const topButton = (textContent, top, owned = false) => ({
-    textContent,
-    getAttribute: (name) => name === "data-codex-taskboard-owned" && owned ? "true" : null,
-    getBoundingClientRect: () => ({ top, bottom: top + 30, height: 30 }),
-    parentElement: {},
-  });
-  const unenumeratedPlugin = topButton("Приклучоци", 160);
-  currentButtons = [
-    topButton("Барања за повлекување", 100),
-    topButton("Локации", 120),
-    topButton("Закажано", 140),
-    unenumeratedPlugin,
-    topButton("Taskboard", 180, true),
-  ];
-  currentSection = { getBoundingClientRect: () => ({ top: 200 }) };
-  assert.equal(findReferenceButton(), unenumeratedPlugin);
 
   const languageDocument = { documentElement: { lang: "" } };
   const languageSource = source.slice(

@@ -56,6 +56,11 @@ function fixtureHtml(origin) {
     <meta charset="utf-8">
     <style>
       html, body { width: 1200px; height: 800px; margin: 0; }
+      #workspace { position: relative; width: 1200px; height: 700px; }
+      nav[data-app-navigation-rail] { position: absolute; width: 64px; }
+      .sidebar-navigation { margin-left: 64px; }
+      nav[data-app-navigation-rail] button::before { content: ""; opacity: 0; }
+      nav[data-app-navigation-rail] button[data-selected]::before { opacity: 1; }
       aside { position: absolute; width: 200px; height: 800px; }
       main { position: absolute; left: 200px; width: 1000px; height: 700px; }
       main > header { position: absolute; z-index: 2; width: 1000px; height: 48px; }
@@ -66,19 +71,22 @@ function fixtureHtml(origin) {
     </style>
   </head>
   <body>
+    <div id="workspace" data-app-shell-workspace-row>
     <aside>
+    <nav data-app-navigation-rail>
+      <button data-sidebar-destination="home" aria-current="page" data-selected><span class="sr-only">首页</span></button>
+      <button data-sidebar-destination="sites"><span class="sr-only">站点</span></button>
+      <button aria-haspopup="menu"><svg></svg><span class="sr-only">探索</span></button>
+    </nav>
+      <div class="sidebar-navigation">
       <nav role="navigation">
         <div data-app-action-sidebar-scroll>
-          <div>
-            <button><span>首页</span></button>
-            <button><span>站点</span></button>
-            <button><svg></svg><span class="text-fade-truncate">插件</span></button>
-          </div>
           <section data-app-action-sidebar-section>
             <div data-app-action-sidebar-section-heading="项目">项目</div>
           </section>
         </div>
       </nav>
+      </div>
     </aside>
     <main>
       <header>Codex header</header>
@@ -94,6 +102,7 @@ function fixtureHtml(origin) {
         ></webview>
       </div>
     </main>
+    </div>
     <output id="result"></output>
     <script>
       window.__CODEX_TASKBOARD_URL__ = ${JSON.stringify(`${origin}/taskboard?host=codex`)};
@@ -175,7 +184,7 @@ function fixtureHtml(origin) {
         window.__browserPanelClosed = true;
       });
     </script>
-    <script>eval(atob(${JSON.stringify(encodedSource)}));</script>
+    <script>eval(new TextDecoder().decode(Uint8Array.from(atob(${JSON.stringify(encodedSource)}), (byte) => byte.charCodeAt(0))));</script>
     <script>
       (async () => {
         const publishHeartbeat = () => window.postMessage({
@@ -198,7 +207,7 @@ function fixtureHtml(origin) {
 
         const page = document.getElementById("codex-taskboard-page");
         const frame = document.getElementById("codex-taskboard-frame");
-        const surface = document.getElementById("surface");
+        const surface = document.getElementById("workspace");
         const conversation = document.getElementById("conversation");
         const result = {
           panelVisibleBefore,
@@ -217,6 +226,28 @@ function fixtureHtml(origin) {
           hostileNavigationRevoked: Boolean(frame?.hidden && !document.getElementById("codex-taskboard-status")?.hidden),
           forgedThreadOpened: window.__forgedThreadOpened,
           injectionError: window.__injectionError,
+        };
+        const home = document.querySelector('[data-sidebar-destination="home"]');
+        const rail = document.querySelector('nav[data-app-navigation-rail]');
+        const sidebar = document.querySelector('.sidebar-navigation');
+        result.destination = {
+          homeSelected: home.hasAttribute("data-selected"),
+          homeBackground: getComputedStyle(home, "::before").opacity,
+          entrySelected: entry.hasAttribute("data-selected"),
+          sidebarVisibility: getComputedStyle(sidebar).visibility,
+          railVisibility: getComputedStyle(rail).visibility,
+          railPointerEvents: getComputedStyle(rail).pointerEvents,
+          pageLeft: page.getBoundingClientRect().left,
+          railRight: rail.getBoundingClientRect().right,
+        };
+        home.click();
+        result.restored = {
+          pageHidden: page.hidden,
+          homeSelected: home.hasAttribute("data-selected"),
+          homeCurrent: home.getAttribute("aria-current"),
+          entrySelected: entry.hasAttribute("data-selected"),
+          sidebarVisibility: getComputedStyle(sidebar).visibility,
+          contentVisibility: getComputedStyle(conversation).visibility,
         };
         document.getElementById("result").textContent = btoa(JSON.stringify(result));
         clearInterval(heartbeatTimer);
@@ -346,5 +377,23 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
     hostileNavigationRevoked: true,
     forgedThreadOpened: false,
     injectionError: null,
+    destination: {
+      homeSelected: false,
+      homeBackground: "0",
+      entrySelected: true,
+      sidebarVisibility: "hidden",
+      railVisibility: "visible",
+      railPointerEvents: "auto",
+      pageLeft: 64,
+      railRight: 64,
+    },
+    restored: {
+      pageHidden: true,
+      homeSelected: true,
+      homeCurrent: "page",
+      entrySelected: false,
+      sidebarVisibility: "visible",
+      contentVisibility: "visible",
+    },
   });
 });
