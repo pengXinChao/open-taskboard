@@ -60,6 +60,8 @@ test("configures Jira Cloud and force-syncs all enhanced-search pages", async ()
       syncCalls.push({ tasks, options });
     },
     upsertJiraAttachments() {},
+    getTask(id) { return syncCalls.at(-1).tasks.find((task) => task.id === id); },
+    upsertJiraComments() { return []; },
   };
 
   const fetch = async (url, init) => {
@@ -76,6 +78,9 @@ test("configures Jira Cloud and force-syncs all enhanced-search pages", async ()
     }
     if (pathname === "/rest/api/2/myself") {
       return response({ displayName: "Test Reader" });
+    }
+    if (pathname.endsWith("/comment")) {
+      return response({ startAt: 0, total: 0, comments: [] });
     }
     if (pathname === "/rest/api/2/search") {
       return response(null, 410);

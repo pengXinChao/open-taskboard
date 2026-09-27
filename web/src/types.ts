@@ -479,6 +479,8 @@ export interface Comment {
   threadBinding: CodexThreadBinding | null;
   legacyLocalThreadId: string | null;
   agentSession?: AgentSession | null;
+  /** 关联远端的评论只读；缺省/空值表示仅本地评论。 */
+  jira?: { origin: string; issueId: string; remoteId: string; url: string } | null;
   attachments: Attachment[];
   version: number;
   createdAt: string;

@@ -10003,3 +10003,16 @@ kbd {
 .task-card-jira-type.issue-type-improvement,
 .issue-list-jira-type.issue-type-improvement,
 .codex-launch-type.issue-type-improvement { color: #267f86; border-color: color-mix(in srgb, #267f86 42%, var(--border)); background: color-mix(in srgb, #267f86 10%, transparent); }
+
+/* 明示远端副作用及评论来源，沿用现有详情页的轻量文字层级。 */
+.jira-comment-notice {
+  margin: 4px 16px 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.comment-header .jira-comment-link,
+.comment-header .comment-local-label {
+  color: var(--text-secondary);
+  font-size: 11px;
+}

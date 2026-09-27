@@ -123,10 +123,17 @@ export function parseRelationMutation(body) {
   };
 }
 
-export function parseCommentCreate(body) {
+// 只有本地 Jira 集成接受发布选项；云端不接受该字段，避免静默降级为仅本地。
+export function parseCommentCreate(body, { allowJiraPublish = false } = {}) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["body", "threadId", "threadBinding", "agentSession"]));
+  assertAllowedKeys(body, new Set(["body", "threadId", "threadBinding", "agentSession",
+    ...(allowJiraPublish ? ["publishToJira"] : []),
+  ]));
+  if (allowJiraPublish && body.publishToJira !== undefined && typeof body.publishToJira !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "publishToJira 必须是布尔值");
+  }
   return {
+    ...(allowJiraPublish ? { publishToJira: body.publishToJira === true } : {}),
     body: stringField(body.body ?? "", "body", { maxLength: 100_000 }),
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),

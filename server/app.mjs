@@ -1421,6 +1421,7 @@ export function createTaskboardServer(options = {}) {
     configStore: jiraConfig,
     database,
     fetch: options.jiraFetch ?? globalThis.fetch,
+    onCommentsChanged: (task) => events.emit("comment.updated", { task }),
   });
   let hostRuntime = null;
   function currentHostThreadBinding(threadId) {
@@ -2617,10 +2618,10 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Comment routes do not accept query parameters");
         }
         if (request.method === "POST") {
-          const comment = database.createComment(taskId, {
-            ...resolveInputThreadBinding(parseCommentCreate(await readJson(request))),
-            actor: actorFromRequest(request),
-          });
+          const input = resolveInputThreadBinding(parseCommentCreate(await readJson(request), { allowJiraPublish: true }));
+          const comment = input.publishToJira
+            ? await jira.publishComment(taskId, input.body)
+            : database.createComment(taskId, { ...input, actor: actorFromRequest(request) });
           const task = database.getTask(taskId);
           events.emit("comment.created", { comment, task });
           return sendJson(response, 201, { comment });
@@ -2698,6 +2699,7 @@ export function createTaskboardServer(options = {}) {
         if (request.method === "POST") {
           const comment = database.getComment(commentId);
           if (!comment) throw new ApiError(404, "COMMENT_NOT_FOUND", `Comment '${commentId}' does not exist`);
+          if (comment.jira) throw new ApiError(409, "JIRA_COMMENT_READ_ONLY", "请前往 Jira 操作此评论；暂不支持追加附件");
           const metadata = parseAttachmentHeaders(request);
           const body = await readBody(request, ATTACHMENT_BODY_LIMIT, "Attachment cannot exceed 25 MiB");
           const id = randomUUID();

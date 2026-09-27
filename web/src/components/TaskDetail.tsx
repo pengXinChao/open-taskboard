@@ -509,6 +509,7 @@ export function TaskDetail({
   // from the document the user started editing. That still needs a body PATCH.
   const descriptionEditValueRef = useRef("");
   const commentEditValueRef = useRef("");
+  const publishCommentToJira = currentTask.source === "jira";
   const draft = serializeInlineMedia(commentSegments);
   const commentInlineImages = inlineMediaImages(commentSegments);
   const commentInlineFiles = inlineMediaFiles(commentSegments);
@@ -896,12 +897,16 @@ export function TaskDetail({
   async function submitComment() {
     const body = draft.trim();
     if ((!body && commentInlineImages.length === 0 && commentInlineFiles.length === 0) || submitting) return;
+    if (publishCommentToJira && (commentInlineImages.length || commentInlineFiles.length)) {
+      setCommentsError(text("Jira 评论暂不支持图片和文件，请仅输入正文。", "Jira comments currently support text only."));
+      return;
+    }
     setSubmitting(true);
     setCommentsError(null);
     try {
       if (!pendingCommentRef.current) {
         pendingCommentRef.current = {
-          comment: await createComment(task.id, body),
+          comment: await createComment(task.id, body, undefined, undefined, publishCommentToJira),
           uploadedAttachments: new Map(),
         };
       }
@@ -1461,6 +1466,10 @@ export function TaskDetail({
                     );
                   }
                   const comment = item.comment;
+                  // Jira 同步元数据也会增加本地版本号，编辑标记应比较远端的创建/更新时间。
+                  const commentEdited = comment.jira
+                    ? Date.parse(comment.updatedAt) > Date.parse(comment.createdAt)
+                    : comment.version > 1;
                   const commentBody = appendUnreferencedAttachments(comment.body, comment.attachments);
                   const commentActor: ActorIdentity = comment.authorType === currentUser.type
                     && comment.authorId === currentUser.id
@@ -1485,7 +1494,15 @@ export function TaskDetail({
                         />
                         <strong>{commentActor.name}</strong>
                         <time title={exactTime(comment.createdAt, locale)}>{relativeTime(comment.createdAt, locale)}</time>
-                        {comment.version > 1 && (
+                        {comment.jira ? (
+                          <a className="jira-comment-link" href={comment.jira.url} target="_blank" rel="noreferrer"
+                            title={text("请前往 Jira 编辑或删除此评论", "Edit or delete this comment in Jira")}>
+                            {text("Jira 评论 ↗", "Jira comment ↗")}
+                          </a>
+                        ) : publishCommentToJira && (
+                          <span className="comment-local-label">{text("仅本地", "Local only")}</span>
+                        )}
+                        {commentEdited && (
                           <span
                             className="comment-edited"
                             title={text(
@@ -1496,7 +1513,7 @@ export function TaskDetail({
                             {text("已编辑", "Edited")}
                           </span>
                         )}
-                        {editingId !== comment.id && (
+                        {!comment.jira && editingId !== comment.id && (
                           <div className="comment-actions" data-comment-menu-root={comment.id}>
                             <button
                               type="button"
@@ -1669,6 +1686,11 @@ export function TaskDetail({
                   />
                   <strong>{currentUser.name}</strong>
                 </div>
+                {publishCommentToJira && (
+                  <p className="jira-comment-notice">
+                    {text("此评论将同步到 Jira（使用已配置的 Jira 账号）；暂不支持图片和文件。", "This comment will be posted to Jira using the configured account. Images and files are not supported yet.")}
+                  </p>
+                )}
                 <InlineMediaComposer
                   ref={composerRef}
                   className="comment-inline-media"
@@ -1682,13 +1704,15 @@ export function TaskDetail({
                   }}
                   placeholder={text("留下评论…", "Leave a comment…")}
                   ariaLabel={text("留下评论", "Leave a comment")}
-                  allowAttachments
+                  allowAttachments={!publishCommentToJira}
+                  allowImages={!publishCommentToJira}
                   onChange={setCommentSegments}
                   onError={setCommentsError}
                   onKeyDown={handleSubmitShortcut}
                 />
                 <footer className="composer-footer">
                   <div className="composer-footer-leading">
+                    {!publishCommentToJira && <>
                     <button
                       className="comment-attach-button"
                       type="button"
@@ -1711,6 +1735,7 @@ export function TaskDetail({
                         event.currentTarget.value = "";
                       }}
                     />
+                    </>}
                   </div>
                   <div>
                     <div className="comment-status-action">

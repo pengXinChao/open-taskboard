@@ -173,7 +173,13 @@ function safeConfig(config, lastSyncedAt = null) {
     };
 }
 
-export function createJiraIntegration({ configStore, database, fetch: fetchImplementation = globalThis.fetch }) {
+/**
+ * 创建共享 Jira 连接的同步/发布入口；onCommentsChanged 在拉取实际改变本地评论后通知界面。
+ * 评论发布与拉取使用同一串行队列，调用失败向上返回，绝不自动重试发布。
+ */
+export function createJiraIntegration({ configStore, database, fetch: fetchImplementation = globalThis.fetch,
+  onCommentsChanged = () => {},
+}) {
   let lastSyncedAt = null;
   let pendingSync = null;
   let pendingOperation = Promise.resolve();
@@ -300,6 +306,53 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
     return issues;
   }
 
+  // 使用 REST v2 的文本正文；缺少稳定 ID 或非文本正文时不静默丢失内容。
+  function normalizeComment(comment) {
+    if (!comment?.id || typeof comment.body !== "string"
+      || !Number.isFinite(Date.parse(comment.created)) || !Number.isFinite(Date.parse(comment.updated))) {
+      throw new ApiError(502, "INVALID_JIRA_RESPONSE", "Jira 评论缺少身份、时间或文本正文");
+    }
+    return {
+      remoteId: String(comment.id), body: comment.body,
+      author: actorFromJira(comment.author, "Jira 用户"),
+      createdAt: new Date(comment.created).toISOString(), updatedAt: new Date(comment.updated).toISOString(),
+    };
+  }
+
+  async function syncComments(config, issues) {
+    const failures = [];
+    for (const issue of issues) {
+      try {
+        const comments = [];
+        let startAt = 0;
+        while (true) {
+          const page = await request(config,
+            `/rest/api/2/issue/${encodeURIComponent(issue.externalId)}/comment?startAt=${startAt}&maxResults=100`);
+          if (!Array.isArray(page?.comments) || !Number.isInteger(page.total) || page.total < 0
+            || (page.startAt !== undefined && page.startAt !== startAt)) {
+            throw new ApiError(502, "INVALID_JIRA_RESPONSE", "Jira 评论分页数据无效");
+          }
+          comments.push(...page.comments.map(normalizeComment));
+          startAt += page.comments.length;
+          if (startAt >= page.total) break;
+          if (page.comments.length === 0) {
+            throw new ApiError(502, "INVALID_JIRA_RESPONSE", "Jira 评论分页未完整返回");
+          }
+        }
+        // 通过稳定标识解析本地任务，兼容已有任务 ID 与 Jira 标识不同的情况。
+        const task = database.getTask(issue.identifier);
+        const changed = database.upsertJiraComments(task.id, comments);
+        if (changed.length) onCommentsChanged(task);
+      } catch (error) {
+        failures.push(`${issue.externalKey}: ${error.message}`);
+      }
+    }
+    if (failures.length) {
+      throw new ApiError(502, "JIRA_COMMENT_SYNC_FAILED",
+        `任务数据已拉取，但评论同步失败；已有评论保留。${failures.join("；")}`);
+    }
+  }
+
   async function fetchOriginId(config) {
     return jiraOriginId(await request(config, "/rest/applinks/1.0/manifest"));
   }
@@ -346,6 +399,7 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       database.upsertJiraAttachments(issue.id, issue.jiraAttachments);
     }
     if (storedConfig.version === 1) config = await configStore.save(config);
+    await syncComments(config, normalizedIssues);
     lastSyncedAt = new Date().toISOString();
     return safeConfig(config, lastSyncedAt);
   }
@@ -493,6 +547,7 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
           database.upsertJiraAttachments(issue.id, issue.jiraAttachments);
         }
         const savedConfig = await configStore.save(config);
+        await syncComments(savedConfig, normalizedIssues);
         lastSyncedAt = new Date().toISOString();
         return safeConfig(savedConfig, lastSyncedAt);
       });
@@ -505,6 +560,43 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
           throw new ApiError(409, "JIRA_NOT_CONFIGURED", "Jira 尚未完成稳定身份配置");
         }
         return syncWithConfig(config, { archiveMissing: false });
+      });
+    },
+    /** 发布用户明确选择的文本评论；先远端创建再入库，不自动重试非幂等的 POST。 */
+    async publishComment(taskId, body) {
+      return runInOrder(async () => {
+        const task = database.getTask(taskId);
+        const config = await configStore.read();
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", "任务不存在");
+        if (task.source !== "jira") throw new ApiError(409, "JIRA_TASK_REQUIRED", "只有 Jira 任务可发布远程评论");
+        if (!config) throw new ApiError(409, "JIRA_NOT_CONFIGURED", "Jira 尚未配置");
+        if (task.externalOrigin !== config.originId || !task.externalKey) {
+          throw new ApiError(409, "JIRA_ORIGIN_MISMATCH", "此任务不属于当前 Jira 连接，请重新同步后再操作");
+        }
+        if (!body.trim()) throw new ApiError(400, "INVALID_FIELD", "Jira 评论正文不能为空");
+        // 本地附件 URL 无法被 Jira 读者访问；首版只允许文本，不发布本地附件引用。
+        if (/\bapi\/attachments\//i.test(body)) {
+          throw new ApiError(400, "JIRA_COMMENT_ATTACHMENT_UNSUPPORTED", "暂不支持向 Jira 评论发布本地附件地址");
+        }
+        await assertLiveOrigin(config);
+        let remote;
+        try {
+          remote = await request(config, `/rest/api/2/issue/${encodeURIComponent(task.externalKey)}/comment`, {
+            method: "POST", body: JSON.stringify({ body }),
+          });
+        } catch (error) {
+          // 网络中断、5xx 或响应解析失败时，远端可能已创建，不能提示安全重试。
+          if (error.status >= 500 || ["JIRA_TIMEOUT", "JIRA_UNAVAILABLE", "INVALID_JIRA_RESPONSE"].includes(error.code)) {
+            throw new ApiError(502, "JIRA_COMMENT_RESULT_UNKNOWN", "发布结果未确认，请刷新 Jira 后核对；不要直接重复提交");
+          }
+          throw error;
+        }
+        try {
+          const [comment] = database.upsertJiraComments(task.id, [normalizeComment(remote)]);
+          return comment;
+        } catch {
+          throw new ApiError(502, "JIRA_COMMENT_LOCAL_SAVE_FAILED", "远程已发布，但本地保存失败；请同步评论补齐，不要重复提交");
+        }
       });
     },
     async updateTask(task, changes) {

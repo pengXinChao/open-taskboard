@@ -148,6 +148,12 @@ function commentFromRow(row) {
     authorId: row.author_id,
     authorName: row.author_name,
     authorAvatarUrl: row.author_avatar_url,
+    jira: row.jira_comment_id ? {
+      origin: row.jira_origin,
+      issueId: row.jira_issue_id,
+      remoteId: row.jira_comment_id,
+      url: row.jira_url,
+    } : null,
     attachments: [],
     version: row.version,
     createdAt: row.created_at,
@@ -721,6 +727,17 @@ export class TaskboardDatabase {
     }
 
     const commentColumns = this.database.prepare("PRAGMA table_info(comments)").all();
+    // 历史评论保持 NULL；远端身份只用于拉取去重，不会把本地记录补发到 Jira。
+    for (const column of ["jira_origin", "jira_issue_id", "jira_comment_id", "jira_url"]) {
+      if (!commentColumns.some((candidate) => candidate.name === column)) {
+        this.database.exec(`ALTER TABLE comments ADD COLUMN ${column} TEXT`);
+      }
+    }
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS comments_jira_identity
+      ON comments (jira_origin, jira_issue_id, jira_comment_id)
+      WHERE jira_comment_id IS NOT NULL
+    `);
     if (!commentColumns.some((column) => column.name === "agent_session")) {
       this.database.exec("ALTER TABLE comments ADD COLUMN agent_session TEXT");
     }
@@ -2449,6 +2466,62 @@ export class TaskboardDatabase {
     return this.#commentsWithAttachments(rows);
   }
 
+  /**
+   * 将同一 Jira 任务的一批远端评论写入本地，返回变化记录供界面刷新。
+   * 远端身份跨拉取/发布共用；不处理远端删除，不触发任何远端写入。
+   */
+  upsertJiraComments(taskId, comments) {
+    const task = this.#requireTask(taskId);
+    const externalId = this.#findTaskRow(task.id).external_id;
+    if (task.source !== "jira" || !task.externalOrigin || !externalId) {
+      throw new ApiError(409, "JIRA_TASK_REQUIRED", "此任务不是已关联的 Jira 任务");
+    }
+    const changed = [];
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const comment of comments) {
+        const existing = this.database.prepare(`
+          SELECT * FROM comments WHERE jira_origin = ? AND jira_issue_id = ? AND jira_comment_id = ?
+        `).get(task.externalOrigin, externalId, comment.remoteId);
+        const url = `${task.externalUrl}?focusedCommentId=${encodeURIComponent(comment.remoteId)}`;
+        const values = [comment.body, comment.author.id, comment.author.name, comment.author.avatarUrl,
+          comment.createdAt, comment.updatedAt, url];
+        if (existing && JSON.stringify(values) === JSON.stringify([
+          existing.body, existing.author_id, existing.author_name, existing.author_avatar_url,
+          existing.created_at, existing.updated_at, existing.jira_url,
+        ])) continue;
+        const id = existing?.id ?? randomUUID();
+        const revision = this.#nextCommentAttachmentRevision();
+        if (existing) {
+          this.database.prepare(`
+            UPDATE comments SET body = ?, author_id = ?, author_name = ?, author_avatar_url = ?,
+              created_at = ?, updated_at = ?, jira_url = ?, version = version + 1, change_revision = ?
+            WHERE id = ?
+          `).run(...values, revision, id);
+        } else {
+          this.database.prepare(`
+            INSERT INTO comments (body, author_id, author_name, author_avatar_url, created_at, updated_at,
+              jira_url, id, task_id, author_type, version, change_revision, jira_origin, jira_issue_id, jira_comment_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'user', 1, ?, ?, ?, ?)
+          `).run(...values, id, task.id, revision, task.externalOrigin, externalId, comment.remoteId);
+        }
+        changed.push(id);
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return changed.map((id) => this.getComment(id));
+  }
+
+  // 远端评论以 Jira 为准，阻止本地编辑/删除制造不再同步的副本。
+  #requireLocalComment(comment) {
+    if (comment.jira) {
+      throw new ApiError(409, "JIRA_COMMENT_READ_ONLY", "请前往 Jira 编辑或删除此评论；暂不支持追加附件");
+    }
+  }
+
   createComment(taskId, input) {
     const id = randomUUID();
     const timestamp = now();
@@ -2501,6 +2574,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const current = this.#requireComment(id);
+      this.#requireLocalComment(current);
       this.#requireCommentVersion(current, version);
       const changeRevision = this.#nextCommentAttachmentRevision();
       const result = this.database.prepare(`
@@ -2523,6 +2597,7 @@ export class TaskboardDatabase {
 
   deleteComment(id, version) {
     const current = this.#requireComment(id);
+    this.#requireLocalComment(current);
     this.#requireCommentVersion(current, version);
     const result = this.database.prepare(`
       DELETE FROM comments WHERE id = ? AND version = ?
@@ -2640,6 +2715,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const comment = this.#requireComment(commentId);
+      this.#requireLocalComment(comment);
       const changeRevision = this.#nextCommentAttachmentRevision();
       this.database.prepare(`
         INSERT INTO attachments (

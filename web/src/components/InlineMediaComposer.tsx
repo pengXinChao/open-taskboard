@@ -113,6 +113,8 @@ export interface InlineMediaComposerProps {
   ariaLabel: string;
   disabled?: boolean;
   allowAttachments?: boolean;
+  /** 纯文本发布入口关闭图片；默认保留其他编辑器现有的粘贴/拖入图片能力。 */
+  allowImages?: boolean;
   className?: string;
   onChange: (segments: InlineMediaSegment[]) => void;
   onError: (message: InlineMediaError | null) => void;
@@ -1108,6 +1110,7 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
     ariaLabel,
     disabled = false,
     allowAttachments = false,
+    allowImages = true,
     className = "",
     onChange,
     onError,
@@ -1124,6 +1127,7 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
     const requestSequence = useRef(0);
     const disabledRef = useRef(disabled);
     const allowAttachmentsRef = useRef(allowAttachments);
+    const allowImagesRef = useRef(allowImages);
     const mentionTasksRef = useRef(mentionTasks);
     const referenceTasksRef = useRef(referenceTasks);
     const completionContextRef = useRef(completionContext);
@@ -1143,6 +1147,7 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
 
     disabledRef.current = disabled;
     allowAttachmentsRef.current = allowAttachments;
+    allowImagesRef.current = allowImages;
     mentionTasksRef.current = mentionTasks;
     referenceTasksRef.current = referenceTasks;
     completionContextRef.current = completionContext;
@@ -1387,8 +1392,12 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
     function insertFiles(files: FileList | File[], position?: number): void {
       const view = viewRef.current;
       if (!view || disabledRef.current) return;
+      if (!allowImagesRef.current && !allowAttachmentsRef.current) {
+        onErrorRef.current(["Jira 评论暂不支持图片和文件，请仅输入正文。", "Jira comments support text only; images and files are not supported yet."]);
+        return;
+      }
       const selected = Array.from(files).filter((file) => (
-        file.type.startsWith("image/") || allowAttachmentsRef.current
+        file.type.startsWith("image/") ? allowImagesRef.current : allowAttachmentsRef.current
       ));
       if (selected.length === 0) return;
 

@@ -696,24 +696,39 @@ export async function listTaskActivities(
   return data.activities;
 }
 
+/** 创建评论；publishToJira 仅由 Jira 任务的用户提交开启，成功时返回远端关联记录。 */
 export async function createComment(
   taskId: string,
   body: string,
   threadId?: string,
   threadBinding?: CodexThreadBinding | null,
+  publishToJira = false,
 ): Promise<Comment> {
-  const data = await request<{ comment: Comment }>(
-    `/api/tasks/${encodeURIComponent(taskId)}/comments`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        body,
-        ...(threadId ? { threadId } : {}),
-        ...(threadBinding === undefined ? {} : { threadBinding }),
-      }),
-    },
-  );
-  return data.comment;
+  try {
+    const data = await request<{ comment: Comment }>(
+      `/api/tasks/${encodeURIComponent(taskId)}/comments`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          body,
+          ...(threadId ? { threadId } : {}),
+          ...(threadBinding === undefined ? {} : { threadBinding }),
+          ...(publishToJira ? { publishToJira: true } : {}),
+        }),
+      },
+    );
+    return data.comment;
+  } catch (error) {
+    // 浏览器与本地服务断线也可能发生在 Jira 已写入之后，不能建议直接重发。
+    if (publishToJira && error instanceof ApiError && error.status === 0) {
+      throw new ApiError(0, { error: {
+        code: "JIRA_COMMENT_RESULT_UNKNOWN",
+        message: apiText("发布结果未确认，请刷新 Jira 后核对；不要直接重复提交",
+          "Posting result is unknown. Check Jira before submitting again."),
+      } });
+    }
+    throw error;
+  }
 }
 
 export async function updateComment(comment: Comment, body: string, threadId?: string): Promise<Comment> {
