@@ -1619,10 +1619,10 @@ export function App() {
     setLaunchTaskId(task.id);
   }
 
-  function startTaskLaunch(task: Task, context: DevelopmentContext) {
+  function startTaskLaunch(task: Task, context: DevelopmentContext, workspace: CodexWorkspaceOption) {
     setLaunchTaskId(null);
     void updateTaskProperties(task, { developmentContext: context }).then((updated) => {
-      openTaskInThread(updated);
+      openTaskInThread(updated, workspace);
     });
   }
 
@@ -2799,7 +2799,8 @@ export function App() {
     ));
 
     try {
-      const updated = await updateTaskRequest(task, { ...taskToDraft(task), ...changes });
+      // 只提交本次修改的属性，避免未编辑的 Jira 描述经规范化后被误判为同时变更。
+      const updated = await updateTaskRequest(task, changes);
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === updated.id ? updated : candidate,
       )));
@@ -3132,17 +3133,25 @@ export function App() {
     return liveProject ? baseIdentity : null;
   }
 
-  async function openTaskInThread(task: Task) {
+  async function openTaskInThread(task: Task, selectedWorkspace?: CodexWorkspaceOption) {
     const standalone = !embedded || window.parent === window;
-    const projectless = task.projectId === GLOBAL_PROJECT_ID;
+    const projectless = !selectedWorkspace && task.projectId === GLOBAL_PROJECT_ID;
     const taskboardProject = projects.find((project) => project.id === task.projectId);
     const savedRemoteIdentity = projectCodexIdentities[task.projectId]?.codexProjectKind === "remote"
       ? projectCodexIdentities[task.projectId]
       : null;
-    let codexProjectContext = savedRemoteIdentity
-      ?? codexProjectContextForTaskProject(task.projectId);
+    // 卡片明确选择的项目身份和目录必须一起传递，不能被任务原项目的映射覆盖。
+    let codexProjectContext = selectedWorkspace
+      ? {
+          codexProjectId: selectedWorkspace.id,
+          codexProjectKind: selectedWorkspace.projectKind,
+          codexHostId: selectedWorkspace.hostId ?? "local",
+          workspacePath: selectedWorkspace.workspacePath,
+        }
+      : savedRemoteIdentity ?? codexProjectContextForTaskProject(task.projectId);
     if (
-      projectCodexIdentities[task.projectId]?.codexProjectKind === "remote"
+      !selectedWorkspace
+      && projectCodexIdentities[task.projectId]?.codexProjectKind === "remote"
       && !codexProjectContext
     ) {
       setActionError(text(
@@ -3167,13 +3176,13 @@ export function App() {
       }
       codexProjectContext = identity;
     }
-    let workspacePath = projectless
+    let workspacePath = selectedWorkspace?.workspacePath ?? (projectless
       ? undefined
       : task.developmentContext?.type === "worktree"
         ? task.developmentContext.path
         : codexProjectContext?.workspacePath
           ?? deviceWorkspacePaths[task.projectId]
-          ?? taskboardProject?.workspacePath;
+          ?? taskboardProject?.workspacePath);
     // Jira 只预填分析目标，不引入 Taskboard 执行管理；会话绑定仍使用独立传递的内部任务 ID。
     const embeddedInstruction = task.source === "jira"
       ? [
@@ -3187,8 +3196,10 @@ export function App() {
         `[$manage-taskboard](${manageTaskboardSkillPath}) Issue ID: ${task.identifier}`,
       );
 
+    // 仅对没有本次显式选择的历史 worktree 做回退；新选项目不属于原项目的扫描范围。
     if (
-      !projectless
+      !selectedWorkspace
+      && !projectless
       && task.developmentContext?.type === "worktree"
       && codexProjectContext?.codexProjectKind !== "remote"
     ) {

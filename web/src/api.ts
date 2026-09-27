@@ -577,7 +577,8 @@ export async function createTask(projectId: string, draft: TaskDraft, threadId?:
   return data.task;
 }
 
-export async function updateTask(task: Task, draft: TaskDraft, threadId?: string): Promise<Task> {
+/** 以当前版本号提交指定字段，未传字段保持不变；返回更新后的任务，冲突或校验失败时抛出 ApiError。 */
+export async function updateTask(task: Task, draft: Partial<TaskDraft>, threadId?: string): Promise<Task> {
   const data = await request<{ task: Task }>(`/api/tasks/${encodeURIComponent(task.id)}`, {
     method: "PATCH",
     body: JSON.stringify({ version: task.version, ...draft, ...(threadId ? { threadId } : {}) }),

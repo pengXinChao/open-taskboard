@@ -11,7 +11,8 @@ interface CodexLaunchDialogProps {
   developmentScanLoading: boolean;
   opening: boolean;
   onClose: () => void;
-  onStart: (task: Task, context: DevelopmentContext) => void;
+  /** 提交任务、开发上下文和所选项目身份，由调用方保存并启动会话。 */
+  onStart: (task: Task, context: DevelopmentContext, workspace: CodexWorkspaceOption) => void;
 }
 
 export function CodexLaunchDialog({
@@ -93,7 +94,7 @@ export function CodexLaunchDialog({
         </div>
         <footer className="codex-launch-footer">
           <button className="button" type="button" onClick={onClose}>{text("取消", "Cancel")}</button>
-          <button className="button primary" type="button" disabled={!context || opening} onClick={() => context && onStart(task, context)}>{opening ? text("正在打开…", "Opening…") : text("在新会话中开始", "Start new conversation")}</button>
+          <button className="button primary" type="button" disabled={!context || opening} onClick={() => context && selected && onStart(task, context, selected)}>{opening ? text("正在打开…", "Opening…") : text("在新会话中开始", "Start new conversation")}</button>
         </footer>
       </div>
     </dialog>
