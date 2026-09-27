@@ -3174,9 +3174,14 @@ export function App() {
         : codexProjectContext?.workspacePath
           ?? deviceWorkspacePaths[task.projectId]
           ?? taskboardProject?.workspacePath;
-    // 提示词给 Agent 用；会话绑定仍使用独立传递的内部任务 ID。
-    const embeddedInstruction = task.source === "jira" && task.externalUrl
-      ? `[$manage-taskboard](${manageTaskboardSkillPath}) Jira:${task.externalUrl}`
+    // Jira 只预填分析目标，不引入 Taskboard 执行管理；会话绑定仍使用独立传递的内部任务 ID。
+    const embeddedInstruction = task.source === "jira"
+      ? [
+        `Jira:${task.externalUrl || task.identifier}`,
+        task.issueType === "故障"
+          ? "根据 Jira 描述、评论及相关附件，结合本地代码核实问题是否存在，并定位原因。区分已确认的事实与待验证的推测，给出关键依据；信息不足时说明缺口。本轮仅分析，不修改代码，不变更任务状态或回写评论。"
+          : "根据 Jira 描述、评论及相关附件分析需求；如果是子任务，请读取父任务补充上下文。梳理需求目标、范围、验收条件及待澄清问题，区分 Jira 已明确的要求与推测。本轮仅分析，不修改代码，不变更任务状态或回写评论。",
+      ].join("\n")
       : text(
         `[$manage-taskboard](${manageTaskboardSkillPath}) 议题 ID：${task.identifier}`,
         `[$manage-taskboard](${manageTaskboardSkillPath}) Issue ID: ${task.identifier}`,
