@@ -95,6 +95,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       && (
         currentUserActor.avatarUrl.startsWith("https://")
         || currentUserActor.avatarUrl.startsWith("http://")
+        || /^data:image\/webp;base64,[A-Za-z0-9+/]+={0,2}$/.test(currentUserActor.avatarUrl)
       )
     ) {
       headers.set("X-Taskboard-User-Avatar", currentUserActor.avatarUrl);

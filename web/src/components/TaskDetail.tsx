@@ -900,7 +900,7 @@ export function TaskDetail({
       setCommentSegments(createInlineMediaSegments());
       if (commentAttachmentInputRef.current) commentAttachmentInputRef.current.value = "";
       let relationAnchor = await getTask(currentTask.id);
-      if (changeStatusToTodo) {
+      if (changeStatusToTodo && relationAnchor.status !== "todo") {
         const saved = await onUpdate(relationAnchor, { status: "todo" });
         setCurrentTask(saved);
         relationAnchor = saved;
@@ -1631,7 +1631,7 @@ export function TaskDetail({
                     />
                   </div>
                   <div>
-                    <div className="comment-status-action">
+                    {currentTask.status !== "todo" && <div className="comment-status-action">
                       <span>{text("改变状态为-等待认领", "Change status to Todo")}</span>
                       <button
                         type="button"
@@ -1643,7 +1643,7 @@ export function TaskDetail({
                       >
                         <span aria-hidden="true" />
                       </button>
-                    </div>
+                    </div>}
                     <button
                       className="button primary"
                       type="submit"

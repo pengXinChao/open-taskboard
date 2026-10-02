@@ -45,7 +45,7 @@ test("entry clones the native Explore rail button and the page covers the comple
   assert.match(source, /document\.querySelector\("\.app-shell-main-content-frame"\)/);
   assert.match(source, /const surface = viewport\?\.closest\("\[data-app-shell-workspace-row\]"\)/);
   assert.match(source, /surface\.appendChild\(page\)/);
-  assert.match(source, /#\$\{PAGE_ID\} \{[\s\S]*?top: 0;/);
+  assert.match(source, /#\$\{PAGE_ID\} \{[\s\S]*?top: var\(--app-shell-titlebar-height, 0px\);/);
   assert.doesNotMatch(source, /--codex-taskboard-top-offset/);
   assert.match(source, /child\.setAttribute\(HIDDEN_ATTRIBUTE, "true"\)/);
   assert.match(source, /page\.hidden = false/);
@@ -110,19 +110,18 @@ test("entry recognizes the Explore rail labels", () => {
   }
 });
 
-test("opening Taskboard suppresses native selection and contextual header until close", () => {
-  assert.match(source, /aside nav\[role="navigation"\] \[aria-current\]/);
-  assert.match(source, /node\.removeAttribute\("aria-current"\)/);
-  assert.match(source, /NATIVE_SELECTED_ATTRIBUTE/);
-  assert.match(source, /app-shell-header-context-menu-surface/);
-  assert.match(source, /restoreNativeSelection\(\)/);
-  assert.match(source, /function onDocumentClick[\s\S]*closeTaskboard\(false\);/);
-  assert.doesNotMatch(source, /setTimeout\(\(\) => closeTaskboard\(false\), 0\)/);
+test("opening Taskboard preserves native selection and the titlebar", () => {
+  assert.doesNotMatch(source, /mutedNativeSelections|hideNativeHeader/);
+  assert.doesNotMatch(source, /node\.removeAttribute\("aria-current"\)/);
+  assert.match(source, /syncNativeRailIcons\(\)/);
+  assert.match(source, /restoreNativeRailIcons\(\)/);
+  assert.match(source, /destination\?\.getAttribute\("aria-current"\) === "page"/);
+  assert.match(source, /function onDocumentClick[\s\S]*event\.stopPropagation\(\)[\s\S]*closeTaskboard\(false\);/);
 });
 
-test("the embedded header fills the native titlebar without clipping or a full-page no-drag region", () => {
-  assert.match(source, /top: 0;/);
-  assert.match(source, /z-index: 31 !important/);
+test("the embedded page sits below the native titlebar without a full-page no-drag region", () => {
+  assert.match(source, /top: var\(--app-shell-titlebar-height, 0px\);/);
+  assert.doesNotMatch(source, /z-index: 31 !important/);
   assert.doesNotMatch(source, /headerRightInset/);
   assert.doesNotMatch(source, /NATIVE_HEADER_RIGHT_INSET/);
   assert.doesNotMatch(source, /clip-path: polygon/);
@@ -193,7 +192,7 @@ test("the injected iframe can be cache-busted without reloading the Codex shell"
   assert.match(source, /reloadFrame,/);
 });
 
-test("reopening reuses a ready cache-busted iframe without showing the startup placeholder", () => {
+test("reopening captures the current identity before showing a reused cache-busted iframe", () => {
   assert.match(source, /function frameMatchesTaskboardUrl\(taskboardUrl\)/);
   assert.match(source, /loadedUrl\.searchParams\.delete\(FRAME_REFRESH_PARAM\)/);
   assert.match(source, /expectedUrl\.searchParams\.delete\(FRAME_REFRESH_PARAM\)/);
@@ -201,13 +200,12 @@ test("reopening reuses a ready cache-busted iframe without showing the startup p
     source.indexOf("async function prepareTaskboard"),
     source.indexOf("function restoreNativeContent"),
   );
-  assert.match(prepareSource, /const canReuseFrame = Boolean\([\s\S]*frameMatchesTaskboardUrl\(taskboardUrl\)/);
-  assert.match(prepareSource, /if \(canReuseFrame\) showFrame\(\);\s*else showLoading\(\);/);
+  assert.match(prepareSource, /showLoading\(\);[\s\S]*captureHostContext\(\),/);
+  assert.match(prepareSource, /currentCodexUser = context\.user;[\s\S]*showFrame\(\);/);
   assert.match(
     prepareSource,
     /if \(!frameReady \|\| result\.restarted \|\| !frameMatchesTaskboardUrl\(taskboardUrl\)\) \{\s*showLoading\(\);/,
   );
-  assert.doesNotMatch(prepareSource, /async function prepareTaskboard\(generation\) \{\s*showLoading\(\);/);
 });
 
 test("opaque iframe messages require the current document capability", () => {

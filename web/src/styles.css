@@ -5433,68 +5433,76 @@ kbd {
   border-radius: 9999px;
 }
 
-.toast {
+/* Capsule notifications share one stack for messages and undo actions. */
+.toast-stack {
   position: fixed;
   z-index: 100;
-  bottom: 18px;
   left: 50%;
+  bottom: 18px;
+  width: min(512px, calc(100vw - 32px));
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.toast-slot {
+  position: absolute;
+  inset: auto 0 0;
+  display: flex;
+  justify-content: center;
+  transform: translateY(calc(-1 * var(--toast-offset))) scale(var(--toast-scale));
+  transform-origin: bottom center;
+  transition: transform 220ms ease, opacity 180ms ease;
+  animation: toast-enter 220ms ease both;
+}
+.toast-stack.is-expanded { pointer-events: auto; }
+.toast-pill {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 9px;
-  border: var(--border-hairline) solid var(--border-strong);
-  border-radius: 6px;
-  background: var(--text-primary);
-  color: var(--bg);
-  font-size: 10px;
-  font-weight: 500;
-  box-shadow: var(--dialog-shadow);
-  transform: translateX(-50%);
+  height: 36px;
+  max-width: 100%;
+  gap: 8px;
+  padding: 0 14px 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--surface-raised) 88%, transparent);
+  color: var(--text-primary);
+  box-shadow: 0 3px 12px #0002, inset 0 1px 0 #ffffff14;
+  backdrop-filter: blur(14px);
+  font-size: 12px;
+  pointer-events: auto;
+  touch-action: none;
+  cursor: grab;
 }
-
-.toast {
-  animation: toast-life 3.4s ease both;
+.toast-pill:active { cursor: grabbing; }
+.toast-pill.is-behind { pointer-events: none; }
+.toast-pill.is-behind > * { visibility: hidden; }
+.toast-mark {
+  display: grid;
+  place-items: center;
+  flex: 0 0 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--success);
+  color: var(--surface-raised);
 }
-
-.toast > span:first-child {
-  color: var(--success);
-}
-
-.undo-toast {
-  gap: 7px;
-  animation: toast-life 5.5s ease both;
-}
-
-.undo-toast-message {
-  max-width: min(420px, 56vw);
-  overflow: hidden;
-  color: inherit;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.undo-toast button {
-  display: inline-flex;
-  align-items: center;
-  height: 22px;
-  gap: 5px;
-  margin: -3px -5px -3px 2px;
-  padding: 0 6px;
-  border: 0;
-  border-left: 1px solid color-mix(in srgb, var(--bg) 24%, transparent);
-  background: transparent;
+.toast-mark svg { width: 12px; height: 12px; }
+.toast-message { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toast-pill:has(button) { padding-right: 4px; }
+.toast-pill button {
+  flex-shrink: 0;
+  height: 26px;
+  margin-left: 12px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9999px;
+  background: var(--surface-hover);
   color: inherit;
   font: inherit;
+  cursor: pointer;
 }
-
-.undo-toast button:hover {
-  background: color-mix(in srgb, var(--bg) 10%, transparent);
-}
-
-.undo-toast kbd {
-  color: color-mix(in srgb, var(--bg) 68%, transparent);
-  font: inherit;
-}
+.toast-pill button:hover { background: var(--surface-active); }
+.toast-pill button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@keyframes toast-enter { from { opacity: 0; margin-bottom: -8px; } to { margin-bottom: 0; } }
+@media (prefers-reduced-motion: reduce) { .toast-slot { animation: none; transition: none; } }
 
 @keyframes shimmer {
   to { background-position: -220% 0; }
@@ -5502,12 +5510,6 @@ kbd {
 
 @keyframes pulse {
   50% { opacity: 0.35; }
-}
-
-@keyframes toast-life {
-  0% { opacity: 0; transform: translate(-50%, 8px); }
-  8%, 85% { opacity: 1; transform: translate(-50%, 0); }
-  100% { opacity: 0; transform: translate(-50%, 6px); }
 }
 
 .ai-chat-launcher {
