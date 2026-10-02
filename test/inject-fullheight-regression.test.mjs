@@ -55,7 +55,9 @@ function fixtureHtml(origin) {
   <head>
     <meta charset="utf-8">
     <style>
-      html, body { width: 1200px; height: 800px; margin: 0; }
+      html, body { width: 1200px; height: 800px; margin: 0; --app-shell-titlebar-height: 36px; --radius-xl-base: 16px; }
+      #native-titlebar { position: absolute; top: 0; z-index: 30; height: 36px; }
+      #native-titlebar button { height: 36px; }
       #workspace { position: relative; width: 1200px; height: 700px; }
       nav[data-app-navigation-rail] { position: absolute; width: 64px; }
       .sidebar-navigation { margin-left: 64px; }
@@ -71,18 +73,21 @@ function fixtureHtml(origin) {
     </style>
   </head>
   <body>
+    <header id="native-titlebar" data-testid="app-shell-header-context-menu-surface"><button>Back</button></header>
     <div id="workspace" data-app-shell-workspace-row>
     <aside>
     <nav data-app-navigation-rail>
-      <button data-sidebar-destination="home" aria-current="page" data-selected><span class="sr-only">首页</span></button>
+      <button data-sidebar-destination="builtin:home" aria-current="page" data-selected><svg viewBox="0 0 20 20"><path d="M2 2h16v16H2Z"/></svg><span class="sr-only">首页</span></button>
       <button data-sidebar-destination="sites"><span class="sr-only">站点</span></button>
       <button aria-haspopup="menu"><svg></svg><span class="sr-only">探索</span></button>
+      <button id="profile-trigger" aria-haspopup="menu" aria-label="Open profile menu" aria-expanded="false" aria-controls="profile-menu"></button>
     </nav>
       <div class="sidebar-navigation">
       <nav role="navigation">
         <div data-app-action-sidebar-scroll>
           <section data-app-action-sidebar-section>
             <div data-app-action-sidebar-section-heading="项目">项目</div>
+            <div id="focused-thread" data-app-action-sidebar-thread-id="thread-449" aria-current="page">Current conversation</div>
           </section>
         </div>
       </nav>
@@ -105,12 +110,33 @@ function fixtureHtml(origin) {
     </div>
     <output id="result"></output>
     <script>
+      const profileTrigger = document.getElementById("profile-trigger");
+      profileTrigger.addEventListener("keydown", (event) => {
+        if (event.key !== "ArrowDown") return;
+        const menu = document.createElement("div");
+        menu.id = "profile-menu";
+        menu.setAttribute("role", "menu");
+        menu.setAttribute("aria-labelledby", profileTrigger.id);
+        menu.innerHTML = '<div role="menuitem"><div data-menu-row-content><span class="flex-1 min-w-0">Fixture User</span></div></div>';
+        menu.addEventListener("keydown", (event) => {
+          if (event.key !== "Escape") return;
+          menu.remove();
+          profileTrigger.setAttribute("aria-expanded", "false");
+        });
+        document.body.appendChild(menu);
+        profileTrigger.setAttribute("aria-expanded", "true");
+      });
       window.__CODEX_TASKBOARD_URL__ = ${JSON.stringify(`${origin}/taskboard?host=codex`)};
       window.__CODEX_TASKBOARD_INSTANCE_TOKEN__ = ${JSON.stringify(instanceToken)};
       window.__CODEX_TASKBOARD_INSTANCE_SECRET__ = ${JSON.stringify(instanceSecret)};
       window.__CODEX_TASKBOARD_HOST_CAPABILITY__ = "fullheight-host-capability";
       window.__CODEX_TASKBOARD_SOURCE_HASH__ = "fullheight-regression";
       window.__browserPanelClosed = false;
+      window.__redundantHomeNavigation = false;
+      document.querySelector('[data-sidebar-destination="builtin:home"]').addEventListener('click', () => {
+        window.__redundantHomeNavigation = true;
+        document.getElementById('focused-thread').removeAttribute('aria-current');
+      });
       window.__injectionError = null;
       window.__frameMessages = [];
       window.__externalOpenUrl = null;
@@ -227,7 +253,7 @@ function fixtureHtml(origin) {
           forgedThreadOpened: window.__forgedThreadOpened,
           injectionError: window.__injectionError,
         };
-        const home = document.querySelector('[data-sidebar-destination="home"]');
+        const home = document.querySelector('[data-sidebar-destination="builtin:home"]');
         const rail = document.querySelector('nav[data-app-navigation-rail]');
         const sidebar = document.querySelector('.sidebar-navigation');
         result.destination = {
@@ -239,6 +265,14 @@ function fixtureHtml(origin) {
           railPointerEvents: getComputedStyle(rail).pointerEvents,
           pageLeft: page.getBoundingClientRect().left,
           railRight: rail.getBoundingClientRect().right,
+          pageTop: page.getBoundingClientRect().top,
+          pageRadius: getComputedStyle(page).borderTopLeftRadius,
+          headerVisibility: getComputedStyle(document.querySelector('#native-titlebar button')).visibility,
+          threadCurrent: document.getElementById('focused-thread').getAttribute('aria-current'),
+          originalIcon: getComputedStyle(home.querySelector('[data-codex-taskboard-native-icon="original"]')).display,
+          outlineIcon: getComputedStyle(home.querySelector('[data-codex-taskboard-native-icon="outline"]')).display,
+          taskboardOutline: getComputedStyle(entry.querySelector('[data-taskboard-icon="outline"]')).display,
+          taskboardFilled: getComputedStyle(entry.querySelector('[data-taskboard-icon="filled"]')).display,
         };
         home.click();
         result.restored = {
@@ -248,6 +282,9 @@ function fixtureHtml(origin) {
           entrySelected: entry.hasAttribute("data-selected"),
           sidebarVisibility: getComputedStyle(sidebar).visibility,
           contentVisibility: getComputedStyle(conversation).visibility,
+          threadCurrent: document.getElementById('focused-thread').getAttribute('aria-current'),
+          redundantHomeNavigation: window.__redundantHomeNavigation,
+          iconOverrides: document.querySelectorAll('[data-codex-taskboard-native-icon]').length,
         };
         document.getElementById("result").textContent = btoa(JSON.stringify(result));
         clearInterval(heartbeatTimer);
@@ -378,7 +415,7 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
     forgedThreadOpened: false,
     injectionError: null,
     destination: {
-      homeSelected: false,
+      homeSelected: true,
       homeBackground: "0",
       entrySelected: true,
       sidebarVisibility: "hidden",
@@ -386,6 +423,14 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
       railPointerEvents: "auto",
       pageLeft: 64,
       railRight: 64,
+      pageTop: 36,
+      pageRadius: "16px",
+      headerVisibility: "visible",
+      threadCurrent: "page",
+      originalIcon: "none",
+      outlineIcon: "inline",
+      taskboardOutline: "none",
+      taskboardFilled: "inline",
     },
     restored: {
       pageHidden: true,
@@ -394,6 +439,9 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
       entrySelected: false,
       sidebarVisibility: "visible",
       contentVisibility: "visible",
+      threadCurrent: "page",
+      redundantHomeNavigation: false,
+      iconOverrides: 0,
     },
   });
 });
