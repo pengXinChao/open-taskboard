@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { releaseMetadata } from "./release-metadata.mjs";
 import { verifyUpdaterSignature } from "./verify-updater-signature.mjs";
 
 const appPath = process.argv[2] ? path.resolve(process.argv[2]) : null;
@@ -36,9 +37,11 @@ const releasePolicy = JSON.parse(await readFile(
   path.join(projectRoot, "src-tauri", "release.json"),
   "utf8",
 ));
-if (releaseTag !== `v${packageJson.version}`) {
-  throw new Error("Release tag does not match package.json version");
-}
+const { releaseVersion, productName, appName, assets } = releaseMetadata(
+  packageJson.version,
+  releaseTag,
+  tauriConfig.productName,
+);
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: "utf8", ...options });
@@ -65,20 +68,37 @@ function plistValue(targetPath, key) {
 }
 
 function verifyApp(targetPath) {
+  if (path.basename(targetPath) !== appName) {
+    throw new Error(`App bundle name must be ${appName}`);
+  }
   run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=2", targetPath]);
   run("/usr/bin/xcrun", ["stapler", "validate", targetPath]);
   run("/usr/sbin/spctl", ["-a", "-t", "exec", "-vv", targetPath]);
   const infoPath = path.join(targetPath, "Contents", "Info.plist");
+  for (const nameKey of ["CFBundleDisplayName", "CFBundleName"]) {
+    if (plistValue(infoPath, nameKey) !== productName) {
+      throw new Error(`Updater App ${nameKey} does not match ${productName}`);
+    }
+  }
   if (plistValue(infoPath, "CFBundleIdentifier") !== tauriConfig.identifier) {
     throw new Error("Updater App bundle identifier does not match tauri.conf.json");
   }
-  if (plistValue(infoPath, "CFBundleShortVersionString") !== packageJson.version) {
-    throw new Error("Updater App version does not match package.json");
+  for (const versionKey of ["CFBundleShortVersionString", "CFBundleVersion"]) {
+    if (plistValue(infoPath, versionKey) !== packageJson.version) {
+      throw new Error(`Updater App ${versionKey} does not match package.json`);
+    }
   }
   if (!signingDetails(targetPath).includes(`TeamIdentifier=${releasePolicy.appleTeamId}`)) {
     throw new Error(`App does not use Apple Team ${releasePolicy.appleTeamId}`);
   }
   const launcherPath = path.join(targetPath, "Contents", "MacOS", "codex-taskboard-launcher");
+  const embeddedVersion = spawnSync(
+    "/usr/bin/grep",
+    ["-a", "-F", "-q", releaseVersion, launcherPath],
+  );
+  if (embeddedVersion.status !== 0) {
+    throw new Error(`Launcher does not embed release version ${releaseVersion}`);
+  }
   if (!signingDetails(launcherPath).includes(`TeamIdentifier=${releasePolicy.appleTeamId}`)) {
     throw new Error(`Launcher does not use Apple Team ${releasePolicy.appleTeamId}`);
   }
@@ -122,7 +142,7 @@ async function manifest(root, relative = "") {
   return entries;
 }
 
-const artifactName = `Codex.Taskboard_${packageJson.version}_universal.app.tar.gz`;
+const artifactName = assets.macosUpdater;
 const artifactPath = path.join(releaseDirectory, artifactName);
 const signaturePath = `${artifactPath}.sig`;
 const signature = await readFile(signaturePath, "utf8");
@@ -133,7 +153,7 @@ await verifyUpdaterSignature({
 });
 
 const latest = JSON.parse(await readFile(path.join(releaseDirectory, "latest.json"), "utf8"));
-if (latest.version !== packageJson.version) throw new Error("latest.json version is incorrect");
+if (latest.version !== releaseVersion) throw new Error("latest.json version is incorrect");
 const expectedUrl = `https://github.com/chuspeeism/dashi-taskboard/releases/download/${releaseTag}/${artifactName}`;
 const expectedPlatforms = [
   "darwin-aarch64",

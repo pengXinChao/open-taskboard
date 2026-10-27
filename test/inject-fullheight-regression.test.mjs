@@ -55,7 +55,14 @@ function fixtureHtml(origin) {
   <head>
     <meta charset="utf-8">
     <style>
-      html, body { width: 1200px; height: 800px; margin: 0; }
+      html, body { width: 1200px; height: 800px; margin: 0; --app-shell-titlebar-height: 36px; --radius-xl-base: 16px; }
+      #native-titlebar { position: absolute; top: 0; z-index: 30; height: 36px; }
+      #native-titlebar button { height: 36px; }
+      #workspace { position: relative; width: 1200px; height: 700px; }
+      nav[data-app-navigation-rail] { position: absolute; width: 64px; }
+      .sidebar-navigation { margin-left: 64px; }
+      nav[data-app-navigation-rail] button::before { content: ""; opacity: 0; }
+      nav[data-app-navigation-rail] button[data-selected]::before { opacity: 1; }
       aside { position: absolute; width: 200px; height: 800px; }
       main { position: absolute; left: 200px; width: 1000px; height: 700px; }
       main > header { position: absolute; z-index: 2; width: 1000px; height: 48px; }
@@ -66,19 +73,25 @@ function fixtureHtml(origin) {
     </style>
   </head>
   <body>
+    <header id="native-titlebar" data-testid="app-shell-header-context-menu-surface"><button>Back</button></header>
+    <div id="workspace" data-app-shell-workspace-row>
     <aside>
+    <nav data-app-navigation-rail>
+      <button data-sidebar-destination="builtin:home" aria-current="page" data-selected><svg viewBox="0 0 20 20"><path d="M2 2h16v16H2Z"/></svg><span class="sr-only">首页</span></button>
+      <button data-sidebar-destination="sites"><span class="sr-only">站点</span></button>
+      <button aria-haspopup="menu"><svg></svg><span class="sr-only">探索</span></button>
+      <button id="profile-trigger" aria-haspopup="menu" aria-label="Open profile menu" aria-expanded="false" aria-controls="profile-menu"></button>
+    </nav>
+      <div class="sidebar-navigation">
       <nav role="navigation">
         <div data-app-action-sidebar-scroll>
-          <div>
-            <button><span>首页</span></button>
-            <button><span>站点</span></button>
-            <button><svg></svg><span class="text-fade-truncate">插件</span></button>
-          </div>
           <section data-app-action-sidebar-section>
             <div data-app-action-sidebar-section-heading="项目">项目</div>
+            <div id="focused-thread" data-app-action-sidebar-thread-id="thread-449" aria-current="page">Current conversation</div>
           </section>
         </div>
       </nav>
+      </div>
     </aside>
     <main>
       <header>Codex header</header>
@@ -94,14 +107,36 @@ function fixtureHtml(origin) {
         ></webview>
       </div>
     </main>
+    </div>
     <output id="result"></output>
     <script>
+      const profileTrigger = document.getElementById("profile-trigger");
+      profileTrigger.addEventListener("keydown", (event) => {
+        if (event.key !== "ArrowDown") return;
+        const menu = document.createElement("div");
+        menu.id = "profile-menu";
+        menu.setAttribute("role", "menu");
+        menu.setAttribute("aria-labelledby", profileTrigger.id);
+        menu.innerHTML = '<div role="menuitem"><div data-menu-row-content><span class="flex-1 min-w-0">Fixture User</span></div></div>';
+        menu.addEventListener("keydown", (event) => {
+          if (event.key !== "Escape") return;
+          menu.remove();
+          profileTrigger.setAttribute("aria-expanded", "false");
+        });
+        document.body.appendChild(menu);
+        profileTrigger.setAttribute("aria-expanded", "true");
+      });
       window.__CODEX_TASKBOARD_URL__ = ${JSON.stringify(`${origin}/taskboard?host=codex`)};
       window.__CODEX_TASKBOARD_INSTANCE_TOKEN__ = ${JSON.stringify(instanceToken)};
       window.__CODEX_TASKBOARD_INSTANCE_SECRET__ = ${JSON.stringify(instanceSecret)};
       window.__CODEX_TASKBOARD_HOST_CAPABILITY__ = "fullheight-host-capability";
       window.__CODEX_TASKBOARD_SOURCE_HASH__ = "fullheight-regression";
       window.__browserPanelClosed = false;
+      window.__redundantHomeNavigation = false;
+      document.querySelector('[data-sidebar-destination="builtin:home"]').addEventListener('click', () => {
+        window.__redundantHomeNavigation = true;
+        document.getElementById('focused-thread').removeAttribute('aria-current');
+      });
       window.__injectionError = null;
       window.__frameMessages = [];
       window.__externalOpenUrl = null;
@@ -175,7 +210,7 @@ function fixtureHtml(origin) {
         window.__browserPanelClosed = true;
       });
     </script>
-    <script>eval(atob(${JSON.stringify(encodedSource)}));</script>
+    <script>eval(new TextDecoder().decode(Uint8Array.from(atob(${JSON.stringify(encodedSource)}), (byte) => byte.charCodeAt(0))));</script>
     <script>
       (async () => {
         const publishHeartbeat = () => window.postMessage({
@@ -198,7 +233,7 @@ function fixtureHtml(origin) {
 
         const page = document.getElementById("codex-taskboard-page");
         const frame = document.getElementById("codex-taskboard-frame");
-        const surface = document.getElementById("surface");
+        const surface = document.getElementById("workspace");
         const conversation = document.getElementById("conversation");
         const result = {
           panelVisibleBefore,
@@ -217,6 +252,39 @@ function fixtureHtml(origin) {
           hostileNavigationRevoked: Boolean(frame?.hidden && !document.getElementById("codex-taskboard-status")?.hidden),
           forgedThreadOpened: window.__forgedThreadOpened,
           injectionError: window.__injectionError,
+        };
+        const home = document.querySelector('[data-sidebar-destination="builtin:home"]');
+        const rail = document.querySelector('nav[data-app-navigation-rail]');
+        const sidebar = document.querySelector('.sidebar-navigation');
+        result.destination = {
+          homeSelected: home.hasAttribute("data-selected"),
+          homeBackground: getComputedStyle(home, "::before").opacity,
+          entrySelected: entry.hasAttribute("data-selected"),
+          sidebarVisibility: getComputedStyle(sidebar).visibility,
+          railVisibility: getComputedStyle(rail).visibility,
+          railPointerEvents: getComputedStyle(rail).pointerEvents,
+          pageLeft: page.getBoundingClientRect().left,
+          railRight: rail.getBoundingClientRect().right,
+          pageTop: page.getBoundingClientRect().top,
+          pageRadius: getComputedStyle(page).borderTopLeftRadius,
+          headerVisibility: getComputedStyle(document.querySelector('#native-titlebar button')).visibility,
+          threadCurrent: document.getElementById('focused-thread').getAttribute('aria-current'),
+          originalIcon: getComputedStyle(home.querySelector('[data-codex-taskboard-native-icon="original"]')).display,
+          outlineIcon: getComputedStyle(home.querySelector('[data-codex-taskboard-native-icon="outline"]')).display,
+          taskboardOutline: getComputedStyle(entry.querySelector('[data-taskboard-icon="outline"]')).display,
+          taskboardFilled: getComputedStyle(entry.querySelector('[data-taskboard-icon="filled"]')).display,
+        };
+        home.click();
+        result.restored = {
+          pageHidden: page.hidden,
+          homeSelected: home.hasAttribute("data-selected"),
+          homeCurrent: home.getAttribute("aria-current"),
+          entrySelected: entry.hasAttribute("data-selected"),
+          sidebarVisibility: getComputedStyle(sidebar).visibility,
+          contentVisibility: getComputedStyle(conversation).visibility,
+          threadCurrent: document.getElementById('focused-thread').getAttribute('aria-current'),
+          redundantHomeNavigation: window.__redundantHomeNavigation,
+          iconOverrides: document.querySelectorAll('[data-codex-taskboard-native-icon]').length,
         };
         document.getElementById("result").textContent = btoa(JSON.stringify(result));
         clearInterval(heartbeatTimer);
@@ -271,7 +339,7 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
   }));
 
   const profile = await mkdtemp(path.join(os.tmpdir(), "taskboard-fullheight-chrome-"));
-  t.after(() => rm(profile, { recursive: true, force: true }));
+  t.after(() => rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   const url = `http://127.0.0.1:${server.address().port}/fixture`;
   const child = spawn(chrome, [
     "--headless=new",
@@ -346,5 +414,34 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
     hostileNavigationRevoked: true,
     forgedThreadOpened: false,
     injectionError: null,
+    destination: {
+      homeSelected: true,
+      homeBackground: "0",
+      entrySelected: true,
+      sidebarVisibility: "hidden",
+      railVisibility: "visible",
+      railPointerEvents: "auto",
+      pageLeft: 64,
+      railRight: 64,
+      pageTop: 36,
+      pageRadius: "16px",
+      headerVisibility: "visible",
+      threadCurrent: "page",
+      originalIcon: "none",
+      outlineIcon: "inline",
+      taskboardOutline: "none",
+      taskboardFilled: "inline",
+    },
+    restored: {
+      pageHidden: true,
+      homeSelected: true,
+      homeCurrent: "page",
+      entrySelected: false,
+      sidebarVisibility: "visible",
+      contentVisibility: "visible",
+      threadCurrent: "page",
+      redundantHomeNavigation: false,
+      iconOverrides: 0,
+    },
   });
 });

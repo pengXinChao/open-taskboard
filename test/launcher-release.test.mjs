@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
 const launcherSource = await readFile(new URL("../src-tauri/src/main.rs", import.meta.url), "utf8");
+const prepareSource = await readFile(new URL("../scripts/prepare-tauri-app.mjs", import.meta.url), "utf8");
 const tauriConfig = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
 const releaseWorkflow = await readFile(new URL("../.github/workflows/release-macos.yml", import.meta.url), "utf8");
 const checkWorkflow = await readFile(new URL("../.github/workflows/check.yml", import.meta.url), "utf8");
@@ -33,9 +34,17 @@ test("the launcher keeps CDP random and prefers the Taskboard port with a fallba
   );
   assert.match(
     launcherSource,
-    /#\[cfg\(target_os = "macos"\)\]\s+command\.args\(\["--launch", "--watch", "--open", "--port", &codex_port\]\);/,
+    /#\[cfg\(any\(target_os = "macos", target_os = "windows"\)\)\]\s+command\.args\(\["--launch", "--watch", "--open", "--port", &codex_port\]\);/,
+  );
+  assert.match(
+    launcherSource,
+    /#\[cfg\(target_os = "linux"\)\]\s+command\.args\(\["--launch", "--watch", "--open", "--cdp-pipe"\]\);/,
   );
   assert.doesNotMatch(launcherSource, /const LAUNCHER_PORT/);
+});
+
+test("the packaged injector includes its Windows Store activation module", () => {
+  assert.match(prepareSource, /"windows-codex\.mjs"/);
 });
 
 test("release signing is tag-only and PR CI builds the real unsigned app bundle", () => {
