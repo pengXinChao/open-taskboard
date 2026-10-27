@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   activateWindowsCodex,
+  activateWindowsCodexWindow,
   stopWindowsCodex,
   windowsCodexProcesses,
   windowsCodexProfileArgument,
@@ -60,6 +61,30 @@ test("Windows Store activation passes the app, isolated profile, and CDP port th
   assert.equal(calls[0].options.env.CODEX_TASKBOARD_CODEX_PORT, "43123");
   assert.match(calls[0].args.at(-1), /IApplicationActivationManager/);
   assert.match(calls[0].args.at(-1), /--remote-debugging-port=/);
+});
+
+test("Windows window activation targets the managed process window", () => {
+  const calls = [];
+  const result = activateWindowsCodexWindow(
+    456,
+    { SAFE: "1" },
+    (command, args, options) => {
+      calls.push({ command, args, options });
+      return {
+        status: 0,
+        stdout: JSON.stringify({ handle: 1234, minimized: false, foreground: true, reason: "" }),
+        stderr: "",
+      };
+    },
+  );
+
+  assert.equal(result.foreground, true);
+  assert.equal(result.handle, 1234);
+  assert.equal(calls[0].command, "powershell.exe");
+  assert.equal(calls[0].options.env.CODEX_TASKBOARD_CODEX_APP_PID, "456");
+  assert.match(calls[0].args.at(-1), /MainWindowHandle/);
+  assert.match(calls[0].args.at(-1), /SetForegroundWindow/);
+  assert.match(calls[0].args.at(-1), /ShowWindow\(\$handle, 9\)/);
 });
 
 test("Windows Codex cleanup terminates the activated process tree", () => {
